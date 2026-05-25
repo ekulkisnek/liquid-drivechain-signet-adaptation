@@ -79,7 +79,7 @@ def main():
 
     # Example status poll (manual for now until we have generated stubs)
     print(f"\n[STUB] Manual status check recommended:")
-    print(f"  cd ../drivechain-wallet-dev/local-dev && ./scripts/liquid-side-status.sh")
+    print(f"  ./drivechain-liquid-sidechain/scripts/liquid-side-status.sh")
 
     print("\n[STUB] To make real progress toward production:")
     print("  - Install: pip install grpcio grpcio-tools")

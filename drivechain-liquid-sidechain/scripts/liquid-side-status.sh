@@ -3,6 +3,22 @@
 # Pure CUSF queries (no fed). Run anytime stack is up.
 set -euo pipefail
 
+# Robust discovery of the drivechain local-dev dir (works from anywhere in the repo)
+if [ -z "${LOCAL_DEV:-}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CANDIDATES=(
+    "/Volumes/T705/code/drivechain-wallet-dev/local-dev"
+    "$SCRIPT_DIR/../../../drivechain-wallet-dev/local-dev"
+    "$(dirname "$SCRIPT_DIR")/../drivechain-wallet-dev/local-dev"
+    "$HOME/drivechain-wallet-dev/local-dev"
+  )
+  for c in "${CANDIDATES[@]}"; do
+    if [ -f "$c/docker-compose.local-minimal.yml" ]; then
+      LOCAL_DEV="$c"
+      break
+    fi
+  done
+fi
 LOCAL_DEV="${LOCAL_DEV:-/Volumes/T705/code/drivechain-wallet-dev/local-dev}"
 COMPOSE_FILE="${COMPOSE_FILE:-$LOCAL_DEV/docker-compose.local-minimal.yml}"
 LIQUID_ID=5
