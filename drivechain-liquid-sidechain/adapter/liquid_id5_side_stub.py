@@ -154,3 +154,44 @@ def attempt_real_bmm_for_id5():
 if __name__ == "__main__":
     print("=== Liquid ID5 Stub with REAL elementsd integration (this turn) ===")
     attempt_real_bmm_for_id5()
+
+
+# === IMPROVED: Simple retry loop for real BMM (added this turn) ===
+def run_bmm_loop(max_attempts=5):
+    print(f"[LOOP] Starting BMM retry loop (max {max_attempts} attempts) using live elementsd...")
+    for i in range(max_attempts):
+        print(f"[LOOP] Attempt {i+1}/{max_attempts}")
+        block_hash, height = get_elements_best_block()
+        if block_hash:
+            # Use height + 1 for next BMM target
+            target_height = height + 1 + i
+            critical = block_hash
+            print(f"[LOOP] elementsd height={height} -> target BMM height={target_height}")
+            
+            # Build the exact command with progressing height
+            d = f{sidechainId:5}
+            cmd = ["bash", "-c", f"buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d \{d}\ http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 || docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d \{d}\ http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1"]
+            try:
+                out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=12)
+                print("[LOOP] Response:", out.decode()[:400])
+                if "error" not in out.decode().lower() and "failed" not in out.decode().lower():
+                    print("[LOOP] *** POSSIBLE SUCCESS ***")
+                    return True
+            except subprocess.CalledProcessError as e:
+                print(f"[LOOP] FAILED returncode={e.returncode}")
+                if e.output:
+                    err = e.output.decode()[:600]
+                    print("[LOOP] Error details:", err)
+                    if "broadcast deposit" in err.lower():
+                        print("[LOOP] Root cause still: enforcer rejecting (no active ID5 participant yet)")
+            except Exception as e:
+                print(f"[LOOP] Error: {e}")
+        else:
+            print(f"[LOOP] No elementsd block yet: {height}")
+        time.sleep(8)
+    print("[LOOP] Loop finished without success.")
+    return False
+
+if __name__ == "__main__":
+    print("=== Liquid ID5 Stub with REAL elementsd + BMM retry loop (this turn) ===")
+    run_bmm_loop(3)
