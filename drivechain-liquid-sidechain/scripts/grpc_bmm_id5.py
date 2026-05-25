@@ -46,7 +46,7 @@ def main():
 
     # Use the prev_bytes that the enforcer itself told us was expected in previous run
     # (re-run with the exact expected value from the latest real INVALID_ARGUMENT error)
-    prev = "00000172af0528d72fadff0557f4e19310f05c215576a034dc16df8a987536f1"  # latest expected from enforcer at current state/height (H~416)
+    prev = "000001c0f7b69141cfc04ac1048823ca1f5f4003041bffc65c25ea2784839775"  # latest expected from enforcer at current state/height (H~417)
 
     req = wallet_pb2.CreateBmmCriticalDataTransactionRequest(
         sidechain_id=wrappers_pb2.UInt32Value(value=5),
