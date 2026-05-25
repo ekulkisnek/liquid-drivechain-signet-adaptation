@@ -97,3 +97,53 @@ def main():
 
 if __name__ == "__main__":
     main()
+# === REAL INTEGRATION (added this turn) ===
+import subprocess
+import json
+
+def get_elements_best_block():
+    """Get best block from the running ID5 regtest elementsd."""
+    try:
+        out = subprocess.check_output(
+            ["./src/elements-cli", "-regtest", "-rpcport=18443",
+             "-datadir=/tmp/liquid-id5-regtest", "getblockchaininfo"],
+            stderr=subprocess.DEVNULL, timeout=5
+        )
+        info = json.loads(out)
+        return info["bestblockhash"], info.get("blocks", 0)
+    except Exception as e:
+        return None, str(e)
+
+def attempt_real_bmm_for_id5():
+    """Drive BMM using real critical_hash from the running elementsd."""
+    block_hash, height = get_elements_best_block()
+    if not block_hash:
+        print(f"[REAL] Could not query elementsd: {height}")
+        return False
+
+    print(f"[REAL] Elementsd best block height={height}, hash={block_hash[:16]}...")
+    # For v0.1 demo, use the block hash as critical_hash (real impl would do header+merkle)
+    critical = block_hash
+
+    # Use the exact same working buf curl pattern as the status script
+    cmd = [
+        "bash", "-c",
+        f"""buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
+        -d '{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}' \
+        http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>/dev/null || \
+        docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl \
+        --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
+        -d '{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}' \
+        http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>/dev/null"""
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10)
+        print("[REAL] BMM response:", out.decode()[:300])
+        return True
+    except Exception as e:
+        print(f"[REAL] BMM attempt result: {e}")
+        return False
+
+if __name__ == "__main__":
+    print("=== Liquid ID5 Stub with REAL elementsd integration (this turn) ===")
+    attempt_real_bmm_for_id5()
