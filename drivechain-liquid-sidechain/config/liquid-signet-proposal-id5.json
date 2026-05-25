@@ -1,0 +1,15 @@
+{
+  "sidechain_id": 5,
+  "declaration": {
+    "v0": {
+      "title": "liquid-signet",
+      "description": "Liquid/Elements sidechain as native BIP300/301 drivechain (no federation or multisig pegin). Brings confidential transactions (CT), native assets, rich scripting, and dynafed options to the drivechain ecosystem on private signet. Fully compatible with CUSF enforcer WalletService/ValidatorService and future real BIP300/301 signets. ID 5 as defined in liquid-signet-sidechain fork of ElementsProject/elements.",
+      "hash_id_1": {
+        "hex": "0000000000000000000000000000000000000000000000000000000000000005"
+      },
+      "hash_id_2": {
+        "hex": "0000000000000000000000000000000000000005"
+      }
+    }
+  }
+}
