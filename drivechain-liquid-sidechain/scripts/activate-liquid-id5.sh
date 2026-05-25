@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_DEV_DIR="$(cd "$SCRIPT_DIR/.." && pwd)/../drivechain-wallet-dev/local-dev"
+LOCAL_DEV_DIR="/Volumes/T705/code/drivechain-wallet-dev/local-dev"
 PROPOSAL_JSON="${PROPOSAL_JSON:-$SCRIPT_DIR/../config/liquid-signet-proposal-id5.json}"
 
 echo "=== Activating Liquid/Elements sidechain ID 5 (native drivechain) ==="
