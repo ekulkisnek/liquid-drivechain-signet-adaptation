@@ -175,9 +175,19 @@ def run_bmm_loop(max_attempts=5):
             critical = block_hash
             print(f"[LOOP] elementsd height={height} -> target BMM height={target_height}")
             
-            # Build the exact command with progressing height
-            d = f'{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{target_height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}'
-            cmd = ["bash", "-c", f"buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d \\'{d}\\' http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 || docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d \\'{d}\\' http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1"]
+            # Build the exact command with progressing height (robust quoting)
+            payload = json.dumps({
+                "sidechainId": 5,
+                "valueSats": {"value": 1000},
+                "height": target_height,
+                "criticalHash": {"value": critical},
+                "prevBytes": {"value": "0000000000000000000000000000000000000000000000000000000000000000"}
+            })
+            cmd = [
+                "bash", "-c",
+                f'echo \'{payload}\' | buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d @- http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 || '
+                f'echo \'{payload}\' | docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d @- http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1'
+            ]
             try:
                 out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=12)
                 print("[LOOP] Response:", out.decode()[:400])
