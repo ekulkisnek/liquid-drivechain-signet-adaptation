@@ -106,6 +106,7 @@ def get_elements_best_block():
     try:
         out = subprocess.check_output(
             ["./src/elements-cli", "-regtest", "-rpcport=18443",
+             "-rpccookiefile=/tmp/liquid-id5-regtest/regtest/.cookie",
              "-datadir=/tmp/liquid-id5-regtest", "getblockchaininfo"],
             stderr=subprocess.DEVNULL, timeout=5
         )

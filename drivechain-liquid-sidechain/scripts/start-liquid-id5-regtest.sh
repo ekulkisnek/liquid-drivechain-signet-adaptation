@@ -33,8 +33,8 @@ echo "P2P: $BIND:$P2PPORT"
 
 echo "Waiting for elementsd RPC ready..."
 for i in $(seq 1 30); do
-  if ./src/elements-cli -regtest -rpcport="$RPCPORT" -datadir="$DATADIR" getblockchaininfo >/dev/null 2>&1; then
-    echo "elementsd ready at height $(./src/elements-cli -regtest -rpcport="$RPCPORT" -datadir="$DATADIR" getblockcount 2>/dev/null || echo 0)"
+  if ./src/elements-cli -regtest -rpcport="$RPCPORT" -rpccookiefile="$DATADIR/regtest/.cookie" -datadir="$DATADIR" getblockchaininfo >/dev/null 2>&1; then
+    echo "elementsd ready at height $(./src/elements-cli -regtest -rpcport="$RPCPORT" -rpccookiefile="$DATADIR/regtest/.cookie" -datadir="$DATADIR" getblockcount 2>/dev/null || echo 0)"
     exit 0
   fi
   sleep 2
