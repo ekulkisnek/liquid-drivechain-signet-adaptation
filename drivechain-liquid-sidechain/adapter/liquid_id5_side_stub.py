@@ -89,9 +89,9 @@ def main():
     print("  - Add elementsd management (subprocess or docker) + RPC client.")
     print("  - Wire into e2e-liquid-on-signet.sh so real side txids/heights appear.")
     print("")
-    print("  IMPORTANT: The Elements build (tmux elements-build) is currently compiling.")
-    print("  Once it finishes, ./src/elementsd will exist in this workspace.")
-    print("  Use it like: ./src/elementsd -regtest -datadir=/tmp/liquid-id5 -port=XXXX ...")
+    print("  STATUS: Elements build COMPLETE. Real ID5 regtest elementsd is now launching in tmux 'liquid-id5-elements'.")
+    print("  Use the launcher: ./drivechain-liquid-sidechain/scripts/start-liquid-id5-regtest.sh")
+    print("  Monitor: tmux attach -t liquid-id5-elements  |  tail -f /tmp/liquid-id5.log")
 
     print("\n=== STUB EXIT (skeleton only; extend me) ===")
 
