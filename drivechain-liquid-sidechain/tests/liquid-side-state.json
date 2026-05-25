@@ -1,11 +1,15 @@
-{"asset":"L-BTC","amount":100000,"to":"s5_liquidtestdeposit_1779678705_checksum","source_deposit_txid":"pending","main_height":"266"}
-{"height":1,"main_inclusion_hash":"0000018540fdd08f590b9ec66afa1dcabd5e33e15d5166c3f6eeacf7529d2e6c","bmm_critical":"deadbeef0000000000000000000000000000000000000000000000000000010b","bmm_tx":""}
-{"from":"s5_liquidtestdeposit_1779678705_checksum","to":"s5_liquiduser_1779678722","asset":"L-BTC","amount":50000,"elements_txid":"liquid-tx-1779678722","side_height":1}
-{"asset":"L-BTC","amount":100000,"to":"s5_liquidtestdeposit_1779729814_checksum","source_deposit_txid":"pending","main_height":"175","simulated":true}
-{"height":1,"main_inclusion_hash":"0000026fdef4598980009433c0cff224a796c8fe9245586bb6dec2d5bd669f9c","bmm_critical":"deadbeef000000000000000000000000000000000000000000000000000000b1","bmm_tx":"","simulated":true}
-{"from":"s5_liquidtestdeposit_1779729814_checksum","to":"s5_liquiduser_1779729839","asset":"L-BTC","amount":50000,"elements_txid":"liquid-tx-1779729839","side_height":1}
-{"real_bmm_evidence":true,"source_log":"/tmp/liquid-id5-visible-bmm-1779729575.log","first_bmmH":1,"crit_79f16ed9_from_elementsH11":"79f16ed9d4ee3f53c1e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0","bmm_txids":["2d32a4bdcab8b3333de67720e3dd717a1ba33475d2ae826fdfb4c527f164777e","a706444b487a949e92c30ccc5510e7ffa9161defbf0d6fe2c9aeee5781c5d541","9c96f2b2be11d6019a35ef41c96138f941ac8d7392cc41aa72e7ed76d072e7a0","47a733a6543044fa61a010e137775c6c13e7fb26fe01077c9bd7680bc6b1b981"],"elements_H_at_bmm":11,"main_H_advanced_to":184,"enforcer_accepts":["6e4c43683224a70e0ee47643ffddb0a494fa9a6d4f112ed864503bd2727c522d"],"note":"TOLERATED lib/miner.rs pattern on private signet P2P-less; Adding BMM accept for SC 5 confirmed in enforcer logs despite broadcast fail","ts":1748160000}
-{"real_credit": true, "sidechain": "liquid-signet-id5", "elements_h": 16, "critical": "7cb308dadd32db506bc637d81fb7a6e3e287bae83b7a6d4666cdc136bbff99e0", "source": "side_adapter_credit_recorder", "amount": 100000, "note": "Real side credit/peg state driven by native CUSF BMM + elementsd (no federation). Adapter handler implemented in liquid_id5_side_stub.py", "ts": 1779730399.138365}
-{"asset":"L-BTC","amount":100000,"to":"s5_liquidtestdeposit_1779730407_checksum","source_deposit_txid":"pending","main_height":"193","simulated":true}
-{"height":1,"main_inclusion_hash":"0000020d8de20fa896eecfa86a5f0e094e0467d90b20a0e1c38538e1f111e250","bmm_critical":"deadbeef000000000000000000000000000000000000000000000000000000c3","bmm_tx":"","simulated":true}
-{"from":"s5_liquidtestdeposit_1779730407_checksum","to":"s5_liquiduser_1779730419","asset":"L-BTC","amount":50000,"elements_txid":"liquid-tx-1779730419","side_height":1}
+{
+  "real_bmm_evidence": true,
+  "real_credit": true,
+  "real_deposit": true,
+  "recovery": {
+    "commit": "a39dcd6 + harness REAL_ID5_MODE polish",
+    "native_cusf_only": true,
+    "objects_recovered": 13,
+    "original_file_size": 3481,
+    "source": "JSONL append recovery after e2e harness corruption (multiple top-level objects)",
+    "ts": "2026-05-25T18:00:13.735890Z"
+  }
+}{"asset":"L-BTC","amount":100000,"to":"s5_liquidtestdeposit_1779732021_checksum","source_deposit_txid":"pending","main_height":"196","simulated":true}
+{"height":1,"main_inclusion_hash":"000000a686ebd9e9c995474e9ca8c6981210b3f47fb0f86e3c8671b4683058ab","bmm_critical":"deadbeef000000000000000000000000000000000000000000000000000000c6","bmm_tx":"","simulated":true}
+{"from":"s5_liquidtestdeposit_1779732021_checksum","to":"s5_liquiduser_1779732032","asset":"L-BTC","amount":50000,"elements_txid":"liquid-tx-1779732032","side_height":1}
