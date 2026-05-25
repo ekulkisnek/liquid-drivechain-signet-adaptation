@@ -126,16 +126,13 @@ def attempt_real_bmm_for_id5():
     # For v0.1 demo, use the block hash as critical_hash (real impl would do header+merkle)
     critical = block_hash
 
-    # Use the exact same working buf curl pattern as the status script
+    # Aligned to status + the loop patch (host buf prefer with direct -d; docker only on true absence). Historical path also updated for consistency.
     cmd = [
         "bash", "-c",
-        f"""buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
-        -d '{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}' \
-        http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>/dev/null || \
-        docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl \
-        --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
-        -d '{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}' \
-        http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>/dev/null"""
+        f'''( command -v buf >/dev/null && buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
+          -d '{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}' http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 \
+          || docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
+          -d '{{"sidechainId":5,"valueSats":{{"value":1000}},"height":{height},"criticalHash":{{"value":"{critical}"}},"prevBytes":{{"value":"0000000000000000000000000000000000000000000000000000000000000000"}}}}' http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 )'''
     ]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10)
@@ -176,7 +173,10 @@ def run_bmm_loop(max_attempts=5):
             critical = block_hash
             print(f"[LOOP] elementsd height={height} -> target BMM height={target_height}")
             
-            # Build the exact command with progressing height (prefer host buf; docker fallback has known arm64/amd64 platform issue on this Mac)
+            # Build payload and command aligned *exactly* to working status.sh + e2e grpc_curl pattern:
+            #   ( command -v buf && buf curl -d '...' http://127.0.0.1:50051/... || docker ... buf curl ... http://enforcer:50051/... )
+            # This ensures host buf (/opt/homebrew/bin/buf 1.69.0) is used for the real criticalHash payload; only falls back on true absence of buf.
+            # Avoids prior echo | -d @- construction that caused non-zero exit + docker platform error on arm64 Mac.
             payload = json.dumps({
                 "sidechainId": 5,
                 "valueSats": {"value": 1000},
@@ -184,11 +184,12 @@ def run_bmm_loop(max_attempts=5):
                 "criticalHash": {"value": critical},
                 "prevBytes": {"value": "0000000000000000000000000000000000000000000000000000000000000000"}
             })
-            # Prefer native buf on host (avoids docker platform mismatch on arm64 Mac)
             cmd = [
                 "bash", "-c",
-                f'echo \'{payload}\' | buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d @- http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 || '
-                f'echo \'{payload}\' | docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d @- http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1'
+                f'''( command -v buf >/dev/null && buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
+                  -d '{payload}' http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 \
+                  || docker compose -f ../drivechain-wallet-dev/local-dev/docker-compose.local-minimal.yml run --rm --pull=never buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge \
+                  -d '{payload}' http://enforcer:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 )'''
             ]
             try:
                 out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=12)

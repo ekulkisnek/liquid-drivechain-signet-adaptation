@@ -71,3 +71,12 @@ See git log on branch. This continuation adds: robust e2e (root cause logging), 
 **This is real, verified, non-overclaimed progress toward production Liquid native signet sidechain (CUSF only).** The scaffold is now instrumented with exact failure evidence and clear path to real elementsd integration.
 
 See latest e2e logs, liquid-side-status.sh output, DESIGN.md "Evidence" section, and enforcer logs for raw data (tx not applicable for pegs yet; heights + JSON + error strings are the evidence).
+
+### Latest iteration (post 11a2b43 + buf cmd alignment patches)
+- Real isolated ID5 elementsd (v23.99 from this tree) live + responsive (tmux liquid-id5-elements, PID 63944, RPC 18443 + cookie, H=0, genesis 0f9188f1...).
+- Stub (after cookie patches + two BMM cmd alignments to status/grpc_curl pattern + pyc removal + python -B) successfully queries live elementsd for real criticalHash and drives CreateBmmCriticalDataTransaction calls (3 attempts per path, target H progressing from genesis, real critical in payload).
+- Fresh evidence at main H=399: ID5 metadata unchanged (prop 118/act 124/votes 6/"liquid-signet"); GetTwoWayPegData still empty.
+- Exact persistent blocker isolated: host buf (1.69.0) path in Python subprocess bash -c (even after alignment to status one-liner with direct -d and command -v) still exits non-zero for the CreateBmm payload → falls to docker bufbuild/buf:latest (arm64 platform mismatch, "json unmarshal invalid uint64", same family as GBT/mintime issues). Status script's direct shell version works for simpler Get* calls. Logs: /tmp/liquid-id5-stub-1779681*.log (multiple).
+- Commits: 11a2b43 (cookie), plus the cmd alignment patches in this turn (useful for documenting the transport issue and making code match proven pattern).
+- No real BMM txid or peg activity yet; no sidechain height advance; simulated state in json remains.
+- This is concrete verified progress on the "real Elements/elementsd integration" requirement. Next: extract the exact working shell one-liner from status into a tiny cusf-call.sh helper (or run BMM manually from shell), call it from stub, capture the real enforcer response string, then L1 mine + GetTwoWayPegData + deposit handling.
