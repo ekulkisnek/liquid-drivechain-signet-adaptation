@@ -195,7 +195,7 @@ def run_bmm_loop(max_attempts=5):
                 print(f"[LOOP] Error: {e}")
         else:
             print(f"[LOOP] No elementsd block yet: {height}")
-        time.sleep(8)
+        time.sleep(3)  # shorter for faster iteration while elementsd is starting
     print("[LOOP] Loop finished without success.")
     return False
 
