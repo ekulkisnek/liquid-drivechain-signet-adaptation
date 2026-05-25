@@ -87,6 +87,10 @@ def main():
     print("  - Implement drive_bmm() and handle_deposit() methods.")
     print("  - Add elementsd management (subprocess or docker) + RPC client.")
     print("  - Wire into e2e-liquid-on-signet.sh so real side txids/heights appear.")
+    print("")
+    print("  IMPORTANT: The Elements build (tmux elements-build) is currently compiling.")
+    print("  Once it finishes, ./src/elementsd will exist in this workspace.")
+    print("  Use it like: ./src/elementsd -regtest -datadir=/tmp/liquid-id5 -port=XXXX ...")
 
     print("\n=== STUB EXIT (skeleton only; extend me) ===")
 
