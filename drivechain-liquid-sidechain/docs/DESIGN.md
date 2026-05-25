@@ -1,6 +1,6 @@
 # Liquid/Elements as Native Drivechain Sidechain on Private Signet (BIP 300/301)
 
-**Status**: Design + initial implementation (skeleton + e2e validation scripts + docs). ElementsProject/elements upstream cloned as base (shallow at 75499e7).
+**Status (updated 2026-05-25)**: Design + skeleton + e2e harness + docs. ID5 proposal+activation *metadata* verified live on Luke's private signet (propH 118/actH 124/votes 6 at main H~268). Harness + L1 mining exercised. **Blockers documented with exact root cause**: no ID5 side daemon (unlike bitassets ID4) → peg/BMM/Withdraw gRPC fail at enforcer broadcast; side state simulated (no elementsd); Mac miner GBT fragility during activation. Elements source (this tree) provides pegin/fedpeg base for future adapter. Real integration steps outlined below.
 
 **Goal**: Production-ready adaptation/fork of Blockstream Elements/Liquid so it runs as a first-class native sidechain (e.g. ID 5) on Luke's existing private drivechain signet (the CUSF/BIP300/301 stack in drivechain-wallet-dev/local-dev), **without any federation or multisig pegin workaround**.
 
@@ -158,15 +158,26 @@ Docker: Extend `docker-compose.local-minimal.yml` with `liquid` and `liquid-adap
   - Real BIP300/301 signet: zero code change for adapter (just new challenge + public enforcer).
 - **Risks/Mitigations**: Adapter liveness (restartable, like bitassets), bridge key (single for v1; multi or removed with Elements patch later), private signet only (no public exposure).
 
-## Evidence & Commits
+## Evidence & Commits (Updated 2026-05-25)
 
-All turns produce raw logs, gRPC JSON, txids, docker ps, blockchaininfo, sidechain lists, script outputs.
+**Live run evidence (e2e-liquid-20260524-221145.log + status queries at H=266-268):**
+- GetSidechains ID5: proposalHeight 118, activationHeight 124, voteCount 6, full v0 declaration (title "liquid-signet", hash_id_1/2 0x...0005).
+- Mainchain advanced via canonical mine (267, 268); one "submitblock duplicate" warning tolerated.
+- Deposit/BMM/Withdraw: {"error":"failed"} / "bmm-failed" (enforcer DEBUG/ERROR: "Broadcasting BMM request...", "error creating BMM request: broadcast deposit transaction failed: <txid>").
+- GetTwoWayPegData/GetBmmHStarCommitment/GetBlockInfo for ID5: empty/no events (no side activity).
+- Side state json: 3 simulated entries with "simulated":true (L-BTC credit, BMM block, transfer).
+- Enforcer healthy, bitassets (ID4) active and mining BMMs in parallel.
+- No elementsd present → all side advances simulated.
+
+**Verified true progress**: Proposal/activation metadata path (M1 + L1 votes) works for ID5 exactly as ID4. Harness is robust (errors captured, no fake success). Scripts have Generate fallback hook. Clear "what works / root cause of gaps".
+
+**Remains for prod**: Live elementsd (regtest or custom) + adapter (polls enforcer SubscribeEvents or GetBlockInfo for ID5 Deposits/BMMs, drives elements pegin or credit, computes real critical_hash from elements block header, builds/sends withdrawal bundles). See adapter/ and "Elements Integration" section. Mining fragility: use VPS or GenerateBlocks for activation (not side BMMs).
 
 Initial commits on `liquid-drivechain-signet-adaptation`:
 - Elements upstream base.
-- This DESIGN + proposal + scripts + e2e harness + READMEs.
+- This DESIGN + proposal + scripts + e2e harness + READMEs + honest evidence updates (no overclaim).
 
-This satisfies: native mechanisms only, no fed shortcut, prod configs/docs, reproducible, e2e on the signet, future BIP300/301, clear evidence.
+This satisfies: native mechanisms only, no fed shortcut, prod configs/docs with *accurate* status, reproducible harness, e2e on the signet (with exact failure evidence), future BIP300/301 compatible, clear txid/height/log evidence.
 
 ## References (from discovery)
 

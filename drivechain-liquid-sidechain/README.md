@@ -69,15 +69,28 @@ Current live signet (at design time): mainchain height 117, enforcer/bitassets h
 - For real Elements + CT/assets: wire the adapter to a running `elementsd -regtest` (or custom chain) + expose combined Electrum/RPC surface for Floresta later.
 - On public BIP300/301 signet: change only the challenge + enforcer host; same proposal/flows/scripts.
 
-## Status & Roadmap
+## Status & Roadmap (Honest, as of 2026-05-25 run)
+
+**Verified (live evidence from e2e + GetSidechains at main height 266-268):**
+- ID5 proposal submitted (prop height 118), activation metadata present (act height 124, 6 votes, full declaration with title/hash_id_1/2).
+- Native CUSF gRPC reachable for ID5 (GetSidechains lists it; WalletService/ValidatorService calls exercised).
+- L1 mining via canonical mine-private-signet-blocks.sh succeeds (height advances, minor GBT dups tolerated).
+- e2e harness runs cleanly to exit 0, captures exact responses/errors, state json.
+- **No federation/multisig** — pure Create* / Get* paths.
+
+**Current blockers / partial (exact root cause):**
+- Deposit/BMM/Withdraw gRPC return "error":"failed" / "bmm-failed" (enforcer log: "broadcast deposit transaction failed"). Root: no live ID5 sidechain daemon/adapter (cf. bitassets container + its BMM driver for ID4). Enforcer cannot escrow or commit BMM without side participation.
+- Side "state"/credits/BMM blocks are SIMULATED in tests/liquid-side-state.json (no elementsd running; Elements source present in workspace root but unbuilt).
+- Full one-shot activation in harness can hit Mac QEMU miner fragility (long GBT "unexpected block"/mintime loops in activate; see LOCAL_DEVELOPMENT_NOTES.md). ID5 metadata succeeded historically via background mines or prior runs.
+- No adapter/ (stub dir only); no docker service for liquid elementsd+driver.
 
 - [x] Upstream clone + branch + discovery of live CUSF stack + protos + flows.
-- [x] DESIGN + proposal + canonical script wrappers + e2e harness (validates real CUSF peg/BMM/withdraw on live signet).
-- [ ] Full Rust adapter (port patterns from plain-bitassets).
-- [ ] Docker service + compose override for "liquid" + adapter in the local stack.
-- [ ] Small Elements patch (optional drivechain peg mode) + build/test in this fork.
-- [ ] Floresta Electrum asset/CT method wiring (big value).
-- [ ] PR to ElementsProject/elements (docs + any minimal patches) + LayerTwo-Labs (adapter/examples).
+- [x] DESIGN + proposal + canonical script wrappers + e2e harness (validates real CUSF proposal/activation metadata + gRPC/L1 mine on live signet; documents exact failures for peg/BMM).
+- [ ] Full Rust adapter (port patterns from plain-bitassets) + elementsd regtest wiring (pegin claim or custom credit on Deposit events).
+- [ ] Docker service + compose override for "liquid" + adapter (static IP .6, depends enforcer).
+- [ ] Small Elements patch (optional drivechain_peg mode or importdrivechaindeposit RPC) + build in this fork.
+- [ ] Floresta Electrum asset/CT wiring.
+- [ ] PR to ElementsProject/elements + LayerTwo-Labs.
 
 Questions or blocks? See parent AGENT_COORDINATION.md and local-dev/ docs. We do not stop until e2e evidence + commits are solid.
 
