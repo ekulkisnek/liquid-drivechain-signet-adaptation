@@ -175,7 +175,7 @@ def run_bmm_loop(max_attempts=5):
             critical = block_hash
             print(f"[LOOP] elementsd height={height} -> target BMM height={target_height}")
             
-            # Build the exact command with progressing height (robust quoting)
+            # Build the exact command with progressing height (prefer host buf; docker fallback has known arm64/amd64 platform issue on this Mac)
             payload = json.dumps({
                 "sidechainId": 5,
                 "valueSats": {"value": 1000},
@@ -183,6 +183,7 @@ def run_bmm_loop(max_attempts=5):
                 "criticalHash": {"value": critical},
                 "prevBytes": {"value": "0000000000000000000000000000000000000000000000000000000000000000"}
             })
+            # Prefer native buf on host (avoids docker platform mismatch on arm64 Mac)
             cmd = [
                 "bash", "-c",
                 f'echo \'{payload}\' | buf curl --timeout 8s --emit-defaults --protocol grpc --http2-prior-knowledge -d @- http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1 || '
