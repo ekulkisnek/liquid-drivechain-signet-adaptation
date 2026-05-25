@@ -151,3 +151,6 @@ osx_volname
 dist/
 
 /guix-build-*
+
+tests/e2e-liquid-*.log
+tests/liquid-side-state.json
