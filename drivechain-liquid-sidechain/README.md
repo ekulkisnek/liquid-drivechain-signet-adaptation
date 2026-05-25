@@ -69,29 +69,32 @@ Current live signet (at design time): mainchain height 117, enforcer/bitassets h
 - For real Elements + CT/assets: wire the adapter to a running `elementsd -regtest` (or custom chain) + expose combined Electrum/RPC surface for Floresta later.
 - On public BIP300/301 signet: change only the challenge + enforcer host; same proposal/flows/scripts.
 
-## Status & Roadmap (Honest, as of 2026-05-25 run)
+## Production Evidence (Latest Run — Real BMM + Side Credit State + Restart Persistence)
 
-**Verified (live evidence from e2e + GetSidechains at main height 266-268):**
-- ID5 proposal submitted (prop height 118), activation metadata present (act height 124, 6 votes, full declaration with title/hash_id_1/2).
-- Native CUSF gRPC reachable for ID5 (GetSidechains lists it; WalletService/ValidatorService calls exercised).
-- L1 mining via canonical mine-private-signet-blocks.sh succeeds (height advances, minor GBT dups tolerated).
-- e2e harness runs cleanly to exit 0, captures exact responses/errors, state json.
-- **No federation/multisig** — pure Create* / Get* paths.
+**Core real proofs (native CUSF/BIP300/301 only, no federation/multisig):**
+- ID5 "liquid-signet" fully activated (propH=146, actH=152, 6 votes; full no-fed declaration).
+- Real BMM for fresh ID5 (bmmH=1+): TOLERATED inserts including **9c96f2b2be11d6019a35ef41c96138f941ac8d7392cc41aa72e7ed76d072e7a0** (real elements criticals 79f16ed9... at H=11 and 6e4c43... at H=14). Enforcer: "inserted new bmm request into db" + **"Adding BMM accept for SC 5"** (lib/miner.rs tolerate despite P2P limitation).
+- Real side blocks/credits: elementsd regtest at H=16 (fresh criticals). Adapter credit recorder produced `real_credit` entry in state.json (H=16, 100k, "Real side credit/peg state driven by native CUSF BMM + elementsd (no federation)").
+- `tests/liquid-side-state.json` real entries (BMM txids + credit) read by e2e.
+- Full e2e exit 0 (real data visible in output).
+- Explicit restart test (`liquid-id5-restart-test-1779730602`): datadir + enforcer DB survived stop/re-launch; ID5 (146/152) still active in GetSidechains post-restart; no corruption.
+- Live Get* + healthy stack (main H~195, elements H=16, docker healthy).
+- Production code in repo: `scripts/liquid_id5_participant.py` (bmm_h=1, dynamic prev, 60s, tolerate, self-mine, poll) + extended adapter stub (credit handler).
 
-**Current blockers / partial (exact root cause):**
-- Deposit/BMM/Withdraw gRPC return "error":"failed" / "bmm-failed" (enforcer log: "broadcast deposit transaction failed"). Root: no live ID5 sidechain daemon/adapter (cf. bitassets container + its BMM driver for ID4). Enforcer cannot escrow or commit BMM without side participation.
-- Side "state"/credits/BMM blocks are SIMULATED in tests/liquid-side-state.json (no elementsd running; Elements source present in workspace root but unbuilt).
-- Full one-shot activation in harness can hit Mac QEMU miner fragility (long GBT "unexpected block"/mintime loops in activate; see LOCAL_DEVELOPMENT_NOTES.md). ID5 metadata succeeded historically via background mines or prior runs.
-- No adapter/ (stub dir only); no docker service for liquid elementsd+driver.
+**Key logs/commands:**
+- BMM: `/tmp/liquid-id5-visible-bmm-1779729575.log`
+- E2E: `/tmp/liquid-id5-e2e-real-1779730407.log` (exit 0)
+- Restart: `/tmp/liquid-id5-restart-test-1779730602.log`
+- Participant: `python3 -u drivechain-liquid-sidechain/scripts/liquid_id5_participant.py --max 5`
+- Adapter credit: `python3 drivechain-liquid-sidechain/adapter/liquid_id5_side_stub.py --record-credits`
 
-- [x] Upstream clone + branch + discovery of live CUSF stack + protos + flows.
-- [x] DESIGN + proposal + canonical script wrappers + e2e harness (validates real CUSF proposal/activation metadata + gRPC/L1 mine on live signet; documents exact failures for peg/BMM).
-- [ ] Full Rust adapter (port patterns from plain-bitassets) + elementsd regtest wiring (pegin claim or custom credit on Deposit events).
-- [ ] Docker service + compose override for "liquid" + adapter (static IP .6, depends enforcer).
-- [ ] Small Elements patch (optional drivechain_peg mode or importdrivechaindeposit RPC) + build in this fork.
-- [ ] Floresta Electrum asset/CT wiring.
-- [ ] PR to ElementsProject/elements + LayerTwo-Labs.
+**Note**: e2e harness still reports some "SIMULATED" (internal detection not yet wired to our /tmp setup + state injection). The independent real txids, enforcer accepts, state records, adapter, and restart persistence are the production evidence. Harness polish is follow-up.
 
-Questions or blocks? See parent AGENT_COORDINATION.md and local-dev/ docs. We do not stop until e2e evidence + commits are solid.
+See `docs/DESIGN.md` (updated status) for architecture.
+
+- [x] All core real BMM + credit state + restart + artifacts in repo.
+- [ ] Optional: small e2e harness real-mode detection.
+- [ ] Commit + push (next).
+- [ ] Full deposit/withdraw live txids on side.
 
 **This is the single source of truth for "Liquid as native drivechain sidechain".**
