@@ -140,8 +140,15 @@ def attempt_real_bmm_for_id5():
         out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10)
         print("[REAL] BMM response:", out.decode()[:300])
         return True
+    except subprocess.CalledProcessError as e:
+        print(f"[REAL] BMM FAILED - returncode={e.returncode}")
+        if e.output:
+            print("Output:", e.output.decode()[:500])
+        if e.stderr:
+            print("Stderr:", e.stderr.decode()[:500])
+        return False
     except Exception as e:
-        print(f"[REAL] BMM attempt result: {e}")
+        print(f"[REAL] BMM attempt error: {e}")
         return False
 
 if __name__ == "__main__":
