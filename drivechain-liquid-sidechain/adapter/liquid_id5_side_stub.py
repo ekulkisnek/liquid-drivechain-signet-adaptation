@@ -5,11 +5,12 @@ liquid_id5_side_stub.py — Minimal Python sidechain participant stub for Liquid
 This is the critical missing piece for making the native CUSF sidechain slot (ID 5)
 actually functional on Luke's private drivechain signet.
 
-Current state (as of 2026-05-25):
-- ID5 proposal + activation metadata is LIVE on the enforcer (propH=118, actH=124, votes=6).
-- All CreateDeposit / CreateBmm / BroadcastWithdrawal for ID5 fail with
-  "broadcast deposit transaction failed" because there is no sidechain participant
-  driving BMMs and claiming deposits (unlike the plain_bitassets process for ID4).
+Current state (as of latest turn, mainchain height 277):
+- ID5 proposal + activation metadata is LIVE (propH=118, actH=124, votes=6).
+- Background Elements build (tmux elements-build) actively compiling in make phase.
+- Docker stack healthy (mainchain + enforcer + bitassets/ID4).
+- All CreateDeposit / CreateBmm / BroadcastWithdrawal for ID5 still fail with
+  "broadcast deposit transaction failed" — no sidechain participant for ID5 yet.
 
 Goal of this stub (v0.1 → production):
 - Connect to the CUSF enforcer (WalletService + ValidatorService) for sidechain_id=5.
