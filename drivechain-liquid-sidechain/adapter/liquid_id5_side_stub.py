@@ -159,6 +159,13 @@ if __name__ == "__main__":
 # === IMPROVED: Simple retry loop for real BMM (added this turn) ===
 def run_bmm_loop(max_attempts=5):
     print(f"[LOOP] Starting BMM retry loop (max {max_attempts} attempts) using live elementsd...")
+    # Wait for elementsd to be ready (fast readiness check)
+    for _ in range(15):
+        bh, h = get_elements_best_block()
+        if bh:
+            print(f"[LOOP] elementsd ready at height {h}")
+            break
+        time.sleep(2)
     for i in range(max_attempts):
         print(f"[LOOP] Attempt {i+1}/{max_attempts}")
         block_hash, height = get_elements_best_block()
