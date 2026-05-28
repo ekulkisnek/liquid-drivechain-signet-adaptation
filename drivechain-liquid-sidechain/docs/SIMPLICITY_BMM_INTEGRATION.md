@@ -49,7 +49,8 @@ if (DeploymentActiveAfter(pindex->pprev, consensusparams, Consensus::DEPLOYMENT_
 }
 ```
 - **Liquid Testnet** (chainparams.cpp:1095): `ALWAYS_ACTIVE` (unconditional).
-- Other nets (main, regtest, signet variants): `NEVER_ACTIVE` or future date (e.g. 2025-04-14 in one signet-derived param set at line 1358).
+- **Regtest** (chainparams.cpp:640): `ALWAYS_ACTIVE` as of this commit (no -evbparams=simplicity:0::1:1 needed; matches Liquid Testnet pattern). Previously required explicit evbparams for activation in regtest/custom chains.
+- Other nets (main, signet variants): `NEVER_ACTIVE` or future date (e.g. 2025-04-14 in one signet-derived param set at line 1358).
 - Also added to `STANDARD_SCRIPT_VERIFY_FLAGS` in policy/policy.h:84.
 - In `GetBlockScriptFlags` this flows to every input's script evaluation for blocks (BMM or otherwise).
 

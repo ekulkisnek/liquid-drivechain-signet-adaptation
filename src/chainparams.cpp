@@ -635,9 +635,9 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nPeriod = 128; // test ability to change from default
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nThreshold = 128;
 
-        // Simplicity
+        // Simplicity (YOLO: force active for the first 0xbe tx broadcast task)
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit = 21;
-        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height = 0; // No activation delay
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nPeriod = 128; // test ability to change from default
@@ -1635,6 +1635,12 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].min_activation_height = 0; // No activation delay
+
+        // YOLO: Force Simplicity active immediately in elements regtest for the broadcast task (bypasses evbparams flakiness)
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit = 21;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height = 0;
 
         UpdateElementsActivationParametersFromArgs(consensus, args);
 
