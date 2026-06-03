@@ -13,3 +13,6 @@
 }{"asset":"L-BTC","amount":100000,"to":"s5_liquidtestdeposit_1779732021_checksum","source_deposit_txid":"pending","main_height":"196","simulated":true}
 {"height":1,"main_inclusion_hash":"000000a686ebd9e9c995474e9ca8c6981210b3f47fb0f86e3c8671b4683058ab","bmm_critical":"deadbeef000000000000000000000000000000000000000000000000000000c6","bmm_tx":"","simulated":true}
 {"from":"s5_liquidtestdeposit_1779732021_checksum","to":"s5_liquiduser_1779732032","asset":"L-BTC","amount":50000,"elements_txid":"liquid-tx-1779732032","side_height":1}
+{"asset":"L-BTC","amount":100000,"to":"s5_liquidtestdeposit_1779997791_checksum","source_deposit_txid":"pending","main_height":"1064","simulated":true}
+{"height":1,"main_inclusion_hash":"000000996e7e4702e5f6f6e7b00e1008d7d1240b706bf897589108bf7848cc1f","bmm_critical":"deadbeef0000000000000000000000000000000000000000000000000000042a","bmm_tx":"","simulated":true}
+{"from":"s5_liquidtestdeposit_1779997791_checksum","to":"s5_liquiduser_1779997824","asset":"L-BTC","amount":50000,"elements_txid":"liquid-tx-1779997824","side_height":1}
