@@ -290,7 +290,7 @@ def reconcile_deposits(args: argparse.Namespace, state: dict[str, Any]) -> list[
     end_hash = get_tip_hash(args)
     payload = {
         "sidechainId": args.sidechain_id,
-        "endBlockHash": end_hash,
+        "endBlockHash": {"hex": end_hash},
     }
     peg_data = grpc_curl(
         args.enforcer,
@@ -380,7 +380,7 @@ def broadcast_withdrawal(args: argparse.Namespace, state: dict[str, Any]) -> dic
 def reconcile_withdrawals(args: argparse.Namespace, state: dict[str, Any]) -> list[dict[str, Any]]:
     end_hash = get_tip_hash(args)
     payload = {
-        "blockHash": end_hash,
+        "blockHash": {"hex": end_hash},
         "sidechainId": args.sidechain_id,
     }
     block_info = grpc_curl(

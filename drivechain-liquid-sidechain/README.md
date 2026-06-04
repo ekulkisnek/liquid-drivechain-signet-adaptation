@@ -50,7 +50,9 @@ See `src/pegins.cpp`, `src/pegins.h`, `src/consensus/tx_verify.cpp` (IsValidPegi
 
 v1 uses regtest + adapter-driven credits (or pegin claims against a bridge single-key fedpegscript). Future: small patch for native "drivechain_peg" mode or in-process gRPC client.
 
-Build from this workspace source when needed: `./autogen.sh && ./configure --enable-wallet ... && make`.
+Build from this workspace source when needed: `./autogen.sh && ./configure --enable-wallet --with-gui ... && make` (then run `./src/qt/elements-qt` or the installed elements-qt for the GUI wallet).
+
+The Qt GUI now includes improved L-BTC branding and a basic "Issue Asset..." action (in toolbar and File menu) providing simple asset issuance UI on top of the `issueasset` RPC for Liquid wallet functionality.
 
 ## Validation Gates (Evidence Every Turn)
 
