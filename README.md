@@ -21,6 +21,19 @@ Elements supports a few different pre-set chains for syncing. Note though some a
 * Bitcoin regtest mode: `elementsd -chain=regtest`
 * Elements custom chains: Any other `-chain=` argument. It has regtest-like default parameters that can be over-ridden by the user by a rich set of start-up options.
 
+### Drivechain / BIP 300/301 Adaptation (Liquid as Native Sidechain)
+
+This tree also contains an adaptation (`liquid-drivechain-signet-adaptation` branch + `drivechain-liquid-sidechain/` directory) that lets you run Liquid/Elements as a **native BIP 300/301 drivechain sidechain** (with Confidential Transactions, assets, Simplicity, etc.) on a patched Bitcoin signet, using only CUSF mechanisms (no federation).
+
+See `drivechain-liquid-sidechain/README.md` (especially the section "Setting Up the Liquid Node on a New Signet + New Sidechain ID (BIP 300/301 + Blind Merged Mining)") for:
+- Bootstrapping a fresh L1 signet + enforcer.
+- Choosing and activating an unused sidechain slot (0-255).
+- Running an isolated `elementsd` for that slot.
+- Full Blind Merged Mining (BIP 301 BMM) setup, both manual and automated (participant scripts + adapter).
+- Deposits, withdrawals, and end-to-end flows.
+
+The same pattern works for any new signet or new sidechain number.
+
 Confidential Assets
 ----------------
 The latest feature in the Elements blockchain platform is Confidential Assets,
