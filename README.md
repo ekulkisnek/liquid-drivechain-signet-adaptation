@@ -21,6 +21,184 @@ Elements supports a few different pre-set chains for syncing. Note though some a
 * Bitcoin regtest mode: `elementsd -chain=regtest`
 * Elements custom chains: Any other `-chain=` argument. It has regtest-like default parameters that can be over-ridden by the user by a rich set of start-up options.
 
+Drivechain signet adaptation
+----------------------------
+
+This branch adapts the Liquid/Elements wallet peg-out path to use a BIP300
+drivechain withdrawal bundle instead of the legacy federated/PAK
+`sendtomainchain` path. It is intended to run as an Elements sidechain attached
+to a Bitcoin signet mainchain that is coordinated by a BIP300/301 enforcer and
+a BIP301 blind merge mining (BMM) miner.
+
+### Connect to a new Bitcoin signet
+
+Start the Bitcoin mainchain node first. The mainchain node must be on the same
+signet as the enforcer and miner, and the miner must be able to sign blocks for
+that signet challenge.
+
+A minimal private signet `bitcoin.conf` looks like:
+
+```ini
+signet=1
+server=1
+txindex=1
+rpcuser=<rpc-user>
+rpcpassword=<rpc-password>
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+signetchallenge=<hex-script>
+```
+
+Use a fresh Bitcoin data directory for each new signet. If this is a private
+signet, keep the block-signing key for `signetchallenge` available to the
+mainchain miner; otherwise `generatetoaddress`/the signet miner will not be
+able to create valid blocks.
+
+Start `elementsd` with peg-in validation pointed at that signet node:
+
+```sh
+src/elementsd \
+  -chain=<elements-chain-name> \
+  -daemon \
+  -validatepegin=1 \
+  -mainchainrpchost=127.0.0.1 \
+  -mainchainrpcport=38332 \
+  -mainchainrpcuser=<rpc-user> \
+  -mainchainrpcpassword=<rpc-password>
+```
+
+Cookie auth can be used instead of `mainchainrpcuser`/`mainchainrpcpassword`:
+
+```sh
+src/elementsd \
+  -chain=<elements-chain-name> \
+  -daemon \
+  -validatepegin=1 \
+  -mainchainrpchost=127.0.0.1 \
+  -mainchainrpcport=38332 \
+  -mainchainrpccookiefile=/path/to/bitcoin/signet/.cookie
+```
+
+For a production-style deployment, use explicit config files and separate data
+directories for the Bitcoin signet node, the enforcer, and every Elements
+sidechain node.
+
+### Choose an unused sidechain number
+
+Every BIP300 sidechain on the same signet must use a unique sidechain number.
+Before launching a new Liquid sidechain:
+
+1. Check the enforcer/signet state and list the sidechain numbers already
+   registered by other sidechains.
+2. Pick a sidechain number that is not already registered or reserved on that
+   signet.
+3. Register/propose that same number with the BIP300/301 enforcer.
+4. Start this Elements node with the same number in its drivechain environment.
+
+This branch defaults to sidechain ID `5` for the drivechain peg-out broadcaster.
+Override it for a new deployment:
+
+```sh
+export ELEMENTS_DRIVECHAIN_SIDECHAIN_ID=<unused-sidechain-number>
+```
+
+The sidechain ID used by `ELEMENTS_DRIVECHAIN_SIDECHAIN_ID`, the enforcer
+sidechain registration, the BMM miner, wallet tooling, and any mobile clients
+must all match. If they do not, peg-outs can be broadcast to the wrong
+sidechain slot or fail to be recognized by the mainchain.
+
+### Configure BIP301 blind merge mining
+
+BIP301 BMM is coordinated by the mainchain/enforcer/miner stack, not by
+ordinary proof-of-work inside `elementsd`. The required pieces are:
+
+1. A Bitcoin signet node using the intended `signetchallenge`.
+2. A BIP300/301 enforcer connected to that Bitcoin node.
+3. The selected sidechain number proposed and activated in the enforcer.
+4. A miner that can create signet blocks and include BIP301 BMM commitments for
+   the selected sidechain number.
+5. A funded mainchain wallet for BMM critical-data transactions and withdrawal
+   bundle fees.
+
+The high-level BMM loop is:
+
+1. Build or receive the next Elements sidechain block candidate.
+2. Ask the BIP300/301 enforcer/miner to commit that candidate's critical data
+   for `ELEMENTS_DRIVECHAIN_SIDECHAIN_ID`.
+3. Mine/sign a Bitcoin signet block that includes the BIP301 BMM commitment.
+4. Let the enforcer and sidechain nodes sync the new mainchain block.
+5. Confirm the sidechain tip advances and the enforcer reports the BMM
+   inclusion for that sidechain number.
+
+When running a local private signet, mine blocks with the configured signet
+miner or with Bitcoin Core RPC if your setup supports direct generation:
+
+```sh
+ADDR=$(bitcoin-cli -signet getnewaddress)
+bitcoin-cli -signet generatetoaddress 1 "$ADDR"
+```
+
+For private signets that require explicit signing, use the miner command/script
+that has access to the signing key matching `signetchallenge`.
+
+### Configure drivechain peg-out RPC
+
+The adapted `sendtomainchain` RPC broadcasts a BIP300 withdrawal bundle through
+the enforcer gRPC API. Configure the enforcer endpoint before starting
+`elementsd`:
+
+```sh
+export ELEMENTS_DRIVECHAIN_SIDECHAIN_ID=<unused-sidechain-number>
+export ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER=127.0.0.1:50051
+export ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS=500
+```
+
+`ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS` is subtracted from the withdrawal
+amount and encoded as the mainchain fee output in the withdrawal bundle. It
+must be non-negative and less than the peg-out amount.
+
+Then start the node from the same environment:
+
+```sh
+src/elementsd \
+  -chain=<elements-chain-name> \
+  -daemon \
+  -validatepegin=1 \
+  -mainchainrpchost=127.0.0.1 \
+  -mainchainrpcport=38332 \
+  -mainchainrpccookiefile=/path/to/bitcoin/signet/.cookie
+```
+
+Peg out with:
+
+```sh
+src/elements-cli -chain=<elements-chain-name> sendtomainchain "<bitcoin-signet-address>" 0.01 false true
+```
+
+With `verbose=true`, the result includes a `drivechain_pegout` object with the
+sidechain ID, enforcer endpoint, withdrawal bundle hex, broadcaster response,
+and sidechain peg-out transaction hex. Save this output when testing a new
+signet because it is the easiest way to confirm the wallet used the intended
+sidechain number.
+
+### Validation checklist
+
+Before considering a new signet deployment ready:
+
+* `bitcoin-cli -signet getblockchaininfo` reports the expected signet and
+  blocks are being signed/mined.
+* The enforcer is synced to the same Bitcoin signet tip.
+* The selected sidechain number is proposed and activated in the enforcer.
+* The BMM miner is producing BIP301 commitments for that sidechain number.
+* `elementsd` is connected to the same mainchain RPC and has a fresh data
+  directory.
+* `getpeginaddress`, mainchain funding, and `claimpegin` work on the new
+  signet.
+* `sendtomainchain` returns a `drivechain_pegout` object with the expected
+  `sidechain_id` and enforcer endpoint.
+* After enough BIP300 acknowledgement/confirmation blocks, the mainchain
+  enforcer reports the withdrawal bundle as accepted/confirmed.
+
 Confidential Assets
 ----------------
 The latest feature in the Elements blockchain platform is Confidential Assets,
@@ -79,4 +257,3 @@ https://github.com/ElementsProject/elementsproject.github.io
 Secure Reporting
 ------------------
 See [our vulnerability reporting guide](SECURITY.md)
-
