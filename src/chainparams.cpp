@@ -659,10 +659,21 @@ public:
         pegin_minimum = PeginMinimum();
         consensus.has_parent_chain = false;
         g_signed_blocks = false;
-        g_con_elementsmode = false;
+        // RedWallet's phone-local Liquid wallet uses Liquid Wallet Kit, which
+        // produces Elements transaction serialization. Keep local regtest on
+        // Elements semantics by default so real LWK transactions can be
+        // decoded, validated, mined, and indexed during device E2E runs.
+        g_con_elementsmode = gArgs.GetBoolArg("-con_elementsmode", true);
         consensus.elements_mode = g_con_elementsmode;
         g_con_blockheightinheader = false;
         consensus.total_valid_epochs = 0;
+        if (g_con_elementsmode) {
+            std::vector<unsigned char> commit = CommitToArguments(consensus, strNetworkID);
+            uint256 entropy;
+            GenerateAssetEntropy(entropy, COutPoint(uint256(commit), 0), parentGenesisBlockHash);
+            CalculateAsset(consensus.pegged_asset, entropy);
+            consensus.subsidy_asset = consensus.pegged_asset;
+        }
 
         pchMessageStart[0] = 0xfa;
         pchMessageStart[1] = 0xbf;
@@ -677,8 +688,10 @@ public:
 
         genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN, consensus);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256S("0x0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"));
-        assert(genesis.hashMerkleRoot == uint256S("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
+        if (!g_con_elementsmode) {
+            assert(consensus.hashGenesisBlock == uint256S("0x0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"));
+            assert(genesis.hashMerkleRoot == uint256S("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
+        }
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();

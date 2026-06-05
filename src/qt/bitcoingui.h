@@ -145,6 +145,7 @@ private:
     QAction* aboutAction = nullptr;
     QAction* receiveCoinsAction = nullptr;
     QAction* issueAssetAction = nullptr;
+    QAction* lwkWalletAction = nullptr;
     QAction* optionsAction = nullptr;
     QAction* encryptWalletAction = nullptr;
     QAction* backupWalletAction = nullptr;
@@ -281,6 +282,8 @@ public Q_SLOTS:
 
     /** Show Issue Asset dialog for basic Liquid asset wallet functionality */
     void issueAssetClicked();
+    /** Show LWK Wallet dialog for basic Liquid Wallet Kit functionality */
+    void lwkWalletClicked();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");

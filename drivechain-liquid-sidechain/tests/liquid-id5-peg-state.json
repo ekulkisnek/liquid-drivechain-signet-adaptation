@@ -1,0 +1,66 @@
+{
+  "deposits": [
+    {
+      "address": "liquidpegin_codex_1780525034",
+      "created_at": "2026-06-03T22:17:45.074312Z",
+      "enforcer_response": {
+        "txid": {
+          "hex": "36d5a8d15e14d4321d4856c5dbe0c3beb3bc88fdf3232c0065afd73332c27cfd"
+        }
+      },
+      "fee_sats": 2000,
+      "sidechain_activation": {
+        "activationHeight": 1955,
+        "declaration": {
+          "v0": {
+            "description": "Liquid/Elements sidechain as native BIP300/301 drivechain (no federation or multisig pegin). Brings confidential transactions (CT), native assets, rich scripting, and dynafed options to the drivechain ecosystem on private signet. Fully compatible with CUSF enforcer WalletService/ValidatorService and future real BIP300/301 signets. ID 5 as defined in liquid-signet-sidechain fork of ElementsProject/elements.",
+            "hashId1": {
+              "hex": "0000000000000000000000000000000000000000000000000000000000000005"
+            },
+            "hashId2": {
+              "hex": "0000000000000000000000000000000000000005"
+            },
+            "title": "liquid-signet"
+          }
+        },
+        "description": {
+          "hex": "fddc01000d6c69717569642d7369676e65744c69717569642f456c656d656e74732073696465636861696e206173206e6174697665204249503330302f333031206472697665636861696e20286e6f2066656465726174696f6e206f72206d756c746973696720706567696e292e204272696e677320636f6e666964656e7469616c207472616e73616374696f6e7320284354292c206e6174697665206173736574732c207269636820736372697074696e672c20616e642064796e61666564206f7074696f6e7320746f20746865206472697665636861696e2065636f73797374656d206f6e2070726976617465207369676e65742e2046756c6c7920636f6d70617469626c652077697468204355534620656e666f726365722057616c6c6574536572766963652f56616c696461746f725365727669636520616e6420667574757265207265616c204249503330302f333031207369676e6574732e204944203520617320646566696e656420696e206c69717569642d7369676e65742d73696465636861696e20666f726b206f6620456c656d656e747350726f6a6563742f656c656d656e74732e00000000000000000000000000000000000000000000000000000000000000050000000000000000000000000000000000000005"
+        },
+        "proposalHeight": 1949,
+        "sidechainNumber": 5,
+        "voteCount": 6
+      },
+      "status": "created_pending_confirmation",
+      "txid": "36d5a8d15e14d4321d4856c5dbe0c3beb3bc88fdf3232c0065afd73332c27cfd",
+      "value_sats": 100000
+    }
+  ],
+  "events": [
+    {
+      "error": "command failed (32): buf curl --timeout 30s --emit-defaults --protocol grpc --http2-prior-knowledge -d {\"sidechainId\":5,\"address\":\"liquidpegin_codex_1780524975\",\"valueSats\":100000,\"feeSats\":2000} http://127.0.0.1:50051/cusf.mainchain.v1.WalletService/CreateDepositTransaction\n{\n   \"code\": \"deadline_exceeded\",\n   \"message\": \"context deadline exceeded\"\n}",
+      "kind": "bridge_error",
+      "ts": "2026-06-03T22:16:45.763904Z"
+    },
+    {
+      "kind": "deposit_created",
+      "ts": "2026-06-03T22:17:45.074606Z",
+      "txid": "36d5a8d15e14d4321d4856c5dbe0c3beb3bc88fdf3232c0065afd73332c27cfd"
+    },
+    {
+      "error": "command failed (1): buf curl --timeout 30s --emit-defaults --protocol grpc --http2-prior-knowledge -d {\"sidechainId\":5,\"endBlockHash\":\"000001ece233f4830425a59af3fb09b670d13496e3af46bfbb8d9f8150cbff74\"} http://127.0.0.1:50051/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData\nFailure: json unmarshal: proto: syntax error (line 1:33): unexpected token \"000001ece233f4830425a59af3fb09b670d13496e3af46bfbb8d9f8150cbff74\"",
+      "kind": "bridge_error",
+      "ts": "2026-06-03T22:18:12.720180Z"
+    },
+    {
+      "deposit_count": 1,
+      "elements_import_hook_available": false,
+      "end_block_hash": "000001ece233f4830425a59af3fb09b670d13496e3af46bfbb8d9f8150cbff74",
+      "kind": "deposits_reconciled",
+      "ts": "2026-06-03T22:18:38.157587Z"
+    }
+  ],
+  "schema": "liquid-id5-peg-state-v1",
+  "sidechain_id": 5,
+  "updated_at": "2026-06-04T03:12:06.105897Z",
+  "withdrawals": []
+}
