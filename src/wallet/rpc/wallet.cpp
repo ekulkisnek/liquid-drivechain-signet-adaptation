@@ -667,6 +667,7 @@ RPCHelpMan generatepegoutproof();
 RPCHelpMan getpeginaddress();
 RPCHelpMan getpegoutkeys();
 RPCHelpMan getwalletpakinfo();
+RPCHelpMan importdrivechaindeposit();
 RPCHelpMan importblindingkey();
 RPCHelpMan importissuanceblindingkey();
 RPCHelpMan importmasterblindingkey();
@@ -755,6 +756,7 @@ static const CRPCCommand commands[] =
     { "wallet",             &getpeginaddress,                },
     { "wallet",             &claimpegin,                     },
     { "wallet",             &createrawpegin,                 },
+    { "wallet",             &importdrivechaindeposit,        },
     { "wallet",             &blindrawtransaction,            },
     { "wallet",             &unblindrawtransaction,          },
     { "wallet",             &sendtomainchain,                },

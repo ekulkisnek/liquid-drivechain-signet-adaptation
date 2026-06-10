@@ -1012,7 +1012,6 @@ RPCHelpMan sendtomainchain()
 }
 
 extern UniValue signrawtransaction(const JSONRPCRequest& request);
-extern UniValue sendrawtransaction(const JSONRPCRequest& request);
 
 template <typename T_tx_ref, typename T_merkle_block>
 static UniValue createrawpegin(const JSONRPCRequest& request, T_tx_ref& txBTCRef, T_merkle_block& merkleBlock)
@@ -1315,6 +1314,142 @@ RPCHelpMan claimpegin()
     pwallet->CommitTransaction(MakeTransactionRef(mtx), mapValue, {} /* orderForm */);
 
     return mtx.GetHash().GetHex();
+},
+    };
+}
+
+RPCHelpMan importdrivechaindeposit()
+{
+    return RPCHelpMan{"importdrivechaindeposit",
+                "\nImport a trusted BIP300/301 drivechain deposit observed by the bridge into this Elements wallet.\n"
+                "This RPC is intended for the local drivechain bridge after it has reconciled the deposit\n"
+                "against CUSF GetTwoWayPegData. It creates and broadcasts a real sidechain pegin\n"
+                "transaction so the credited output is anchored in the sidechain UTXO set.\n",
+                {
+                    {"mainchain_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The mainchain deposit transaction id observed in two-way-peg data."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The Elements address to credit."},
+                    {"value_sats", RPCArg::Type::NUM, RPCArg::Optional::NO, "The deposit value in satoshis."},
+                    {"fee_sats", RPCArg::Type::NUM, RPCArg::Default{1000}, "The sidechain relay fee to subtract from the credited output."},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR_HEX, "txid", "The deterministic wallet credit transaction id."},
+                        {RPCResult::Type::STR_HEX, "mainchain_txid", "The mainchain deposit transaction id."},
+                        {RPCResult::Type::STR, "address", "The credited Elements address."},
+                        {RPCResult::Type::STR_AMOUNT, "amount", "The credited amount in pegged asset units."},
+                        {RPCResult::Type::NUM, "value_sats", "The credited amount in satoshis."},
+                        {RPCResult::Type::NUM, "deposit_value_sats", "The deposit input value in satoshis."},
+                        {RPCResult::Type::NUM, "fee_sats", "The sidechain relay fee subtracted from the credited output."},
+                        {RPCResult::Type::STR_HEX, "hex", "The sidechain transaction hex."},
+                        {RPCResult::Type::BOOL, "already_imported", "Whether this sidechain deposit transaction was already known."},
+                        {RPCResult::Type::BOOL, "broadcast", "Whether the transaction was broadcast by this call."},
+                    },
+                },
+                RPCExamples{
+                    HelpExampleCli("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" \"el1qq...\" 100000")
+            + HelpExampleRpc("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", \"el1qq...\", 100000")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
+    if (!wallet) return NullUniValue;
+    CWallet* const pwallet = wallet.get();
+
+    const std::string mainchain_txid_str = request.params[0].get_str();
+    if (!IsHex(mainchain_txid_str) || mainchain_txid_str.size() != 64) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "mainchain_txid must be a 32-byte hex transaction id");
+    }
+
+    const std::string address = request.params[1].get_str();
+    const CTxDestination dest = DecodeDestination(address);
+    if (!IsValidDestination(dest)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Elements address");
+    }
+
+    int64_t value_sats{0};
+    if (request.params[2].isNum()) {
+        value_sats = request.params[2].get_int64();
+    } else if (request.params[2].isStr() && ParseInt64(request.params[2].get_str(), &value_sats)) {
+        // Allow elements-cli and bridge callers that serialize the satoshi amount as a string.
+    } else {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be an integer number of satoshis");
+    }
+    if (value_sats <= 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be greater than zero");
+    }
+    if (value_sats > std::numeric_limits<CAmount>::max()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats is too large");
+    }
+    int64_t fee_sats{1000};
+    if (request.params.size() > 3 && !request.params[3].isNull()) {
+        if (request.params[3].isNum()) {
+            fee_sats = request.params[3].get_int64();
+        } else if (request.params[3].isStr() && ParseInt64(request.params[3].get_str(), &fee_sats)) {
+        } else {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_sats must be an integer number of satoshis");
+        }
+    }
+    if (fee_sats < 0 || fee_sats >= value_sats) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_sats must be non-negative and less than value_sats");
+    }
+    const CAmount deposit_amount = value_sats;
+    const CAmount amount = value_sats - fee_sats;
+
+    if (pwallet->chain().isInitialBlockDownload()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Drivechain deposits cannot be imported during initial sync or reindexing.");
+    }
+
+    const uint256 mainchain_txid = uint256S(mainchain_txid_str);
+    CMutableTransaction mtx;
+    mtx.nVersion = 2;
+
+    CTxIn pegin_input(COutPoint(mainchain_txid, 0), CScript(), CTxIn::SEQUENCE_FINAL);
+    pegin_input.m_is_pegin = true;
+    mtx.vin.push_back(pegin_input);
+    mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, amount, GetScriptForDestination(dest)));
+    if (fee_sats > 0) {
+        mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, fee_sats, CScript()));
+    }
+    mtx.witness.vtxinwit.resize(1);
+    mtx.witness.vtxinwit[0].m_pegin_witness = CreateDrivechainDepositPeginWitness(
+        deposit_amount,
+        Params().GetConsensus().pegged_asset,
+        Params().ParentGenesisBlockHash(),
+        CScript() << OP_TRUE,
+        mainchain_txid);
+
+    CTransactionRef tx_ref = MakeTransactionRef(mtx);
+    const uint256 side_txid = tx_ref->GetHash();
+    const std::string tx_hex = EncodeHexTx(*tx_ref);
+    bool already_imported = pwallet->GetWalletTx(side_txid) != nullptr;
+    bool broadcast = false;
+
+    if (!already_imported) {
+        std::string err_string;
+        if (pwallet->chain().broadcastTransaction(tx_ref, /*max_tx_fee=*/0, /*relay=*/true, err_string)) {
+            broadcast = true;
+        } else if (err_string.find("already in block chain") != std::string::npos ||
+                   err_string.find("txn-already-in-mempool") != std::string::npos ||
+                   err_string.find("Transaction already in block chain") != std::string::npos) {
+            already_imported = true;
+        } else {
+            throw JSONRPCError(RPC_TRANSACTION_REJECTED, err_string);
+        }
+    }
+
+    UniValue ret(UniValue::VOBJ);
+        ret.pushKV("txid", side_txid.GetHex());
+        ret.pushKV("mainchain_txid", mainchain_txid.GetHex());
+        ret.pushKV("address", address);
+        ret.pushKV("amount", ValueFromAmount(amount));
+        ret.pushKV("value_sats", value_sats);
+        ret.pushKV("deposit_value_sats", deposit_amount);
+        ret.pushKV("fee_sats", fee_sats);
+    ret.pushKV("hex", tx_hex);
+    ret.pushKV("already_imported", already_imported);
+    ret.pushKV("broadcast", broadcast);
+    return ret;
 },
     };
 }

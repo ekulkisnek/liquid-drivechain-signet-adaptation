@@ -24,6 +24,12 @@ bool GetAmountFromParentChainPegin(CAmount& amount, const CTransaction& txBTC, u
 bool CheckParentProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
 /** Checks pegin witness for validity */
 bool IsValidPeginWitness(const CScriptWitness& pegin_witness, const std::vector<std::pair<CScript, CScript>>& fedpegscripts, const COutPoint& prevout, std::string& err_msg, bool check_depth, bool* depth_failed = nullptr);
+/** Checks whether a pegin witness is a trusted BIP300/301 drivechain deposit import. */
+bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness, const COutPoint& prevout, CAmount* value = nullptr, CScript* claim_script = nullptr);
+/** Return the duplicate-claim key used for sidechain pegin/deposit spent tracking. */
+std::pair<uint256, COutPoint> GetPeginSpentKey(const CScriptWitness& pegin_witness, const COutPoint& prevout);
+/** Create a pegin witness for a trusted BIP300/301 drivechain deposit import. */
+CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value, const CAsset& asset, const uint256& genesis_hash, const CScript& claim_script, const uint256& mainchain_txid);
 
 /* Consensus-critical. Matching against telescoped multisig used on Liquid v1:
  * Pseudo-structure:

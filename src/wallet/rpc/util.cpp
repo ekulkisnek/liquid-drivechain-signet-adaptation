@@ -9,6 +9,7 @@
 #include <util/url.h>
 #include <wallet/context.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 
 #include <univalue.h>
 
@@ -52,6 +53,37 @@ bool GetWalletNameFromJSONRPCRequest(const JSONRPCRequest& request, std::string&
     return false;
 }
 
+static std::shared_ptr<CWallet> LoadOrCreateDefaultWallet(WalletContext& context)
+{
+    constexpr const char* DEFAULT_BITWINDOW_WALLET = "default";
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    load_options.verify = false;
+    DatabaseStatus load_status;
+    bilingual_str load_error;
+    std::vector<bilingual_str> load_warnings;
+    if (auto wallet = LoadWallet(context, DEFAULT_BITWINDOW_WALLET, /*load_on_start=*/true, load_options, load_status, load_error, load_warnings)) {
+        return wallet;
+    }
+    if (load_status != DatabaseStatus::FAILED_NOT_FOUND) {
+        throw JSONRPCError(RPC_WALLET_ERROR, load_error.original);
+    }
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+#ifdef USE_SQLITE
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+#endif
+    DatabaseStatus create_status;
+    bilingual_str create_error;
+    std::vector<bilingual_str> create_warnings;
+    if (auto wallet = CreateWallet(context, DEFAULT_BITWINDOW_WALLET, /*load_on_start=*/true, create_options, create_status, create_error, create_warnings)) {
+        return wallet;
+    }
+    throw JSONRPCError(RPC_WALLET_ERROR, create_error.original);
+}
+
 std::shared_ptr<CWallet> GetWalletForJSONRPCRequest(const JSONRPCRequest& request)
 {
     CHECK_NONFATAL(request.mode == JSONRPCRequest::EXECUTE);
@@ -70,8 +102,7 @@ std::shared_ptr<CWallet> GetWalletForJSONRPCRequest(const JSONRPCRequest& reques
     }
 
     if (wallets.empty()) {
-        throw JSONRPCError(
-            RPC_WALLET_NOT_FOUND, "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet. (Note: A default wallet is no longer automatically created)");
+        return LoadOrCreateDefaultWallet(context);
     }
     throw JSONRPCError(RPC_WALLET_NOT_SPECIFIED,
         "Wallet file not specified (must request wallet RPC through /wallet/<filename> uri-path).");

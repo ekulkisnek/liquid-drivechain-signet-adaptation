@@ -683,6 +683,15 @@ private:
             CAmount parent_fee = 0;
             uint32_t parent_vsize = 0;
             for (size_t i = 0; i < pegin_indices.size(); ++i) {
+                if (IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[pegin_indices[i]].m_pegin_witness, tx.vin[pegin_indices[i]].prevout)) {
+                    CAmount drivechain_value;
+                    if (!IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[pegin_indices[i]].m_pegin_witness, tx.vin[pegin_indices[i]].prevout, &drivechain_value)) {
+                        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "drivechain-deposit-invalid", "invalid drivechain deposit pegin witness");
+                    }
+                    value += drivechain_value;
+                    continue;
+                }
+
                 // get the parent txid and blockhash from the peg-in witness data
                 CAmount pvalue;
                 CAsset passet;
@@ -941,7 +950,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "pegin-no-witness", err_msg);
             }
 
-            std::pair<uint256, COutPoint> pegin = std::make_pair(uint256(tx.witness.vtxinwit[i].m_pegin_witness.stack[2]), tx.vin[i].prevout);
+            std::pair<uint256, COutPoint> pegin = GetPeginSpentKey(tx.witness.vtxinwit[i].m_pegin_witness, tx.vin[i].prevout);
             // This assumes non-null prevout and genesis block hash
             if (m_view.IsPeginSpent(pegin)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "pegin-already-claimed");
@@ -1815,7 +1824,7 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
             const CTxIn& txin = tx.vin[i];
             if (txin.m_is_pegin) {
                 const CTxInWitness& txinwit = tx.witness.vtxinwit[i];
-                std::pair<uint256, COutPoint> outpoint = std::make_pair(uint256(txinwit.m_pegin_witness.stack[2]), txin.prevout);
+                std::pair<uint256, COutPoint> outpoint = GetPeginSpentKey(txinwit.m_pegin_witness, txin.prevout);
                 inputs.SetPeginSpent(outpoint, true);
                 // Dummy undo
                 txundo.vprevout.emplace_back();
@@ -2017,7 +2026,7 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out, cons
         if (!IsValidPeginWitness(pegin_witness, fedpegscripts, txin.prevout, err, false)) {
             fClean = fClean && error("%s: peg-in occurred without proof", __func__);
         } else {
-            std::pair<uint256, COutPoint> outpoint = std::make_pair(uint256(pegin_witness.stack[2]), txin.prevout);
+            std::pair<uint256, COutPoint> outpoint = GetPeginSpentKey(pegin_witness, txin.prevout);
             bool fSpent = view.IsPeginSpent(outpoint);
             if (!fSpent) {
                 fClean = fClean && error("%s: peg-in bitcoin txid not marked spent", __func__);

@@ -210,7 +210,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
             if (tx.witness.vtxinwit.size() <= i || !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, prevout, err, true)) {
                 return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-pegin-witness", err);
             }
-            std::pair<uint256, COutPoint> pegin = std::make_pair(uint256(tx.witness.vtxinwit[i].m_pegin_witness.stack[2]), prevout);
+            std::pair<uint256, COutPoint> pegin = GetPeginSpentKey(tx.witness.vtxinwit[i].m_pegin_witness, prevout);
             if (inputs.IsPeginSpent(pegin)) {
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-double-pegin", strprintf("Double-pegin of %s:%d", prevout.hash.ToString(), prevout.n));
             }
