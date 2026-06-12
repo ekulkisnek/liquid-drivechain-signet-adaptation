@@ -19,6 +19,11 @@
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
+
+static constexpr const char* LAYER_TWO_LABS_SIGNET_CHALLENGE = "00148835832e28c816b7acd8fdb19772ab2199603a56";
+static constexpr const char* LAYER_TWO_LABS_SIGNET_SEED = "172.105.148.135:38333";
+static constexpr const char* LAYER_TWO_LABS_SIGNET_GENESIS = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6";
+
 static CScript StrHexToScriptWithDefault(std::string strScript, const CScript defaultScript)
 {
     CScript returnScript;
@@ -458,23 +463,19 @@ public:
         vSeeds.clear();
 
         if (!args.IsArgSet("-signetchallenge")) {
-            bin = ParseHex("512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae");
-            vSeeds.emplace_back("seed.signet.bitcoin.sprovoost.nl.");
+            bin = ParseHex(LAYER_TWO_LABS_SIGNET_CHALLENGE);
+            vSeeds.emplace_back(LAYER_TWO_LABS_SIGNET_SEED);
 
-            // Hardcoded nodes can be removed once there are more DNS seeds
-            vSeeds.emplace_back("178.128.221.177");
-            vSeeds.emplace_back("v7ajjeirttkbnt32wpy3c6w3emwnfr3fkla7hpxcfokr3ysd3kqtzmqd.onion:38333");
-
-            consensus.nMinimumChainWork = uint256S("0x000000000000000000000000000000000000000000000000000000de26b0e471");
-            consensus.defaultAssumeValid = uint256S("0x00000112852484b5fe3451572368f93cfd2723279af3464e478aee35115256ef"); // 78788
-            m_assumed_blockchain_size = 1;
+            consensus.nMinimumChainWork = uint256{};
+            consensus.defaultAssumeValid = uint256{};
+            m_assumed_blockchain_size = 0;
             m_assumed_chain_state_size = 0;
             chainTxData = ChainTxData{
-                // Data from RPC: getchaintxstats 4096 0000003d9144c56ac110ae04a0c271a0acce2f14f426b39fdf0d938c96d2eb09
-                /* nTime    */ 1645631279,
-                /* nTxCount */ 1257429,
-                /* dTxRate  */ 0.1389638742514995,
+                0,
+                0,
+                0,
             };
+            LogPrintf("Signet with default LayerTwo-Labs challenge %s\n", LAYER_TWO_LABS_SIGNET_CHALLENGE);
         } else {
             const auto signet_challenge = args.GetArgs("-signetchallenge");
             if (signet_challenge.size() != 1) {
@@ -571,6 +572,7 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256S("0x00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"));
         assert(genesis.hashMerkleRoot == uint256S("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
+        parentGenesisBlockHash = uint256S(LAYER_TWO_LABS_SIGNET_GENESIS);
 
         vFixedSeeds.clear();
 
