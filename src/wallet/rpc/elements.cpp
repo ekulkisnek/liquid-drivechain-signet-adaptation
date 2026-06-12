@@ -711,6 +711,7 @@ RPCHelpMan sendtomainchain_base()
     bool verbose = request.params[3].isNull() ? false: request.params[3].get_bool();
     mapValue_t mapValue;
     CCoinControl no_coin_control; // This is a deprecated API
+    no_coin_control.m_include_unsafe_inputs = true;
     UniValue send_result = SendMoney(*pwallet, no_coin_control, recipients, std::move(mapValue), true /* verbose */, true /* ignore_blind_fail */);
 
     const std::string txid_str = send_result.isObject() ? find_value(send_result, "txid").get_str() : send_result.get_str();
@@ -1393,12 +1394,11 @@ RPCHelpMan importdrivechaindeposit()
     if (fee_sats < 0 || fee_sats >= value_sats) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_sats must be non-negative and less than value_sats");
     }
+    if (!g_con_elementsmode) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Drivechain deposits require Elements transaction serialization; start the Liquid sidechain with -con_elementsmode=1.");
+    }
     const CAmount deposit_amount = value_sats;
     const CAmount amount = value_sats - fee_sats;
-
-    if (pwallet->chain().isInitialBlockDownload()) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Drivechain deposits cannot be imported during initial sync or reindexing.");
-    }
 
     const uint256 mainchain_txid = uint256S(mainchain_txid_str);
     CMutableTransaction mtx;
@@ -1412,6 +1412,7 @@ RPCHelpMan importdrivechaindeposit()
         mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, fee_sats, CScript()));
     }
     mtx.witness.vtxinwit.resize(1);
+    mtx.witness.vtxoutwit.resize(mtx.vout.size());
     mtx.witness.vtxinwit[0].m_pegin_witness = CreateDrivechainDepositPeginWitness(
         deposit_amount,
         Params().GetConsensus().pegged_asset,

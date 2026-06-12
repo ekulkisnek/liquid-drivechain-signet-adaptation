@@ -3,8 +3,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <asset.h>
 #include <core_io.h>
 #include <key_io.h>
+#include <policy/policy.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <util/translation.h>
@@ -24,6 +26,43 @@ bool HaveKey(const SigningProvider& wallet, const CKey& key)
     CKey key2;
     key2.Set(key.begin(), key.end(), !key.IsCompressed());
     return wallet.HaveKey(key.GetPubKey().GetID()) || wallet.HaveKey(key2.GetPubKey().GetID());
+}
+
+static RPCHelpMan balance()
+{
+    return RPCHelpMan{"balance",
+                "Returns sidechain wallet balance in the JSON shape expected by BitWindow sidechain adapters.\n",
+                {},
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::NUM, "total_sats", "Total pegged asset balance, including unconfirmed and immature wallet funds."},
+                        {RPCResult::Type::NUM, "available_sats", "Trusted pegged asset wallet balance."},
+                    }},
+                RPCExamples{
+                    HelpExampleCli("balance", "")
+                    + HelpExampleRpc("balance", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+
+    pwallet->BlockUntilSyncedToCurrentChain();
+
+    LOCK(pwallet->cs_wallet);
+
+    const auto bal = GetBalance(*pwallet);
+    const CAmount trusted = valueFor(bal.m_mine_trusted, ::policyAsset);
+    const CAmount pending = valueFor(bal.m_mine_untrusted_pending, ::policyAsset);
+    const CAmount immature = valueFor(bal.m_mine_immature, ::policyAsset);
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("total_sats", trusted + pending + immature);
+    obj.pushKV("available_sats", trusted);
+    return obj;
+},
+    };
 }
 
 static RPCHelpMan getwalletinfo()
@@ -687,6 +726,7 @@ static const CRPCCommand commands[] =
 { //  category              actor (function)
   //  ------------------    ------------------------
     { "rawtransactions",    &fundrawtransaction,             },
+    { "wallet",             &balance,                        },
     { "wallet",             &abandontransaction,             },
     { "wallet",             &abortrescan,                    },
     { "wallet",             &addmultisigaddress,             },

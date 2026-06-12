@@ -1734,6 +1734,10 @@ void CWallet::ReacceptWalletTransactions()
     for (std::pair<const uint256, CWalletTx>& item : mapWallet) {
         const uint256& wtxid = item.first;
         CWalletTx& wtx = item.second;
+        if (!wtx.tx) {
+            WalletLogPrintf("Skipping wallet transaction %s with missing transaction data\n", wtxid.ToString());
+            continue;
+        }
         assert(wtx.GetHash() == wtxid);
 
         int nDepth = GetTxDepthInMainChain(wtx);
