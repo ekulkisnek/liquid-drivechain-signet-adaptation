@@ -213,7 +213,7 @@ static UniValue RunDrivechainCommandParseJSON(const std::string& command)
 
 static UniValue BroadcastDrivechainWithdrawalBundle(const std::vector<unsigned char>& bundle_bytes)
 {
-    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 5);
+    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
     if (sidechain_id < 0) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
     }
