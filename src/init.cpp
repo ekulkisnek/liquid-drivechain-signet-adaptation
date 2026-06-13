@@ -333,7 +333,7 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
 
 static void DrivechainL1BlockSyncTick(NodeContext& node)
 {
-    if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", false)) {
+    if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", true)) {
         return;
     }
 
@@ -879,7 +879,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-mainchainrpcpassword=<pwd>", "The rpc password which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpccookiefile=<file>", "The bitcoind cookie auth path which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins. (default: `<datadir>/regtest/.cookie`)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. (default: %d)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncmaxcatchup=<n>", "Maximum number of sidechain blocks to mine in one -drivechainl1blocksync scheduler tick. (default: 100)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmm", "Submit BIP301 blind merge mining requests to the parent chain while -drivechainl1blocksync is enabled, using the generated sidechain block fees as the bid amount. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -2287,7 +2287,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         banman->DumpBanlist();
     }, DUMP_BANS_INTERVAL);
 
-    if (args.GetBoolArg("-drivechainl1blocksync", false)) {
+    if (args.GetBoolArg("-drivechainl1blocksync", true)) {
         const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
         LogPrintf("Starting drivechain L1 block sync scheduler, interval %d seconds, BIP301 BMM %s, sidechain slot %d\n",
             interval_seconds,
