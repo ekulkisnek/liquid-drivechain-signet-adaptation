@@ -8,6 +8,7 @@
 #include <core_io.h>
 #include <deploymentstatus.h>
 #include <dynafed.h>
+#include <hash.h>
 #include <issuance.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
@@ -32,6 +33,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <optional>
 #include <sys/wait.h>
 
 using wallet::BlindDetails;
@@ -116,6 +118,21 @@ static void PushBitcoinTxOut(std::vector<unsigned char>& bytes, CAmount amount, 
     bytes.insert(bytes.end(), script_pubkey.begin(), script_pubkey.end());
 }
 
+static std::vector<unsigned char> ToByteVector(const uint256& value)
+{
+    return std::vector<unsigned char>(value.begin(), value.end());
+}
+
+static CScript BuildDrivechainInputsCommitmentScript(const COutPoint& withdrawal_outpoint, uint32_t sidechain_block_height)
+{
+    std::vector<COutPoint> committed_inputs;
+    committed_inputs.push_back(withdrawal_outpoint);
+    committed_inputs.emplace_back(uint256::ZERO, sidechain_block_height);
+
+    const uint256 commitment = SerializeHash(committed_inputs, SER_GETHASH, 0);
+    return CScript() << OP_RETURN << ToByteVector(commitment);
+}
+
 static CScript BuildDrivechainPayoutScript(const std::string& destination)
 {
     if (destination.rfind("hex:", 0) == 0) {
@@ -159,7 +176,18 @@ static CScript BuildDrivechainPayoutScript(const std::string& destination)
     return CScript() << OP_RETURN << destination_bytes;
 }
 
-static std::vector<unsigned char> BuildDrivechainWithdrawalBundle(CAmount amount, const std::string& destination)
+struct DrivechainWithdrawalBundle
+{
+    std::vector<unsigned char> bytes;
+    uint256 m6id;
+};
+
+static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
+    CAmount amount,
+    const std::string& destination,
+    const COutPoint& withdrawal_outpoint,
+    uint32_t sidechain_block_height,
+    bool include_witness_marker)
 {
     const CAmount mainchain_fee = GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS", 0);
     if (mainchain_fee < 0 || mainchain_fee >= amount) {
@@ -172,18 +200,45 @@ static std::vector<unsigned char> BuildDrivechainWithdrawalBundle(CAmount amount
         fee_bytes.push_back((fee_sats >> (8 * i)) & 0xff);
     }
     const CScript fee_script = CScript() << OP_RETURN << fee_bytes;
+    const CScript inputs_commitment_script = BuildDrivechainInputsCommitmentScript(withdrawal_outpoint, sidechain_block_height);
     const CScript payout_script = BuildDrivechainPayoutScript(destination);
 
     std::vector<unsigned char> bytes;
     PushLE32(bytes, 2); // nVersion
-    bytes.push_back(0); // segwit marker; disambiguates an inputless tx from a non-witness tx
-    bytes.push_back(1); // segwit flag
+    if (include_witness_marker) {
+        bytes.push_back(0); // segwit marker; disambiguates an inputless tx from a non-witness tx
+        bytes.push_back(1); // segwit flag
+    }
     PushCompactSize(bytes, 0); // vin
-    PushCompactSize(bytes, 2); // vout
+    PushCompactSize(bytes, 3); // vout
     PushBitcoinTxOut(bytes, 0, fee_script);
+    PushBitcoinTxOut(bytes, 0, inputs_commitment_script);
     PushBitcoinTxOut(bytes, amount - mainchain_fee, payout_script);
     PushLE32(bytes, 0); // nLockTime
     return bytes;
+}
+
+static DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
+    CAmount amount,
+    const std::string& destination,
+    const COutPoint& withdrawal_outpoint,
+    uint32_t sidechain_block_height)
+{
+    DrivechainWithdrawalBundle bundle;
+    bundle.bytes = BuildDrivechainWithdrawalBundleBytes(
+        amount,
+        destination,
+        withdrawal_outpoint,
+        sidechain_block_height,
+        true);
+    const std::vector<unsigned char> no_witness_bytes = BuildDrivechainWithdrawalBundleBytes(
+        amount,
+        destination,
+        withdrawal_outpoint,
+        sidechain_block_height,
+        false);
+    bundle.m6id = Hash(no_witness_bytes);
+    return bundle;
 }
 
 static UniValue RunDrivechainCommandParseJSON(const std::string& command)
@@ -211,15 +266,97 @@ static UniValue RunDrivechainCommandParseJSON(const std::string& command)
     return result;
 }
 
-static UniValue BroadcastDrivechainWithdrawalBundle(const std::vector<unsigned char>& bundle_bytes)
+static UniValue CallMainChainRPCResult(const std::string& method, const UniValue& params)
+{
+    const UniValue reply = CallMainChainRPC(method, params);
+    const UniValue& error = find_value(reply, "error");
+    if (!error.isNull()) {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("mainchain %s returned error: %s", method, error.write()));
+    }
+    return find_value(reply, "result");
+}
+
+static std::string WithdrawalBundleEventStatus(const UniValue& event)
+{
+    const UniValue& status = event["event"];
+    if (!status.isObject()) return "";
+    if (!status["submitted"].isNull()) return "submitted";
+    if (!status["succeeded"].isNull()) return "succeeded";
+    if (!status["failed"].isNull()) return "failed";
+    return "";
+}
+
+static std::string FindWithdrawalBundleEventStatus(const UniValue& two_way_peg_data, const std::string& m6id_hex)
+{
+    const UniValue& blocks = two_way_peg_data["blocks"];
+    if (!blocks.isArray()) return "";
+
+    for (const UniValue& block : blocks.getValues()) {
+        const UniValue& events = block["blockInfo"]["events"];
+        if (!events.isArray()) continue;
+
+        for (const UniValue& event : events.getValues()) {
+            const UniValue& withdrawal_bundle = event["withdrawalBundle"];
+            if (!withdrawal_bundle.isObject()) continue;
+
+            const UniValue& m6id = withdrawal_bundle["m6id"]["hex"];
+            if (m6id.isStr() && m6id.get_str() == m6id_hex) {
+                return WithdrawalBundleEventStatus(withdrawal_bundle);
+            }
+        }
+    }
+
+    return "";
+}
+
+static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, const std::string& enforcer, const std::string& m6id_hex)
+{
+    UniValue no_params(UniValue::VARR);
+    const std::string mainchain_tip = CallMainChainRPCResult("getbestblockhash", no_params).get_str();
+
+    UniValue end_block_hash(UniValue::VOBJ);
+    end_block_hash.pushKV("hex", mainchain_tip);
+
+    UniValue payload(UniValue::VOBJ);
+    payload.pushKV("sidechainId", sidechain_id);
+    payload.pushKV("endBlockHash", end_block_hash);
+
+    const std::string command = "buf curl --timeout 30s --emit-defaults --protocol grpc --http2-prior-knowledge -d " +
+        ShellEscape(payload.write()) + " " +
+        ShellEscape("http://" + enforcer + "/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData");
+    const UniValue peg_data = RunDrivechainCommandParseJSON(command);
+    const std::string status = FindWithdrawalBundleEventStatus(peg_data, m6id_hex);
+
+    UniValue verification(UniValue::VOBJ);
+    verification.pushKV("mainchain_tip", mainchain_tip);
+    verification.pushKV("m6id", m6id_hex);
+    verification.pushKV("event_status", status.empty() ? "missing" : status);
+
+    if (status.empty()) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            strprintf(
+                "Drivechain withdrawal bundle broadcast returned, but the enforcer has no withdrawal bundle event for M6 id %s at L1 tip %s",
+                m6id_hex,
+                mainchain_tip));
+    }
+    if (status == "failed") {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("Drivechain withdrawal bundle M6 id %s is already marked failed on L1", m6id_hex));
+    }
+
+    return verification;
+}
+
+static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBundle& bundle)
 {
     const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
     if (sidechain_id < 0) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
     }
 
-    const std::string tx_base64 = EncodeBase64(MakeUCharSpan(bundle_bytes));
-    const std::string tx_hex = HexStr(bundle_bytes);
+    const std::string tx_base64 = EncodeBase64(MakeUCharSpan(bundle.bytes));
+    const std::string tx_hex = HexStr(bundle.bytes);
+    const std::string m6id_hex = bundle.m6id.GetHex();
 
     UniValue payload(UniValue::VOBJ);
     payload.pushKV("sidechainId", sidechain_id);
@@ -234,8 +371,12 @@ static UniValue BroadcastDrivechainWithdrawalBundle(const std::vector<unsigned c
     result.pushKV("enabled", true);
     result.pushKV("sidechain_id", sidechain_id);
     result.pushKV("enforcer", enforcer);
+    result.pushKV("m6id", m6id_hex);
     result.pushKV("withdrawal_bundle_hex", tx_hex);
     result.pushKV("broadcast_response", RunDrivechainCommandParseJSON(command));
+    if (GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT", 1) != 0) {
+        result.pushKV("l1_event_verification", VerifyDrivechainWithdrawalBundleEvent(sidechain_id, enforcer, m6id_hex));
+    }
     return result;
 }
 
@@ -646,6 +787,8 @@ RPCHelpMan sendtomainchain_base()
 {
     return RPCHelpMan{"sendtomainchain",
                 "\nSends sidechain funds to the given mainchain address through the BIP300 drivechain peg-out mechanism.\n"
+                "By default this RPC requires the enforcer to report the submitted withdrawal bundle in L1 two-way-peg data; "
+                "set ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT=0 only for diagnostics.\n"
                 + wallet::HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination address on Bitcoin mainchain, or hex:<scriptPubKey>"},
@@ -701,9 +844,10 @@ RPCHelpMan sendtomainchain_base()
     nulldata << std::vector<unsigned char>(genesisBlockHash.begin(), genesisBlockHash.end());
     nulldata << std::vector<unsigned char>(mainchain_script.begin(), mainchain_script.end());
     CTxDestination address(nulldata);
+    const CScript sidechain_withdrawal_script = GetScriptForDestination(address);
 
     std::vector<CRecipient> recipients;
-    CRecipient recipient = {GetScriptForDestination(address), nAmount, Params().GetConsensus().pegged_asset, CPubKey(), subtract_fee};
+    CRecipient recipient = {sidechain_withdrawal_script, nAmount, Params().GetConsensus().pegged_asset, CPubKey(), subtract_fee};
     recipients.push_back(recipient);
 
     EnsureWalletIsUnlocked(*pwallet);
@@ -721,10 +865,33 @@ RPCHelpMan sendtomainchain_base()
         throw JSONRPCError(RPC_WALLET_ERROR, "Created pegout transaction is not available in the wallet");
     }
 
+    std::optional<uint32_t> withdrawal_vout;
+    for (uint32_t i = 0; i < wtx->tx->vout.size(); ++i) {
+        if (wtx->tx->vout[i].scriptPubKey == sidechain_withdrawal_script) {
+            withdrawal_vout = i;
+            break;
+        }
+    }
+    if (!withdrawal_vout.has_value()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Created pegout transaction does not contain the expected sidechain withdrawal output");
+    }
+
+    CBlockIndex* const chain_tip = pwallet->chain().getTip();
+    if (chain_tip == nullptr || chain_tip->nHeight < 0) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot determine sidechain height for drivechain withdrawal bundle");
+    }
+
     const std::string tx_hex = EncodeHexTx(*wtx->tx, pwallet->chain().rpcSerializationFlags());
-    const std::vector<unsigned char> withdrawal_bundle = BuildDrivechainWithdrawalBundle(nAmount, mainchain_destination);
+    const COutPoint withdrawal_outpoint(txid, *withdrawal_vout);
+    const DrivechainWithdrawalBundle withdrawal_bundle = BuildDrivechainWithdrawalBundle(
+        nAmount,
+        mainchain_destination,
+        withdrawal_outpoint,
+        static_cast<uint32_t>(chain_tip->nHeight));
     UniValue drivechain_result = BroadcastDrivechainWithdrawalBundle(withdrawal_bundle);
     drivechain_result.pushKV("sidechain_pegout_tx_hex", tx_hex);
+    drivechain_result.pushKV("sidechain_withdrawal_vout", static_cast<int>(*withdrawal_vout));
+    drivechain_result.pushKV("sidechain_height", chain_tip->nHeight);
 
     if (!verbose) {
         return txid_str;
