@@ -18,6 +18,7 @@
 #include <consensus/amount.h>
 #include <deploymentstatus.h>
 #include <fs.h>
+#include <core_io.h>
 #include <hash.h>
 #include <httprpc.h>
 #include <httpserver.h>
@@ -44,12 +45,15 @@
 #include <policy/fees.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
+#include <pow.h>
 #include <protocol.h>
 #include <rpc/blockchain.h>
+#include <rpc/protocol.h>
 #include <rpc/register.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <scheduler.h>
+#include <script/script.h>
 #include <script/sigcache.h>
 #include <script/standard.h>
 #include <shutdown.h>
@@ -82,6 +86,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <array>
 
 #ifndef WIN32
 #include <attributes.h>
@@ -109,14 +114,257 @@ using node::ChainstateLoadingError;
 using node::CleanupBlockRevFiles;
 using node::DEFAULT_PRINTPRIORITY;
 using node::DEFAULT_STOPAFTERBLOCKIMPORT;
+using node::BlockAssembler;
+using node::CBlockTemplate;
 using node::LoadChainstate;
 using node::NodeContext;
 using node::ThreadImport;
 using node::VerifyLoadedChainstate;
+using node::IncrementExtraNonce;
 using node::fHavePruned;
 using node::fPruneMode;
 using node::fReindex;
 using node::nPruneTarget;
+
+static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
+{
+    const UniValue reply = CallMainChainRPC(method, params);
+    if (!reply["error"].isNull()) {
+        throw std::runtime_error(strprintf("%s returned error: %s", method, reply["error"].write()));
+    }
+    return reply["result"];
+}
+
+static int64_t GetMainchainBlockHeight()
+{
+    UniValue params(UniValue::VARR);
+    return CallMainChainRPCChecked("getblockcount", params).get_int64();
+}
+
+static uint256 GetMainchainBlockHash(const int64_t height)
+{
+    UniValue params(UniValue::VARR);
+    params.push_back(height);
+    return uint256S(CallMainChainRPCChecked("getblockhash", params).get_str());
+}
+
+static void SubmitDrivechainBmmRequest(const int sidechain_slot, const uint256& previous_sidechain_tip, const CAmount sidechain_fees)
+{
+    if (!gArgs.GetBoolArg("-drivechainbmm", true)) {
+        return;
+    }
+
+    UniValue no_params(UniValue::VARR);
+    try {
+        CallMainChainRPCChecked("refreshbmmtemplates", no_params);
+    } catch (const std::exception& e) {
+        LogPrintf("drivechain L1 block sync: refreshbmmtemplates failed before BMM request: %s\n", e.what());
+    }
+
+    UniValue hash_params(UniValue::VARR);
+    hash_params.push_back(sidechain_slot);
+    try {
+        const UniValue result = CallMainChainRPCChecked("getbmmhash", hash_params);
+        const UniValue& prev_side_hash = result["prevSideHash"];
+        if (prev_side_hash.isStr() && prev_side_hash.get_str() != previous_sidechain_tip.GetHex()) {
+            LogPrintf("drivechain L1 block sync: mainchain BMM prevSideHash %s differs from local sidechain tip %s\n",
+                prev_side_hash.get_str(), previous_sidechain_tip.GetHex());
+        }
+    } catch (const std::exception& e) {
+        LogPrintf("drivechain L1 block sync: getbmmhash failed before BMM request: %s\n", e.what());
+    }
+
+    UniValue submit_params(UniValue::VARR);
+    submit_params.push_back(sidechain_slot);
+    submit_params.push_back(previous_sidechain_tip.GetHex());
+    submit_params.push_back(ValueFromAmount(sidechain_fees));
+    const UniValue result = CallMainChainRPCChecked("submitbmmrequest", submit_params);
+    LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request for sidechain %d, prev side tip %s, sidechain fees %s, result %s\n",
+        sidechain_slot, previous_sidechain_tip.GetHex(), FormatMoney(sidechain_fees), result.write());
+}
+
+static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
+{
+#ifdef WIN32
+    LogPrintf("drivechain L1 block sync: BIP301 gRPC fallback is not supported on Windows builds\n");
+#else
+    const int64_t mainchain_tip_height = GetMainchainBlockHeight();
+    const uint256 mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height);
+    const std::string grpcurl_path = gArgs.GetArg("-drivechainbmmgrpcurl", "grpcurl");
+    const std::string grpc_addr = gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051");
+    const std::string request = strprintf(
+        "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
+        sidechain_slot,
+        sidechain_fees,
+        mainchain_tip_height,
+        sidechain_block_hash.GetHex(),
+        mainchain_tip_hash.GetHex());
+    const std::string command = strprintf("'%s' -plaintext -d '%s' '%s' cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1",
+        grpcurl_path,
+        request,
+        grpc_addr);
+
+    std::array<char, 512> buffer;
+    std::string output;
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        throw std::runtime_error("failed to launch grpcurl");
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        output += buffer.data();
+    }
+    const int exit_code = pclose(pipe);
+    if (exit_code != 0) {
+        throw std::runtime_error(strprintf("grpcurl exited with status %d: %s", exit_code, output));
+    }
+    LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, sidechain block %s, fees %s, response %s\n",
+        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height, sidechain_block_hash.GetHex(), FormatMoney(sidechain_fees), output);
+#endif
+}
+
+static void SubmitDrivechainBmm(const int sidechain_slot, const uint256& previous_sidechain_tip, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
+{
+    if (!gArgs.GetBoolArg("-drivechainbmm", true)) {
+        return;
+    }
+
+    try {
+        SubmitDrivechainBmmRequest(sidechain_slot, previous_sidechain_tip, sidechain_fees);
+        return;
+    } catch (const std::exception& e) {
+        LogPrintf("drivechain L1 block sync: legacy BIP301 JSON-RPC request failed: %s\n", e.what());
+    }
+
+    if (!gArgs.GetBoolArg("-drivechainbmmgrpc", true)) {
+        return;
+    }
+    SubmitDrivechainBmmGrpcRequest(sidechain_slot, sidechain_block_hash, sidechain_fees);
+}
+
+static bool ProcessPreparedDrivechainBlock(ChainstateManager& chainman, CBlock& block)
+{
+    static unsigned int extra_nonce = 0;
+    uint64_t max_tries = 1000000;
+
+    {
+        LOCK(cs_main);
+        IncrementExtraNonce(&block, chainman.ActiveChain().Tip(), extra_nonce);
+    }
+
+    const CChainParams chainparams(Params());
+    if (!g_signed_blocks) {
+        while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() &&
+               !CheckProofOfWork(block.GetHash(), block.nBits, chainparams.GetConsensus()) &&
+               !ShutdownRequested()) {
+            ++block.nNonce;
+            --max_tries;
+        }
+        if (max_tries == 0 || ShutdownRequested()) {
+            return false;
+        }
+    }
+
+    CScript op_true(OP_TRUE);
+    if (block.m_dynafed_params.m_current.m_signblockscript == GetScriptForDestination(WitnessV0ScriptHash(op_true))) {
+        block.m_signblock_witness.stack.push_back(std::vector<unsigned char>(op_true.begin(), op_true.end()));
+    } else if (!block.m_dynafed_params.IsNull()) {
+        LogPrintf("drivechain L1 block sync: cannot sign dynamic federation block because signblockscript is not WSH(OP_TRUE)\n");
+        return false;
+    }
+
+    std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
+    if (!chainman.ProcessNewBlock(chainparams, shared_pblock, true, nullptr)) {
+        LogPrintf("drivechain L1 block sync: generated sidechain block %s was not accepted\n", block.GetHash().ToString());
+        return false;
+    }
+
+    return true;
+}
+
+static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
+{
+    if (!node.chainman || !node.mempool) {
+        LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n");
+        return false;
+    }
+
+    int side_height = 0;
+    uint256 previous_sidechain_tip;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
+        if (!tip) {
+            LogPrintf("drivechain L1 block sync: sidechain tip unavailable\n");
+            return false;
+        }
+        side_height = tip->nHeight + 1;
+        previous_sidechain_tip = tip->GetBlockHash();
+    }
+
+    const std::vector<unsigned char> parent_hash_bytes(parent_hash.begin(), parent_hash.end());
+    const CScript parent_commitment = CScript() << OP_RETURN << parent_hash_bytes;
+    const std::vector<CScript> commitments{parent_commitment};
+
+    CScript coinbase_script(OP_TRUE);
+    std::unique_ptr<CBlockTemplate> block_template(BlockAssembler(node.chainman->ActiveChainstate(), *node.mempool, Params()).CreateNewBlock(coinbase_script, std::chrono::seconds(0), nullptr, &commitments));
+    if (!block_template) {
+        LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n", parent_height);
+        return false;
+    }
+
+    const CAmount sidechain_fees = -block_template->vTxFees[0];
+    const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
+
+    if (!ProcessPreparedDrivechainBlock(*node.chainman, block_template->block)) {
+        return false;
+    }
+
+    try {
+        SubmitDrivechainBmm(sidechain_slot, previous_sidechain_tip, parent_height, parent_hash, block_template->block.GetHash(), sidechain_fees);
+    } catch (const std::exception& e) {
+        LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d: %s\n",
+            side_height, parent_height, e.what());
+    }
+
+    LogPrintf("drivechain L1 block sync: mined sidechain block %s at height %d for L1 block %s at height %d, fees %s\n",
+        block_template->block.GetHash().ToString(), side_height, parent_hash.GetHex(), parent_height, FormatMoney(sidechain_fees));
+    return true;
+}
+
+static void DrivechainL1BlockSyncTick(NodeContext& node)
+{
+    if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", false)) {
+        return;
+    }
+
+    try {
+        const int64_t parent_height = GetMainchainBlockHeight();
+        int side_height = 0;
+        {
+            LOCK(cs_main);
+            side_height = node.chainman ? node.chainman->ActiveChain().Height() : 0;
+        }
+
+        const int64_t max_catchup = std::max<int64_t>(1, gArgs.GetIntArg("-drivechainl1blocksyncmaxcatchup", 100));
+        int64_t mined = 0;
+        while (!ShutdownRequested() && side_height < parent_height && mined < max_catchup) {
+            const int64_t next_parent_height = side_height + 1;
+            const uint256 parent_hash = GetMainchainBlockHash(next_parent_height);
+            if (!MineOneBlockForParentBlock(node, next_parent_height, parent_hash)) {
+                break;
+            }
+            ++side_height;
+            ++mined;
+        }
+
+        if (mined > 0) {
+            LogPrintf("drivechain L1 block sync: caught sidechain up by %d block(s), parent height %d, sidechain height %d\n",
+                mined, parent_height, side_height);
+        }
+    } catch (const std::exception& e) {
+        LogPrintf("drivechain L1 block sync: tick failed: %s\n", e.what());
+    }
+}
 
 static const bool DEFAULT_PROXYRANDOMIZE = true;
 static const bool DEFAULT_REST_ENABLE = false;
@@ -631,6 +879,14 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-mainchainrpcpassword=<pwd>", "The rpc password which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpccookiefile=<file>", "The bitcoind cookie auth path which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins. (default: `<datadir>/regtest/.cookie`)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. (default: %d)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksyncmaxcatchup=<n>", "Maximum number of sidechain blocks to mine in one -drivechainl1blocksync scheduler tick. (default: 100)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmm", "Submit BIP301 blind merge mining requests to the parent chain while -drivechainl1blocksync is enabled, using the generated sidechain block fees as the bid amount. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used by -drivechainbmm. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpc", "Fall back to the CUSF enforcer gRPC wallet service for BIP301 requests when the parent-chain JSON-RPC methods are unavailable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used by -drivechainbmmgrpc. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used by -drivechainbmmgrpc. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-peginconfirmationdepth=<n>", strprintf("Peg-in claims must be this deep to be considered valid. (default: %d)", DEFAULT_PEGIN_CONFIRMATION_DEPTH), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-parentpubkeyprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 pubkey address. (default: %d)", 111), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-parentscriptprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 script address. (default: %d)", 196), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
@@ -2030,6 +2286,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     node.scheduler->scheduleEvery([banman]{
         banman->DumpBanlist();
     }, DUMP_BANS_INTERVAL);
+
+    if (args.GetBoolArg("-drivechainl1blocksync", false)) {
+        const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
+        LogPrintf("Starting drivechain L1 block sync scheduler, interval %d seconds, BIP301 BMM %s, sidechain slot %d\n",
+            interval_seconds,
+            args.GetBoolArg("-drivechainbmm", true) ? "enabled" : "disabled",
+            args.GetIntArg("-drivechainbmmslot", 24));
+        node.scheduler->scheduleEvery([&node]{
+            DrivechainL1BlockSyncTick(node);
+        }, std::chrono::seconds{interval_seconds});
+    }
 
     if (node.peerman) node.peerman->StartScheduledTasks(*node.scheduler);
 
