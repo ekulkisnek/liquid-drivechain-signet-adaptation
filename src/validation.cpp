@@ -2200,6 +2200,9 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
         flags |= SCRIPT_VERIFY_SIMPLICITY;
     }
 
+    // Enforce OP_CHECKTEMPLATEVERIFY semantics assigned to OP_NOP4.
+    flags |= SCRIPT_VERIFY_CHECKTEMPLATEVERIFY;
+
     return flags;
 }
 

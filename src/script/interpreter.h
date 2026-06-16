@@ -159,6 +159,19 @@ enum : uint32_t {
     //
     SCRIPT_VERIFY_SIMPLICITY = (1U << 23),
 
+    // Enable OP_CHECKTEMPLATEVERIFY.
+    //
+    SCRIPT_VERIFY_CHECKTEMPLATEVERIFY = (1U << 24),
+
+    // Making OP_CHECKTEMPLATEVERIFY non-standard while it is inactive.
+    //
+    SCRIPT_VERIFY_DISCOURAGE_CHECKTEMPLATEVERIFY = (1U << 25),
+
+    // Making non-32-byte OP_CHECKTEMPLATEVERIFY arguments non-standard so
+    // future upgrades can define additional argument lengths.
+    //
+    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH = (1U << 26),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -338,6 +351,11 @@ public:
         return nullptr;
     }
 
+    virtual bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const
+    {
+        return false;
+    }
+
     virtual uint32_t GetnIn() const
     {
         return std::numeric_limits<uint32_t>::max();
@@ -391,6 +409,7 @@ public:
 
     const PrecomputedTransactionData* GetPrecomputedTransactionData() const override;
     uint32_t GetnIn() const override;
+    bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
     bool CheckSimplicity(const std::vector<unsigned char>& program, const std::vector<unsigned char>& witness, const rawElementsTapEnv& simplicityRawTap, int64_t budget, ScriptError* serror) const override;
 };
 

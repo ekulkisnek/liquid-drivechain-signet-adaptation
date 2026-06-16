@@ -1561,9 +1561,6 @@ RPCHelpMan importdrivechaindeposit()
     if (fee_sats < 0 || fee_sats >= value_sats) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_sats must be non-negative and less than value_sats");
     }
-    if (!g_con_elementsmode) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Drivechain deposits require Elements transaction serialization; start the Liquid sidechain with -con_elementsmode=1.");
-    }
     const CAmount deposit_amount = value_sats;
     const CAmount amount = value_sats - fee_sats;
 
@@ -1575,7 +1572,7 @@ RPCHelpMan importdrivechaindeposit()
     pegin_input.m_is_pegin = true;
     mtx.vin.push_back(pegin_input);
     mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, amount, GetScriptForDestination(dest)));
-    if (fee_sats > 0) {
+    if (g_con_elementsmode && fee_sats > 0) {
         mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, fee_sats, CScript()));
     }
     mtx.witness.vtxinwit.resize(1);

@@ -768,7 +768,41 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     break;
                 }
 
-                case OP_NOP1: case OP_NOP4: case OP_NOP5:
+                case OP_CHECKTEMPLATEVERIFY:
+                {
+                    if (flags & SCRIPT_VERIFY_DISCOURAGE_CHECKTEMPLATEVERIFY) {
+                        return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                    }
+
+                    // If not enabled, keep the historical OP_NOP4 behavior.
+                    if (!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY)) {
+                        break;
+                    }
+
+                    if (stack.size() < 1) {
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    }
+
+                    switch (stack.back().size()) {
+                    case 32:
+                    {
+                        const Span<const unsigned char> hash{stack.back()};
+                        if (!checker.CheckDefaultCheckTemplateVerifyHash(hash)) {
+                            return set_error(serror, SCRIPT_ERR_TEMPLATE_MISMATCH);
+                        }
+                        break;
+                    }
+                    default:
+                        // Future upgrades can assign semantics to other
+                        // argument lengths, so discourage them in policy.
+                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH) {
+                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                        }
+                    }
+                }
+                break;
+
+                case OP_NOP1: case OP_NOP5:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
                     if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
@@ -2510,6 +2544,68 @@ std::vector<uint256> GetSpentScriptPubKeysSHA256(const std::vector<CTxOut>& outp
     return spent_spk_single_hashes;
 }
 
+/** Compute the (single) SHA256 of the concatenation of all scriptSigs in a tx. */
+template <class T>
+uint256 GetScriptSigsSHA256(const T& txTo)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    for (const auto& txin : txTo.vin) {
+        ss << txin.scriptSig;
+    }
+    return ss.GetSHA256();
+}
+
+template <class T>
+bool NoScriptSigs(const T& txTo)
+{
+    return std::all_of(txTo.vin.begin(), txTo.vin.end(), [](const CTxIn& txin) {
+        return txin.scriptSig.empty();
+    });
+}
+
+template <class T>
+uint256 GetDefaultCheckTemplateVerifyHashWithScript(const T& txTo, const uint256& outputs_hash, const uint256& sequences_hash, const uint256& scriptSig_hash, const uint32_t input_index)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << txTo.nVersion;
+    ss << txTo.nLockTime;
+    ss << scriptSig_hash;
+    ss << uint32_t(txTo.vin.size());
+    ss << sequences_hash;
+    ss << uint32_t(txTo.vout.size());
+    ss << outputs_hash;
+    ss << input_index;
+    return ss.GetSHA256();
+}
+
+template <class T>
+uint256 GetDefaultCheckTemplateVerifyHashEmptyScript(const T& txTo, const uint256& outputs_hash, const uint256& sequences_hash, const uint32_t input_index)
+{
+    CHashWriter ss(SER_GETHASH, 0);
+    ss << txTo.nVersion;
+    ss << txTo.nLockTime;
+    ss << uint32_t(txTo.vin.size());
+    ss << sequences_hash;
+    ss << uint32_t(txTo.vout.size());
+    ss << outputs_hash;
+    ss << input_index;
+    return ss.GetSHA256();
+}
+
+template <class T>
+uint256 GetDefaultCheckTemplateVerifyHash(const T& txTo, const uint256& outputs_hash, const uint256& sequences_hash, const uint32_t input_index)
+{
+    return NoScriptSigs(txTo) ?
+        GetDefaultCheckTemplateVerifyHashEmptyScript(txTo, outputs_hash, sequences_hash, input_index) :
+        GetDefaultCheckTemplateVerifyHashWithScript(txTo, outputs_hash, sequences_hash, GetScriptSigsSHA256(txTo), input_index);
+}
+
+template <class T>
+uint256 GetDefaultCheckTemplateVerifyHash(const T& txTo, const uint32_t input_index)
+{
+    return GetDefaultCheckTemplateVerifyHash(txTo, GetOutputsSHA256(txTo), GetSequencesSHA256(txTo), input_index);
+}
+
 /** Compute the vector where each element is SHA256 of output scriptPubKey of a tx. */
 template <class T>
 std::vector<uint256> GetOutputScriptPubKeysSHA256(const T& txTo)
@@ -3110,6 +3206,15 @@ template <class T>
 const PrecomputedTransactionData* GenericTransactionSignatureChecker<T>::GetPrecomputedTransactionData() const
 {
     return txdata;
+}
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const
+{
+    assert(hash.size() == 32);
+    assert(txTo != nullptr);
+    const uint256 hash_tmpl = GetDefaultCheckTemplateVerifyHash(*txTo, nIn);
+    return std::equal(hash_tmpl.begin(), hash_tmpl.end(), hash.data());
 }
 
 template <class T>
