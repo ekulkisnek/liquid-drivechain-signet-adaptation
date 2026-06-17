@@ -126,6 +126,9 @@ using node::fPruneMode;
 using node::fReindex;
 using node::nPruneTarget;
 
+static CThreadInterrupt g_drivechain_l1_block_sync_interrupt;
+static std::thread g_drivechain_l1_block_sync_thread;
+
 static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
 {
     const UniValue reply = CallMainChainRPC(method, params);
@@ -183,14 +186,35 @@ static void SubmitDrivechainBmmRequest(const int sidechain_slot, const uint256& 
         sidechain_slot, previous_sidechain_tip.GetHex(), FormatMoney(sidechain_fees), result.write());
 }
 
-static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
+static std::string ResolveDrivechainBmmGrpcurlPath()
+{
+    const std::string configured_path = gArgs.GetArg("-drivechainbmmgrpcurl", "");
+    if (!configured_path.empty()) {
+        return configured_path;
+    }
+
+    const std::vector<fs::path> candidates{
+        gArgs.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
+        gArgs.GetDataDirBase().parent_path() / "bin" / "grpcurl",
+        fs::PathFromString("/opt/homebrew/bin/grpcurl"),
+        fs::PathFromString("/usr/local/bin/grpcurl"),
+        fs::PathFromString("/usr/bin/grpcurl"),
+    };
+    for (const fs::path& candidate : candidates) {
+        if (fs::exists(candidate)) {
+            return fs::PathToString(candidate);
+        }
+    }
+
+    return "grpcurl";
+}
+
+static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64_t mainchain_tip_height, const uint256& mainchain_tip_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
 {
 #ifdef WIN32
     LogPrintf("drivechain L1 block sync: BIP301 gRPC fallback is not supported on Windows builds\n");
 #else
-    const int64_t mainchain_tip_height = GetMainchainBlockHeight();
-    const uint256 mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height);
-    const std::string grpcurl_path = gArgs.GetArg("-drivechainbmmgrpcurl", "grpcurl");
+    const std::string grpcurl_path = ResolveDrivechainBmmGrpcurlPath();
     const std::string grpc_addr = gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051");
     const std::string request = strprintf(
         "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
@@ -199,10 +223,10 @@ static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const uint2
         mainchain_tip_height,
         sidechain_block_hash.GetHex(),
         mainchain_tip_hash.GetHex());
-    const std::string command = strprintf("'%s' -plaintext -d '%s' '%s' cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1",
-        grpcurl_path,
-        request,
-        grpc_addr);
+    const std::string command = strprintf("%s -plaintext -d %s %s cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1",
+        ShellEscape(grpcurl_path),
+        ShellEscape(request),
+        ShellEscape(grpc_addr));
 
     std::array<char, 512> buffer;
     std::string output;
@@ -215,6 +239,12 @@ static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const uint2
     }
     const int exit_code = pclose(pipe);
     if (exit_code != 0) {
+        if (output.find("AlreadyExists") != std::string::npos ||
+            output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
+            LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
+                sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
+            return;
+        }
         throw std::runtime_error(strprintf("grpcurl exited with status %d: %s", exit_code, output));
     }
     LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, sidechain block %s, fees %s, response %s\n",
@@ -228,17 +258,28 @@ static void SubmitDrivechainBmm(const int sidechain_slot, const uint256& previou
         return;
     }
 
+    const int64_t mainchain_tip_height = GetMainchainBlockHeight();
+    const uint256 mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height);
+    if (parent_height != mainchain_tip_height || parent_hash != mainchain_tip_hash) {
+        LogPrintf("drivechain L1 block sync: skipping BIP301 BMM for historical parent block %s height %d; current mainchain tip is %s height %d\n",
+            parent_hash.GetHex(), parent_height, mainchain_tip_hash.GetHex(), mainchain_tip_height);
+        return;
+    }
+
+    if (gArgs.GetBoolArg("-drivechainbmmgrpc", true)) {
+        try {
+            SubmitDrivechainBmmGrpcRequest(sidechain_slot, mainchain_tip_height, mainchain_tip_hash, sidechain_block_hash, sidechain_fees);
+            return;
+        } catch (const std::exception& e) {
+            LogPrintf("drivechain L1 block sync: BIP301 gRPC request failed: %s\n", e.what());
+        }
+    }
+
     try {
         SubmitDrivechainBmmRequest(sidechain_slot, previous_sidechain_tip, sidechain_fees);
-        return;
     } catch (const std::exception& e) {
         LogPrintf("drivechain L1 block sync: legacy BIP301 JSON-RPC request failed: %s\n", e.what());
     }
-
-    if (!gArgs.GetBoolArg("-drivechainbmmgrpc", true)) {
-        return;
-    }
-    SubmitDrivechainBmmGrpcRequest(sidechain_slot, sidechain_block_hash, sidechain_fees);
 }
 
 static bool ProcessPreparedDrivechainBlock(ChainstateManager& chainman, CBlock& block)
@@ -366,6 +407,40 @@ static void DrivechainL1BlockSyncTick(NodeContext& node)
     }
 }
 
+static void ThreadDrivechainL1BlockSync(NodeContext& node, const std::chrono::seconds interval)
+{
+    while (!ShutdownRequested()) {
+        DrivechainL1BlockSyncTick(node);
+        if (!g_drivechain_l1_block_sync_interrupt.sleep_for(interval)) break;
+    }
+}
+
+static void StartDrivechainL1BlockSyncThread(NodeContext& node, const int64_t interval_seconds)
+{
+    if (g_drivechain_l1_block_sync_thread.joinable()) {
+        return;
+    }
+    assert(!g_drivechain_l1_block_sync_interrupt);
+    g_drivechain_l1_block_sync_thread = std::thread(&util::TraceThread, "drivechainl1sync", [&node, interval_seconds] {
+        ThreadDrivechainL1BlockSync(node, std::chrono::seconds{interval_seconds});
+    });
+}
+
+static void InterruptDrivechainL1BlockSyncThread()
+{
+    if (g_drivechain_l1_block_sync_thread.joinable()) {
+        g_drivechain_l1_block_sync_interrupt();
+    }
+}
+
+static void StopDrivechainL1BlockSyncThread()
+{
+    if (g_drivechain_l1_block_sync_thread.joinable()) {
+        g_drivechain_l1_block_sync_thread.join();
+        g_drivechain_l1_block_sync_interrupt.reset();
+    }
+}
+
 static const bool DEFAULT_PROXYRANDOMIZE = true;
 static const bool DEFAULT_REST_ENABLE = false;
 
@@ -436,6 +511,7 @@ static fs::path GetPidFile(const ArgsManager& args)
 
 void Interrupt(NodeContext& node)
 {
+    InterruptDrivechainL1BlockSyncThread();
     InterruptHTTPServer();
     InterruptHTTPRPC();
     InterruptRPC();
@@ -486,6 +562,7 @@ void Shutdown(NodeContext& node)
 
     // After everything has been shut down, but before things get flushed, stop the
     // CScheduler/checkqueue, scheduler and load block thread.
+    StopDrivechainL1BlockSyncThread();
     if (node.chainman && node.chainman->m_load_block.joinable()) node.chainman->m_load_block.join();
     if (node.scheduler) node.scheduler->stop();
     if (node.reverification_scheduler) node.reverification_scheduler->stop();
@@ -884,7 +961,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-drivechainl1blocksyncmaxcatchup=<n>", "Maximum number of sidechain blocks to mine in one -drivechainl1blocksync scheduler tick. (default: 100)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmm", "Submit BIP301 blind merge mining requests to the parent chain while -drivechainl1blocksync is enabled, using the generated sidechain block fees as the bid amount. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used by -drivechainbmm. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpc", "Fall back to the CUSF enforcer gRPC wallet service for BIP301 requests when the parent-chain JSON-RPC methods are unavailable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpc", "Use the CUSF enforcer gRPC wallet service for BIP301 requests before falling back to parent-chain JSON-RPC methods. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used by -drivechainbmmgrpc. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used by -drivechainbmmgrpc. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-peginconfirmationdepth=<n>", strprintf("Peg-in claims must be this deep to be considered valid. (default: %d)", DEFAULT_PEGIN_CONFIRMATION_DEPTH), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -2289,13 +2366,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (args.GetBoolArg("-drivechainl1blocksync", true)) {
         const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
-        LogPrintf("Starting drivechain L1 block sync scheduler, interval %d seconds, BIP301 BMM %s, sidechain slot %d\n",
+        LogPrintf("Starting drivechain L1 block sync thread, interval %d seconds, BIP301 BMM %s, sidechain slot %d\n",
             interval_seconds,
             args.GetBoolArg("-drivechainbmm", true) ? "enabled" : "disabled",
             args.GetIntArg("-drivechainbmmslot", 24));
-        node.scheduler->scheduleEvery([&node]{
-            DrivechainL1BlockSyncTick(node);
-        }, std::chrono::seconds{interval_seconds});
+        StartDrivechainL1BlockSyncThread(node, interval_seconds);
     }
 
     if (node.peerman) node.peerman->StartScheduledTasks(*node.scheduler);
