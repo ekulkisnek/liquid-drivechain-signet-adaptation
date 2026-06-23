@@ -34,7 +34,10 @@
 #include <cstdio>
 #include <limits>
 #include <optional>
+
+#ifndef WIN32
 #include <sys/wait.h>
+#endif
 
 using wallet::BlindDetails;
 using wallet::CAddressBookData;
@@ -75,6 +78,32 @@ static int GetEnvInt(const char* name, int fallback)
         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid integer in %s", name));
     }
     return parsed;
+}
+
+static bool ProcessExitSucceeded(int status)
+{
+#ifdef WIN32
+    return status == 0;
+#else
+    return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+static std::string CommandArg(const std::string& arg)
+{
+#ifdef WIN32
+    std::string escaped;
+    escaped.reserve(arg.size() + 2);
+    escaped.push_back('"');
+    for (const char c : arg) {
+        if (c == '"' || c == '\\') escaped.push_back('\\');
+        escaped.push_back(c);
+    }
+    escaped.push_back('"');
+    return escaped;
+#else
+    return ShellEscape(arg);
+#endif
 }
 
 static void PushLE32(std::vector<unsigned char>& bytes, uint32_t value)
@@ -255,7 +284,7 @@ static UniValue RunDrivechainCommandParseJSON(const std::string& command)
     }
 
     const int status = pclose(pipe);
-    if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (!ProcessExitSucceeded(status)) {
         throw JSONRPCError(RPC_MISC_ERROR, strprintf("Drivechain pegout broadcaster failed: %s", output));
     }
 
@@ -322,8 +351,8 @@ static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, co
     payload.pushKV("endBlockHash", end_block_hash);
 
     const std::string command = "buf curl --timeout 30s --emit-defaults --protocol grpc --http2-prior-knowledge -d " +
-        ShellEscape(payload.write()) + " " +
-        ShellEscape("http://" + enforcer + "/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData");
+        CommandArg(payload.write()) + " " +
+        CommandArg("http://" + enforcer + "/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData");
     const UniValue peg_data = RunDrivechainCommandParseJSON(command);
     const std::string status = FindWithdrawalBundleEventStatus(peg_data, m6id_hex);
 
@@ -364,8 +393,8 @@ static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBu
 
     const std::string enforcer = GetEnvString("ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER", "127.0.0.1:50051");
     const std::string command = "buf curl --timeout 30s --emit-defaults --protocol grpc --http2-prior-knowledge -d " +
-        ShellEscape(payload.write()) + " " +
-        ShellEscape("http://" + enforcer + "/cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle");
+        CommandArg(payload.write()) + " " +
+        CommandArg("http://" + enforcer + "/cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle");
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("enabled", true);
