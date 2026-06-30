@@ -12,6 +12,7 @@
 #include <issuance.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
+#include <node/drivechain_withdrawal_bundle.h>
 #include <rpc/rawtransaction_util.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
@@ -918,6 +919,7 @@ RPCHelpMan sendtomainchain_base()
         withdrawal_outpoint,
         static_cast<uint32_t>(chain_tip->nHeight));
     UniValue drivechain_result = BroadcastDrivechainWithdrawalBundle(withdrawal_bundle);
+    node::SetCurrentDrivechainWithdrawalBundleHash(withdrawal_bundle.m6id);
     drivechain_result.pushKV("sidechain_pegout_tx_hex", tx_hex);
     drivechain_result.pushKV("sidechain_withdrawal_vout", static_cast<int>(*withdrawal_vout));
     drivechain_result.pushKV("sidechain_height", chain_tip->nHeight);

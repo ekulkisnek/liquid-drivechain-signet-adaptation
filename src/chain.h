@@ -206,6 +206,7 @@ public:
     //! block header
     int32_t nVersion{0};
     uint256 hashMerkleRoot{};
+    uint256 hashWithdrawalBundle{};
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
@@ -292,6 +293,7 @@ public:
     explicit CBlockIndex(const CBlockHeader& block)
         : nVersion{block.nVersion},
           hashMerkleRoot{block.hashMerkleRoot},
+          hashWithdrawalBundle{block.hashWithdrawalBundle},
           nTime{block.nTime},
           nBits{block.nBits},
           nNonce{block.nNonce},
@@ -331,6 +333,7 @@ public:
         if (pprev)
             block.hashPrevBlock = pprev->GetBlockHash();
         block.hashMerkleRoot = hashMerkleRoot;
+        block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;
@@ -385,9 +388,10 @@ public:
 
     std::string ToString() const
     {
-        return strprintf("CBlockIndex(pprev=%p, nHeight=%d, merkle=%s, hashBlock=%s)",
+        return strprintf("CBlockIndex(pprev=%p, nHeight=%d, merkle=%s, withdrawal_bundle=%s, hashBlock=%s)",
             pprev, nHeight,
             hashMerkleRoot.ToString(),
+            hashWithdrawalBundle.ToString(),
             GetBlockHash().ToString());
     }
 
@@ -480,6 +484,20 @@ public:
         return is_dynafed_block();
     }
 
+    bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) {
+        if (for_read) {
+            bool has_withdrawal_bundle_hash = ((uint32_t)nVersion & CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK) != 0;
+            nVersion = (int32_t) (~CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK & (uint32_t)nVersion);
+            return has_withdrawal_bundle_hash;
+        } else {
+            return !hashWithdrawalBundle.IsNull();
+        }
+    }
+    bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) const {
+        assert(!for_read);
+        return !hashWithdrawalBundle.IsNull();
+    }
+
     SERIALIZE_METHODS(CDiskBlockIndex, obj)
     {
         LOCK(::cs_main);
@@ -504,12 +522,21 @@ public:
             if (obj.is_dynafed_block()) {
                 nVersion |= (int32_t)CBlockHeader::DYNAFED_HF_MASK;
             }
+            if (!obj.hashWithdrawalBundle.IsNull()) {
+                nVersion |= (int32_t)CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
+            }
             READWRITE(nVersion);
         }
         bool is_dyna = obj.RemoveDynaFedMaskOnSerialize(ser_action.ForRead());
+        bool has_withdrawal_bundle_hash = obj.RemoveWithdrawalBundleMaskOnSerialize(ser_action.ForRead());
 
         READWRITE(obj.hashPrev);
         READWRITE(obj.hashMerkleRoot);
+        if (has_withdrawal_bundle_hash) {
+            READWRITE(obj.hashWithdrawalBundle);
+        } else {
+            SER_READ(obj, obj.hashWithdrawalBundle.SetNull());
+        }
         READWRITE(obj.nTime);
 
         // Allocate objects in the optional<> fields when reading, since READWRITE will not do this
@@ -541,6 +568,7 @@ public:
         block.nVersion = nVersion;
         block.hashPrevBlock = hashPrev;
         block.hashMerkleRoot = hashMerkleRoot;
+        block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;

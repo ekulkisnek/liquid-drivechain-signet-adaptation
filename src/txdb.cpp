@@ -359,6 +359,7 @@ const CBlockIndex *CBlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTr
     pindexNew->nUndoPos       = pindexTrimmed->nUndoPos;
     pindexNew->nVersion       = pindexTrimmed->nVersion;
     pindexNew->hashMerkleRoot = pindexTrimmed->hashMerkleRoot;
+    pindexNew->hashWithdrawalBundle = pindexTrimmed->hashWithdrawalBundle;
     pindexNew->nTime          = pindexTrimmed->nTime;
     pindexNew->nBits          = pindexTrimmed->nBits;
     pindexNew->nNonce         = pindexTrimmed->nNonce;
@@ -400,6 +401,7 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->nUndoPos       = diskindex.nUndoPos;
                 pindexNew->nVersion       = diskindex.nVersion;
                 pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
+                pindexNew->hashWithdrawalBundle = diskindex.hashWithdrawalBundle;
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;

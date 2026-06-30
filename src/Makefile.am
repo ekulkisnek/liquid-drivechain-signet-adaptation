@@ -197,6 +197,7 @@ BITCOIN_CORE_H = \
   node/coin.h \
   node/coinstats.h \
   node/context.h \
+  node/drivechain_withdrawal_bundle.h \
   node/miner.h \
   node/minisketchwrapper.h \
   node/psbt.h \

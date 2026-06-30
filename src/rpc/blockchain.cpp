@@ -215,6 +215,7 @@ UniValue blockheaderToJSON(const CBlockIndex* tip, const CBlockIndex* blockindex
     result.pushKV("version", blockindex->nVersion);
     result.pushKV("versionHex", strprintf("%08x", blockindex->nVersion));
     result.pushKV("merkleroot", blockindex->hashMerkleRoot.GetHex());
+    result.pushKV("withdrawalbundlehash", blockindex->hashWithdrawalBundle.GetHex());
     result.pushKV("time", (int64_t)blockindex->nTime);
     result.pushKV("mediantime", (int64_t)blockindex->GetMedianTimePast());
     if (!g_signed_blocks) {
@@ -966,6 +967,7 @@ static RPCHelpMan getblockheader()
                             {RPCResult::Type::NUM, "version", "The block version"},
                             {RPCResult::Type::STR_HEX, "versionHex", "The block version formatted in hexadecimal"},
                             {RPCResult::Type::STR_HEX, "merkleroot", "The merkle root"},
+                            {RPCResult::Type::STR_HEX, "withdrawalbundlehash", "The current drivechain withdrawal bundle hash committed by this block header"},
                             {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM, "nonce", "The nonce"},
@@ -1098,6 +1100,7 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::NUM, "version", "The block version"},
                     {RPCResult::Type::STR_HEX, "versionHex", "The block version formatted in hexadecimal"},
                     {RPCResult::Type::STR_HEX, "merkleroot", "The merkle root"},
+                    {RPCResult::Type::STR_HEX, "withdrawalbundlehash", "The current drivechain withdrawal bundle hash committed by this block header"},
                     {RPCResult::Type::ARR, "tx", "The transaction ids",
                         {{RPCResult::Type::STR_HEX, "", "The transaction id"}}},
                     {RPCResult::Type::NUM_TIME, "time",       "The block time expressed in " + UNIX_EPOCH_TIME},

@@ -14,10 +14,12 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
+#include <node/drivechain_withdrawal_bundle.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <pow.h>
 #include <primitives/transaction.h>
+#include <sync.h>
 #include <timedata.h>
 #include <util/moneystr.h>
 #include <util/system.h>
@@ -29,6 +31,24 @@
 #include <utility>
 
 namespace node {
+
+namespace {
+Mutex g_current_drivechain_withdrawal_bundle_mutex;
+uint256 g_current_drivechain_withdrawal_bundle_hash GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex);
+} // namespace
+
+uint256 GetCurrentDrivechainWithdrawalBundleHash()
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    return g_current_drivechain_withdrawal_bundle_hash;
+}
+
+void SetCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
+}
+
 void ResetChallenge(CBlockHeader& block, const CBlockIndex& indexLast, const Consensus::Params& params)
 {
     block.proof.challenge = indexLast.get_proof().challenge;
@@ -222,6 +242,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
 
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
+    pblock->hashWithdrawalBundle = GetCurrentDrivechainWithdrawalBundleHash();
     UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     pblock->nBits          = g_signed_blocks ? 0 : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     if (g_con_blockheightinheader) {
