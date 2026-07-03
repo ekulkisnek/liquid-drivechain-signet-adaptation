@@ -1,6 +1,10 @@
 #include <mainchainrpc.h>
 
 #include <chainparamsbase.h>
+#include <fs.h>
+#include <logging.h>
+#include <primitives/block.h>
+#include <script/script.h>
 #include <util/system.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
@@ -12,6 +16,10 @@
 
 #include <event2/buffer.h>
 #include <event2/keyvalq_struct.h>
+
+#include <array>
+#include <cstdio>
+#include <vector>
 
 /** Reply structure for request_done to fill in */
 struct HTTPReply
@@ -149,6 +157,239 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params)
         throw std::runtime_error("expected reply to have result, error and id properties");
 
     return reply;
+}
+
+static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
+{
+    const UniValue reply = CallMainChainRPC(method, params);
+    const UniValue& error = find_value(reply, "error");
+    if (!error.isNull()) {
+        throw std::runtime_error(strprintf("%s returned error: %s", method, error.write()));
+    }
+    const UniValue& result = find_value(reply, "result");
+    if (result.isNull()) {
+        throw std::runtime_error(strprintf("%s returned no result", method));
+    }
+    return result;
+}
+
+static std::string ResolveDrivechainBmmGrpcurlPath()
+{
+    const std::string configured_path = gArgs.GetArg("-drivechainbmmgrpcurl", "");
+    if (!configured_path.empty()) {
+        return configured_path;
+    }
+
+    const std::vector<fs::path> candidates{
+        gArgs.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
+        gArgs.GetDataDirBase().parent_path() / "bin" / "grpcurl",
+        fs::PathFromString("/opt/homebrew/bin/grpcurl"),
+        fs::PathFromString("/usr/local/bin/grpcurl"),
+        fs::PathFromString("/usr/bin/grpcurl"),
+    };
+    for (const fs::path& candidate : candidates) {
+        if (fs::exists(candidate)) {
+            return fs::PathToString(candidate);
+        }
+    }
+
+    return "grpcurl";
+}
+
+static const UniValue& FindField(const UniValue& obj, const std::string& lower_camel, const std::string& snake_case)
+{
+    const UniValue& lower_value = find_value(obj.get_obj(), lower_camel);
+    if (!lower_value.isNull()) {
+        return lower_value;
+    }
+    return find_value(obj.get_obj(), snake_case);
+}
+
+static std::string GetHexField(const UniValue& obj, const std::string& lower_camel, const std::string& snake_case)
+{
+    if (!obj.isObject()) {
+        return "";
+    }
+
+    const UniValue& field = FindField(obj, lower_camel, snake_case);
+    if (field.isStr()) {
+        return field.get_str();
+    }
+    if (!field.isObject()) {
+        return "";
+    }
+
+    const UniValue& hex = find_value(field.get_obj(), "hex");
+    if (hex.isStr()) {
+        return hex.get_str();
+    }
+    return "";
+}
+
+static bool RunCommandJSON(const std::string& command, UniValue& json, std::string* error)
+{
+#ifdef WIN32
+    if (error) {
+        *error = "GetTwoWayPegData proof lookup is not supported on Windows builds";
+    }
+    return false;
+#else
+    std::array<char, 512> buffer;
+    std::string output;
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        if (error) {
+            *error = "failed to launch command";
+        }
+        return false;
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
+        output += buffer.data();
+    }
+    const int exit_code = pclose(pipe);
+    if (exit_code != 0) {
+        if (error) {
+            *error = strprintf("command exited with status %d: %s", exit_code, output);
+        }
+        return false;
+    }
+    if (!json.read(output) || !json.isObject()) {
+        if (error) {
+            *error = strprintf("unable to parse JSON response: %s", output);
+        }
+        return false;
+    }
+    return true;
+#endif
+}
+
+bool ExtractDrivechainParentHashFromBlock(const CBlock& block, uint256& parent_hash, std::string* error)
+{
+    if (block.vtx.empty()) {
+        if (error) {
+            *error = "block has no coinbase transaction";
+        }
+        return false;
+    }
+
+    bool found = false;
+    for (const CTxOut& txout : block.vtx[0]->vout) {
+        CScript::const_iterator pc = txout.scriptPubKey.begin();
+        std::vector<unsigned char> data;
+        opcodetype opcode;
+
+        if (!txout.scriptPubKey.GetOp(pc, opcode, data) || opcode != OP_RETURN) {
+            continue;
+        }
+        if (!txout.scriptPubKey.GetOp(pc, opcode, data) || opcode > OP_PUSHDATA4 || data.size() != 32) {
+            continue;
+        }
+        if (pc != txout.scriptPubKey.end()) {
+            continue;
+        }
+
+        if (found) {
+            if (error) {
+                *error = "block coinbase contains multiple drivechain parent commitments";
+            }
+            return false;
+        }
+        parent_hash = uint256(data);
+        found = true;
+    }
+
+    if (!found && error) {
+        *error = "block coinbase does not contain a drivechain parent commitment";
+    }
+    return found;
+}
+
+bool IsDrivechainBmmCommitmentMined(const CBlock& block, const int sidechain_slot, std::string* error)
+{
+    uint256 parent_hash;
+    if (!ExtractDrivechainParentHashFromBlock(block, parent_hash, error)) {
+        return false;
+    }
+    return IsDrivechainBmmCommitmentMined(block.GetHash(), parent_hash, sidechain_slot, error);
+}
+
+bool IsDrivechainBmmCommitmentMined(const uint256& sidechain_block_hash, const uint256& parent_hash, const int sidechain_slot, std::string* error)
+{
+    try {
+        UniValue no_params(UniValue::VARR);
+        const uint256 mainchain_tip = uint256S(CallMainChainRPCChecked("getbestblockhash", no_params).get_str());
+        const std::string grpcurl_path = ResolveDrivechainBmmGrpcurlPath();
+        const std::string grpc_addr = gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051");
+        const std::string request = strprintf(
+            "{\"sidechainId\":%d,\"startBlockHash\":{\"hex\":\"%s\"},\"endBlockHash\":{\"hex\":\"%s\"}}",
+            sidechain_slot,
+            parent_hash.GetHex(),
+            mainchain_tip.GetHex());
+        const std::string command = strprintf("%s -plaintext -d %s %s cusf.mainchain.v1.ValidatorService/GetTwoWayPegData 2>&1",
+            ShellEscape(grpcurl_path),
+            ShellEscape(request),
+            ShellEscape(grpc_addr));
+
+        UniValue response(UniValue::VOBJ);
+        std::string command_error;
+        if (!RunCommandJSON(command, response, &command_error)) {
+            if (error) {
+                *error = strprintf("GetTwoWayPegData failed: %s", command_error);
+            }
+            return false;
+        }
+
+        const UniValue& blocks = FindField(response, "blocks", "blocks");
+        if (!blocks.isArray()) {
+            if (error) {
+                *error = strprintf("GetTwoWayPegData response does not contain blocks array: %s", response.write());
+            }
+            return false;
+        }
+
+        bool saw_successor = false;
+        std::string mismatched_commitment;
+        for (const UniValue& item : blocks.get_array().getValues()) {
+            if (!item.isObject()) {
+                continue;
+            }
+            const UniValue& header_info = FindField(item, "blockHeaderInfo", "block_header_info");
+            const std::string prev_hash = GetHexField(header_info, "prevBlockHash", "prev_block_hash");
+            if (prev_hash != parent_hash.GetHex()) {
+                continue;
+            }
+
+            saw_successor = true;
+            const UniValue& block_info = FindField(item, "blockInfo", "block_info");
+            const std::string bmm_commitment = GetHexField(block_info, "bmmCommitment", "bmm_commitment");
+            if (bmm_commitment.empty()) {
+                continue;
+            }
+            if (bmm_commitment == sidechain_block_hash.GetHex()) {
+                return true;
+            }
+            mismatched_commitment = bmm_commitment;
+        }
+
+        if (error) {
+            if (!mismatched_commitment.empty()) {
+                *error = strprintf("L1 successor of parent %s mined BMM commitment %s, expected %s",
+                    parent_hash.GetHex(), mismatched_commitment, sidechain_block_hash.GetHex());
+            } else if (!saw_successor) {
+                *error = strprintf("no L1 successor of parent %s found through current mainchain tip %s",
+                    parent_hash.GetHex(), mainchain_tip.GetHex());
+            } else {
+                *error = strprintf("L1 successor of parent %s has no BMM commitment for expected sidechain block %s",
+                    parent_hash.GetHex(), sidechain_block_hash.GetHex());
+            }
+        }
+        return false;
+    } catch (const std::exception& e) {
+        if (error) {
+            *error = e.what();
+        }
+        return false;
+    }
 }
 
 bool IsConfirmedBitcoinBlock(const uint256& hash, const int nMinConfirmationDepth, const int nbTxs)

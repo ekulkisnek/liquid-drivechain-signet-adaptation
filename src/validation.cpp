@@ -2273,6 +2273,15 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
         return true;
     }
 
+    {
+        const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
+        std::string bmm_error;
+        if (!IsDrivechainBmmCommitmentMined(block, sidechain_slot, &bmm_error)) {
+            return state.Error(strprintf("missing mined BIP301 BMM commitment for sidechain block %s: %s",
+                block_hash.GetHex(), bmm_error));
+        }
+    }
+
     // Check it again in case a previous version let a bad block in
     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
     // ContextualCheckBlockHeader() here. This means that if we add a new
@@ -4285,6 +4294,16 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, Block
             m_blockman.m_dirty_blockindex.insert(pindex);
         }
         return error("%s: %s", __func__, state.ToString());
+    }
+
+    if (m_params.GetConsensus().hashGenesisBlock != block.GetHash()) {
+        const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
+        std::string bmm_error;
+        if (!IsDrivechainBmmCommitmentMined(block, sidechain_slot, &bmm_error)) {
+            state.Error(strprintf("missing mined BIP301 BMM commitment for sidechain block %s: %s",
+                block.GetHash().GetHex(), bmm_error));
+            return error("%s: %s", __func__, state.ToString());
+        }
     }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW

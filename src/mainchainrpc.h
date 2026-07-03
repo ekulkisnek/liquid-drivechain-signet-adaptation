@@ -15,6 +15,8 @@
 
 #include <univalue.h>
 
+class CBlock;
+
 static const bool DEFAULT_NAMED=false;
 static const char DEFAULT_RPCCONNECT[] = "127.0.0.1";
 static const int DEFAULT_HTTP_CLIENT_TIMEOUT=900;
@@ -41,5 +43,8 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
 // it equals the number of transactions in the block.
 bool IsConfirmedBitcoinBlock(const uint256& hash, const int nMinConfirmationDepth, const int nbTxs);
 
-#endif // BITCOIN_MAINCHAINRPC_H
+bool ExtractDrivechainParentHashFromBlock(const CBlock& block, uint256& parent_hash, std::string* error = nullptr);
+bool IsDrivechainBmmCommitmentMined(const CBlock& block, int sidechain_slot, std::string* error = nullptr);
+bool IsDrivechainBmmCommitmentMined(const uint256& sidechain_block_hash, const uint256& parent_hash, int sidechain_slot, std::string* error = nullptr);
 
+#endif // BITCOIN_MAINCHAINRPC_H
