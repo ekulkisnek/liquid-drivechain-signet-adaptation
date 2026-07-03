@@ -339,10 +339,10 @@ static std::string FindWithdrawalBundleEventStatus(const UniValue& two_way_peg_d
     return "";
 }
 
-static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, const std::string& enforcer, const std::string& m6id_hex)
+static std::string FetchDrivechainWithdrawalBundleEventStatus(const int sidechain_id, const std::string& enforcer, const std::string& m6id_hex, std::string& mainchain_tip)
 {
     UniValue no_params(UniValue::VARR);
-    const std::string mainchain_tip = CallMainChainRPCResult("getbestblockhash", no_params).get_str();
+    mainchain_tip = CallMainChainRPCResult("getbestblockhash", no_params).get_str();
 
     UniValue end_block_hash(UniValue::VOBJ);
     end_block_hash.pushKV("hex", mainchain_tip);
@@ -355,7 +355,13 @@ static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, co
         CommandArg(payload.write()) + " " +
         CommandArg("http://" + enforcer + "/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData");
     const UniValue peg_data = RunDrivechainCommandParseJSON(command);
-    const std::string status = FindWithdrawalBundleEventStatus(peg_data, m6id_hex);
+    return FindWithdrawalBundleEventStatus(peg_data, m6id_hex);
+}
+
+static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, const std::string& enforcer, const std::string& m6id_hex)
+{
+    std::string mainchain_tip;
+    const std::string status = FetchDrivechainWithdrawalBundleEventStatus(sidechain_id, enforcer, m6id_hex, mainchain_tip);
 
     UniValue verification(UniValue::VOBJ);
     verification.pushKV("mainchain_tip", mainchain_tip);
@@ -376,6 +382,61 @@ static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, co
 
     return verification;
 }
+
+static void ClearFinalDrivechainWithdrawalBundle()
+{
+    const uint256 current_bundle_hash = node::GetCurrentDrivechainWithdrawalBundleHash();
+    if (current_bundle_hash.IsNull()) {
+        return;
+    }
+
+    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
+    if (sidechain_id < 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
+    }
+
+    const std::string enforcer = GetEnvString("ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER", "127.0.0.1:50051");
+    std::string mainchain_tip;
+    const std::string status = FetchDrivechainWithdrawalBundleEventStatus(sidechain_id, enforcer, current_bundle_hash.GetHex(), mainchain_tip);
+    if (status == "succeeded" || status == "failed") {
+        node::ClearCurrentDrivechainWithdrawalBundleHash(current_bundle_hash);
+    }
+}
+
+class DrivechainWithdrawalBundleCreationGuard
+{
+private:
+    bool m_active{false};
+
+public:
+    DrivechainWithdrawalBundleCreationGuard()
+    {
+        uint256 current_bundle_hash;
+        bool creation_in_progress{false};
+        if (!node::TryBeginDrivechainWithdrawalBundleCreation(current_bundle_hash, creation_in_progress)) {
+            if (creation_in_progress) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "A drivechain withdrawal bundle is already being created; wait for that sendtomainchain call to finish before creating another bundle");
+            }
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
+                "A drivechain withdrawal bundle is already active: %s. Wait for it to complete on L1 before creating another bundle",
+                current_bundle_hash.GetHex()));
+        }
+        m_active = true;
+    }
+
+    ~DrivechainWithdrawalBundleCreationGuard()
+    {
+        if (m_active) {
+            node::AbortDrivechainWithdrawalBundleCreation();
+        }
+    }
+
+    void Complete(const uint256& bundle_hash)
+    {
+        node::CompleteDrivechainWithdrawalBundleCreation(bundle_hash);
+        m_active = false;
+    }
+};
 
 static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBundle& bundle)
 {
@@ -404,9 +465,6 @@ static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBu
     result.pushKV("m6id", m6id_hex);
     result.pushKV("withdrawal_bundle_hex", tx_hex);
     result.pushKV("broadcast_response", RunDrivechainCommandParseJSON(command));
-    if (GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT", 1) != 0) {
-        result.pushKV("l1_event_verification", VerifyDrivechainWithdrawalBundleEvent(sidechain_id, enforcer, m6id_hex));
-    }
     return result;
 }
 
@@ -886,6 +944,8 @@ RPCHelpMan sendtomainchain_base()
     mapValue_t mapValue;
     CCoinControl no_coin_control; // This is a deprecated API
     no_coin_control.m_include_unsafe_inputs = true;
+    ClearFinalDrivechainWithdrawalBundle();
+    DrivechainWithdrawalBundleCreationGuard withdrawal_bundle_creation;
     UniValue send_result = SendMoney(*pwallet, no_coin_control, recipients, std::move(mapValue), true /* verbose */, true /* ignore_blind_fail */);
 
     const std::string txid_str = send_result.isObject() ? find_value(send_result, "txid").get_str() : send_result.get_str();
@@ -919,7 +979,15 @@ RPCHelpMan sendtomainchain_base()
         withdrawal_outpoint,
         static_cast<uint32_t>(chain_tip->nHeight));
     UniValue drivechain_result = BroadcastDrivechainWithdrawalBundle(withdrawal_bundle);
-    node::SetCurrentDrivechainWithdrawalBundleHash(withdrawal_bundle.m6id);
+    withdrawal_bundle_creation.Complete(withdrawal_bundle.m6id);
+    if (GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT", 1) != 0) {
+        drivechain_result.pushKV(
+            "l1_event_verification",
+            VerifyDrivechainWithdrawalBundleEvent(
+                find_value(drivechain_result, "sidechain_id").get_int(),
+                find_value(drivechain_result, "enforcer").get_str(),
+                withdrawal_bundle.m6id.GetHex()));
+    }
     drivechain_result.pushKV("sidechain_pegout_tx_hex", tx_hex);
     drivechain_result.pushKV("sidechain_withdrawal_vout", static_cast<int>(*withdrawal_vout));
     drivechain_result.pushKV("sidechain_height", chain_tip->nHeight);

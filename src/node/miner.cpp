@@ -35,6 +35,7 @@ namespace node {
 namespace {
 Mutex g_current_drivechain_withdrawal_bundle_mutex;
 uint256 g_current_drivechain_withdrawal_bundle_hash GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex);
+bool g_drivechain_withdrawal_bundle_creation_in_progress GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex) = false;
 } // namespace
 
 uint256 GetCurrentDrivechainWithdrawalBundleHash()
@@ -43,10 +44,39 @@ uint256 GetCurrentDrivechainWithdrawalBundleHash()
     return g_current_drivechain_withdrawal_bundle_hash;
 }
 
-void SetCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
+bool TryBeginDrivechainWithdrawalBundleCreation(uint256& current_bundle_hash, bool& creation_in_progress)
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    current_bundle_hash = g_current_drivechain_withdrawal_bundle_hash;
+    creation_in_progress = g_drivechain_withdrawal_bundle_creation_in_progress;
+    if (creation_in_progress || !current_bundle_hash.IsNull()) {
+        return false;
+    }
+    g_drivechain_withdrawal_bundle_creation_in_progress = true;
+    return true;
+}
+
+void CompleteDrivechainWithdrawalBundleCreation(const uint256& bundle_hash)
 {
     LOCK(g_current_drivechain_withdrawal_bundle_mutex);
     g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
+    g_drivechain_withdrawal_bundle_creation_in_progress = false;
+}
+
+void AbortDrivechainWithdrawalBundleCreation()
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    g_drivechain_withdrawal_bundle_creation_in_progress = false;
+}
+
+bool ClearCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    if (g_current_drivechain_withdrawal_bundle_hash != bundle_hash) {
+        return false;
+    }
+    g_current_drivechain_withdrawal_bundle_hash.SetNull();
+    return true;
 }
 
 void ResetChallenge(CBlockHeader& block, const CBlockIndex& indexLast, const Consensus::Params& params)
