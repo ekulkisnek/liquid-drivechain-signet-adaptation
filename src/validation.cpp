@@ -333,6 +333,12 @@ void CChainState::MaybeUpdateMempoolForReorg(
 
     AssertLockHeld(cs_main);
     AssertLockHeld(m_mempool->cs);
+    // A reorg can resurrect many native deposits while cs_main and the
+    // mempool lock are both held. Share one parent-work deadline across the
+    // complete batch instead of giving every AcceptToMemoryPool call a fresh
+    // synchronous RPC allowance.
+    DrivechainParentValidationBudget parent_budget{
+        m_params.GetConsensus().drivechain_slot.has_value()};
     std::vector<uint256> vHashUpdate;
     // disconnectpool's insertion_order index sorts the entries from
     // oldest to newest, but the oldest entry will be the last tx from the
@@ -420,6 +426,139 @@ void CChainState::MaybeUpdateMempoolForReorg(
         this->CoinsTip(),
         gArgs.GetIntArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000,
         std::chrono::hours{gArgs.GetIntArg("-mempoolexpiry", DEFAULT_MEMPOOL_EXPIRY)});
+}
+
+bool CChainState::RevalidateDrivechainMempoolForParentEpoch(
+    const uint64_t expected_epoch,
+    std::string* error)
+{
+    if (error) error->clear();
+    if (!m_params.GetConsensus().drivechain_slot.has_value()) return true;
+    if (expected_epoch == 0 ||
+        GetDrivechainParentReplayEpoch() != expected_epoch) {
+        if (error) {
+            *error = "authenticated parent replay generation is unavailable or changed before the mempool sweep";
+        }
+        return false;
+    }
+    if (!m_mempool) {
+        m_drivechain_mempool_parent_epoch.store(
+            expected_epoch, std::memory_order_release);
+        return true;
+    }
+
+    LOCK(::cs_main);
+    LOCK(m_mempool->cs);
+
+    // The out-of-lock warmer already performed all replay work. This shares
+    // the same bounded active-tip authentication used by normal mempool
+    // admission, after which deposit checks are in-memory cache lookups.
+    DrivechainParentValidationBudget parent_budget{/*enable=*/true};
+    const auto fedpegscripts = GetValidFedpegScripts(
+        m_chain.Tip(), m_params.GetConsensus(),
+        /*nextblock_validation=*/true);
+
+    CTxMemPool::setEntries invalid_entries;
+    bool parent_unavailable{false};
+    std::string unavailable_error;
+    for (auto it = m_mempool->mapTx.begin();
+         it != m_mempool->mapTx.end(); ++it) {
+        const CTransaction& tx = it->GetTx();
+        bool has_pegin{false};
+        bool invalid{false};
+        std::string invalid_error;
+
+        for (size_t input_index = 0; input_index < tx.vin.size();
+             ++input_index) {
+            const CTxIn& input = tx.vin[input_index];
+            if (!input.m_is_pegin) continue;
+            has_pegin = true;
+
+            if (tx.witness.vtxinwit.size() != tx.vin.size()) {
+                invalid = true;
+                invalid_error =
+                    "native peg-in has no complete input witness vector";
+                continue;
+            }
+
+            std::string witness_error;
+            bool input_parent_unavailable{false};
+            const CScriptWitness& witness =
+                tx.witness.vtxinwit[input_index].m_pegin_witness;
+            if (!IsValidPeginWitness(
+                    witness, fedpegscripts, input.prevout, witness_error,
+                    /*check_depth=*/true, nullptr,
+                    &input_parent_unavailable)) {
+                if (input_parent_unavailable) {
+                    parent_unavailable = true;
+                    if (unavailable_error.empty()) {
+                        unavailable_error = witness_error;
+                    }
+                } else {
+                    invalid = true;
+                    invalid_error = witness_error;
+                }
+                continue;
+            }
+            if (!IsDrivechainDepositPeginWitness(witness, input.prevout)) {
+                invalid = true;
+                invalid_error =
+                    "non-native peg-in is forbidden on a drivechain network";
+                continue;
+            }
+            if (!CheckDrivechainDepositOutputs(
+                    tx, input_index, witness_error)) {
+                invalid = true;
+                invalid_error = witness_error;
+            }
+        }
+
+        if (has_pegin && invalid) {
+            invalid_entries.insert(it);
+            LogPrint(BCLog::MEMPOOL,
+                     "native drivechain mempool revalidation marked %s invalid: %s\n",
+                     tx.GetHash().GetHex(), invalid_error);
+        }
+    }
+
+    // Never partially mutate the mempool if the replay changed during the
+    // pass or any lookup was unavailable. The generation mismatch already
+    // prevents BlockAssembler from selecting these entries.
+    if (GetDrivechainParentReplayEpoch() != expected_epoch) {
+        if (error) {
+            *error = "authenticated parent replay generation changed during the mempool sweep";
+        }
+        return false;
+    }
+    if (parent_unavailable) {
+        if (error) {
+            *error = strprintf(
+                "native peg-in mempool revalidation is temporarily unavailable: %s",
+                unavailable_error);
+        }
+        return false;
+    }
+
+    CTxMemPool::setEntries removals;
+    for (const auto& entry : invalid_entries) {
+        m_mempool->CalculateDescendants(entry, removals);
+    }
+    if (!removals.empty()) {
+        m_mempool->RemoveStaged(
+            removals, /*updateDescendants=*/false,
+            MemPoolRemovalReason::REORG);
+    }
+    m_drivechain_mempool_parent_epoch.store(
+        expected_epoch, std::memory_order_release);
+    return true;
+}
+
+bool CChainState::IsDrivechainMempoolCurrentForMining() const
+{
+    if (!m_params.GetConsensus().drivechain_slot.has_value()) return true;
+    return IsDrivechainMempoolEpochCurrent(
+        GetDrivechainParentReplayEpoch(),
+        m_drivechain_mempool_parent_epoch.load(std::memory_order_acquire));
 }
 
 /**
@@ -648,7 +787,8 @@ private:
          EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Compare a package's feerate against minimum allowed.
-    bool CheckFeeRate(size_t package_size, CAmount package_fee, TxValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_pool.cs)
+    bool CheckFeeRate(size_t package_size, CAmount package_fee, TxValidationState& state,
+                      bool bypass_min_relay_fee) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, m_pool.cs)
     {
         AssertLockHeld(::cs_main);
         AssertLockHeld(m_pool.cs);
@@ -657,7 +797,7 @@ private:
             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "mempool min fee not met", strprintf("%d < %d", package_fee, mempoolRejectFee));
         }
 
-        if (package_fee < ::minRelayTxFee.GetFee(package_size)) {
+        if (!bypass_min_relay_fee && package_fee < ::minRelayTxFee.GetFee(package_size)) {
             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "min relay fee not met", strprintf("%d < %d", package_fee, ::minRelayTxFee.GetFee(package_size)));
         }
         return true;
@@ -945,8 +1085,26 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         if (txin.m_is_pegin) {
             // Peg-in witness is required, check here without validating existence in parent chain
             std::string err_msg = "no peg-in witness attached";
-            if (tx.witness.vtxinwit.size() != tx.vin.size() ||
-                    !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, tx.vin[i].prevout, err_msg, false)) {
+            bool parent_unavailable{false};
+            bool preliminary_valid{false};
+            if (tx.witness.vtxinwit.size() == tx.vin.size()) {
+                const CScriptWitness& pegin_witness = tx.witness.vtxinwit[i].m_pegin_witness;
+                // Native deposits receive their authoritative parent check in
+                // Consensus::CheckTxInputs below. Their preliminary mempool
+                // pass must remain structural so one submission does not make
+                // the same synchronous parent RPC twice while both cs_main and
+                // the mempool lock are held.
+                preliminary_valid =
+                    (chainparams.GetConsensus().drivechain_slot.has_value() &&
+                     IsDrivechainDepositPeginWitness(pegin_witness, txin.prevout)) ||
+                    IsValidPeginWitness(pegin_witness, fedpegscripts,
+                                        txin.prevout, err_msg, false, nullptr,
+                                        &parent_unavailable);
+            }
+            if (!preliminary_valid) {
+                if (parent_unavailable) {
+                    return state.Error(strprintf("drivechain parent state unavailable: %s", err_msg));
+                }
                 return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "pegin-no-witness", err_msg);
             }
 
@@ -1061,7 +1219,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // blocks
     // ELEMENTS: accept discounted fees for Confidential Transactions only, if enabled.
     int64_t package_size = Params().GetAcceptDiscountCT() ? GetDiscountVirtualTransactionSize(tx) : ws.m_vsize;
-    if (!bypass_limits && !CheckFeeRate(package_size, ws.m_modified_fees, state)) return false;
+    const bool fee_free_drivechain_deposit =
+        chainparams.GetConsensus().drivechain_slot.has_value() &&
+        pegin_indices.size() == 1 && pegin_indices[0] == 0 &&
+        ws.m_base_fees == 0 && IsCanonicalFeeFreeDrivechainDeposit(tx);
+    if (!bypass_limits && !CheckFeeRate(package_size, ws.m_modified_fees, state, fee_free_drivechain_deposit)) return false;
     // ELEMENTS: check if peg-in subsidy is required and min peg-in amount is met
     if (!CheckPeginSubsidyAndMinimum(state, tx, pegin_indices)) return false;
 
@@ -1425,6 +1587,10 @@ MempoolAcceptResult MemPoolAccept::AcceptSingleTransaction(const CTransactionRef
 PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::vector<CTransactionRef>& txns, ATMPArgs& args)
 {
     AssertLockHeld(cs_main);
+    // Some internal callers reach this helper directly. Nesting is deliberate:
+    // the outer package/reorg operation owns the deadline and replay allowance.
+    DrivechainParentValidationBudget parent_budget{
+        args.m_chainparams.GetConsensus().drivechain_slot.has_value()};
 
     // These context-free package limits can be done before taking the mempool lock.
     PackageValidationState package_state;
@@ -1601,6 +1767,8 @@ MempoolAcceptResult AcceptToMemoryPool(CChainState& active_chainstate, const CTr
 {
     AssertLockHeld(::cs_main);
     const CChainParams& chainparams{active_chainstate.m_params};
+    DrivechainParentValidationBudget parent_budget{
+        chainparams.GetConsensus().drivechain_slot.has_value()};
     assert(active_chainstate.GetMempool() != nullptr);
     CTxMemPool& pool{*active_chainstate.GetMempool()};
 
@@ -1626,6 +1794,8 @@ PackageMempoolAcceptResult ProcessNewPackage(CChainState& active_chainstate, CTx
                                                    const Package& package, bool test_accept)
 {
     AssertLockHeld(cs_main);
+    DrivechainParentValidationBudget parent_budget{
+        active_chainstate.m_params.GetConsensus().drivechain_slot.has_value()};
     assert(!package.empty());
     assert(std::all_of(package.cbegin(), package.cend(), [](const auto& tx){return tx != nullptr;}));
 
@@ -1901,7 +2071,18 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // transaction).
     uint256 hashCacheEntry;
     CSHA256 hasher = g_scriptExecutionCacheHasher;
-    hasher.Write(tx.GetWitnessHash().begin(), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
+    unsigned char bmm_mtp_context[9]{};
+    if (txdata.m_bmm_parent_mtp.has_value()) {
+        bmm_mtp_context[0] = 1;
+        const uint64_t mtp = *txdata.m_bmm_parent_mtp;
+        for (std::size_t i = 0; i < 8; ++i) {
+            bmm_mtp_context[i + 1] = mtp >> (56 - 8 * i);
+        }
+    }
+    hasher.Write(tx.GetWitnessHash().begin(), 32)
+          .Write((unsigned char*)&flags, sizeof(flags))
+          .Write(bmm_mtp_context, sizeof(bmm_mtp_context))
+          .Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (g_scriptExecutionCache.contains(hashCacheEntry, !cacheFullScriptStore)) {
         return true;
@@ -2023,7 +2204,17 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out, cons
         view.AddCoin(out, std::move(undo), !fClean);
     } else {
         std::string err;
-        if (!IsValidPeginWitness(pegin_witness, fedpegscripts, txin.prevout, err, false)) {
+        // A connected Drivechain deposit was already authenticated against the
+        // parent chain when the block connected. Undo must only recover its
+        // deterministic spent key: re-querying mutable parent state here would
+        // make the exact block orphaned by a parent reorg impossible to
+        // disconnect. Legacy peg-ins retain their existing structural check.
+        const Consensus::Params& consensus = Params().GetConsensus();
+        const bool valid_native_drivechain_pegin = consensus.drivechain_slot.has_value() &&
+            IsDrivechainDepositPeginWitness(pegin_witness, txin.prevout);
+        const bool valid_pegin = valid_native_drivechain_pegin ||
+            IsValidPeginWitness(pegin_witness, fedpegscripts, txin.prevout, err, false);
+        if (!valid_pegin) {
             fClean = fClean && error("%s: peg-in occurred without proof", __func__);
         } else {
             std::pair<uint256, COutPoint> outpoint = GetPeginSpentKey(pegin_witness, txin.prevout);
@@ -2200,10 +2391,17 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
         flags |= SCRIPT_VERIFY_SIMPLICITY;
     }
 
-    // Enforce OP_CHECKTEMPLATEVERIFY semantics assigned to OP_NOP4.
-    flags |= SCRIPT_VERIFY_CHECKTEMPLATEVERIFY;
+    if (consensusparams.enable_usdd_sp1_annex) {
+        flags |= SCRIPT_VERIFY_USDD_SP1_ANNEX;
+    }
 
     return flags;
+}
+
+unsigned int GetBlockScriptFlagsForTesting(const CBlockIndex* pindex,
+                                           const Consensus::Params& consensusparams)
+{
+    return GetBlockScriptFlags(pindex, consensusparams);
 }
 
 
@@ -2224,9 +2422,13 @@ bool CheckPeginRipeness(const CBlock& block, const std::vector<std::pair<CScript
             for (unsigned int i = 0; i < tx.vin.size(); ++i) {
                 if (tx.vin[i].m_is_pegin) {
                     std::string err;
-                    bool depth_failed = false;
-                    if ((tx.witness.vtxinwit.size() <= i) || !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, tx.vin[i].prevout, err, true, &depth_failed)) {
-                        if (depth_failed) {
+                    bool depth_failed{false};
+                    bool parent_unavailable{false};
+                    if ((tx.witness.vtxinwit.size() <= i) ||
+                        !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts,
+                                             tx.vin[i].prevout, err, true, &depth_failed,
+                                             &parent_unavailable)) {
+                        if (depth_failed || parent_unavailable) {
                             return false;  // Pegins not ripe.
                         } else {
                             return true;  // Some other failure; details later.
@@ -2239,14 +2441,149 @@ bool CheckPeginRipeness(const CBlock& block, const std::vector<std::pair<CScript
     return true;
 }
 
+static DrivechainAnchor MakeDrivechainAnchor(const DrivechainBmmBlockContext& context)
+{
+    DrivechainAnchor anchor;
+    anchor.parent_block_hash = context.parent_hash;
+    anchor.bmm_block_hash = context.bmm_block_hash;
+    anchor.parent_chainwork = context.parent_chainwork;
+    anchor.bmm_chainwork = context.bmm_chainwork;
+    anchor.parent_height = context.parent_height;
+    anchor.bmm_height = context.bmm_height;
+    anchor.parent_median_time_past = context.parent_median_time_past;
+    return anchor;
+}
+
+bool IsDrivechainHeaderAuthenticated(const CBlockIndex* index,
+                                     const Consensus::Params& consensus)
+{
+    if (!consensus.drivechain_slot.has_value()) return true;
+    if (index == nullptr || (index->nStatus & BLOCK_FAILED_MASK) != 0 ||
+        !index->HaveTxsDownloaded()) {
+        return false;
+    }
+    if (index->nHeight == 0) return true;
+    return index->m_drivechain_anchor.has_value() &&
+           index->m_drivechain_anchor->IsSane();
+}
+
+bool IsDrivechainAnchorReplacementAllowed(
+    const DrivechainAnchorStatus old_status,
+    const DrivechainAnchor& old_anchor,
+    const DrivechainAnchor& replacement,
+    const DrivechainAnchor* predecessor_anchor)
+{
+    // An ACTIVE or merely UNAVAILABLE proof identity is immutable. Rebinding
+    // is only a liveness repair after the exact old P->Q edge has been
+    // cryptographically proven absent from the active parent chain.
+    return old_status == DrivechainAnchorStatus::ORPHANED &&
+           old_anchor.IsSane() && replacement.IsSane() &&
+           old_anchor != replacement &&
+           (predecessor_anchor == nullptr ||
+            replacement.Follows(*predecessor_anchor));
+}
+
+static bool SetDrivechainBmmValidationFailure(BlockValidationState& state,
+                                              const DrivechainBmmStatus status,
+                                              const uint256& block_hash,
+                                              const std::string& error)
+{
+    assert(status != DrivechainBmmStatus::VALID);
+    if (status == DrivechainBmmStatus::INVALID) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                             "bad-drivechain-bmm",
+                             strprintf("sidechain block %s has an invalid BIP301 commitment: %s",
+                                       block_hash.GetHex(), error));
+    }
+    if (status == DrivechainBmmStatus::PARENT_REJECTED) {
+        return state.Error(strprintf("current authenticated parent P->Q edge rejects sidechain block %s: %s",
+                                     block_hash.GetHex(), error));
+    }
+    assert(status == DrivechainBmmStatus::UNAVAILABLE);
+    return state.Error(strprintf("BIP301 validation is temporarily unavailable for sidechain block %s: %s",
+                                 block_hash.GetHex(), error));
+}
+
+/**
+ * Authenticate native deposits before a block is relayed, stored, or admitted
+ * to setBlockIndexCandidates. This prevents an unavailable or fabricated
+ * parent reference in one otherwise BMM-valid block from stalling activation
+ * of every competing block. ConnectBlock repeats these checks authoritatively
+ * to cover parent reorgs racing admission.
+ */
+static bool PreflightDrivechainDeposits(const CBlock& block,
+                                        CBlockIndex* pindex,
+                                        const CChainParams& chainparams,
+                                        BlockValidationState& state)
+{
+    if (!chainparams.GetConsensus().drivechain_slot.has_value()) return true;
+
+    const auto fedpegscripts = GetValidFedpegScripts(
+        pindex, chainparams.GetConsensus(), false /* nextblock_validation */);
+    for (const auto& tx_ref : block.vtx) {
+        const CTransaction& tx = *tx_ref;
+        if (tx.IsCoinBase()) continue;
+
+        for (unsigned int input_index = 0; input_index < tx.vin.size(); ++input_index) {
+            if (!tx.vin[input_index].m_is_pegin) continue;
+
+            std::string error_message{"no peg-in witness attached"};
+            bool parent_unavailable{false};
+            if (tx.witness.vtxinwit.size() <= input_index ||
+                !IsValidPeginWitness(tx.witness.vtxinwit[input_index].m_pegin_witness,
+                                     fedpegscripts, tx.vin[input_index].prevout,
+                                     error_message, true, nullptr,
+                                     &parent_unavailable)) {
+                if (parent_unavailable) {
+                    return state.Error(strprintf("drivechain deposit parent state unavailable: %s",
+                                                 error_message));
+                }
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-drivechain-deposit-witness", error_message);
+            }
+
+            // IsValidPeginWitness rejects legacy peg-ins on slot-assigned
+            // networks. Keep this explicit check here so future legacy changes
+            // cannot silently widen the native admission path.
+            if (!IsDrivechainDepositPeginWitness(
+                    tx.witness.vtxinwit[input_index].m_pegin_witness,
+                    tx.vin[input_index].prevout)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-drivechain-deposit-witness",
+                                     "non-native peg-in on a Drivechain network");
+            }
+            if (!CheckDrivechainDepositOutputs(tx, input_index, error_message)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                     "bad-drivechain-deposit-outputs", error_message);
+            }
+        }
+    }
+    return true;
+}
+
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                   CCoinsViewCache& view, std::set<std::pair<uint256, COutPoint>>* setPeginsSpent, bool fJustCheck)
 {
+    // Every ordinary caller, including ProcessNewBlock, reindex, VerifyDB, and
+    // TestBlockValidity, takes the final path. The parent-only candidate path
+    // is reachable solely through TestBlockCandidateValidity below.
+    return ConnectBlockInternal(block, state, pindex, view, setPeginsSpent, fJustCheck, nullptr, nullptr);
+}
+
+bool CChainState::ConnectBlockInternal(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
+                  CCoinsViewCache& view, std::set<std::pair<uint256, COutPoint>>* setPeginsSpent, bool fJustCheck,
+                  const DrivechainParentBlockContext* candidate_context,
+                  const DrivechainBmmBlockContext* finalized_context)
+{
     AssertLockHeld(cs_main);
+    DrivechainParentValidationBudget parent_budget{
+        m_params.GetConsensus().drivechain_slot.has_value()};
     assert(pindex);
+    assert(candidate_context == nullptr || fJustCheck);
+    assert(candidate_context == nullptr || finalized_context == nullptr);
 
     uint256 block_hash{block.GetHash()};
     assert(*pindex->phashBlock == block_hash);
@@ -2273,12 +2610,63 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
         return true;
     }
 
-    {
-        const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
-        std::string bmm_error;
-        if (!IsDrivechainBmmCommitmentMined(block, sidechain_slot, &bmm_error)) {
-            return state.Error(strprintf("missing mined BIP301 BMM commitment for sidechain block %s: %s",
-                block_hash.GetHex(), bmm_error));
+    std::optional<DrivechainBmmBlockContext> bmm_context;
+    std::optional<uint64_t> authenticated_parent_mtp;
+    if (consensusParams.drivechain_slot.has_value()) {
+        if (candidate_context != nullptr) {
+            // The candidate context is authenticated against the parent-chain
+            // state but intentionally has no successor/M7 yet: the candidate
+            // hash needed by M7 does not exist until after this self-check.
+            authenticated_parent_mtp = candidate_context->parent_median_time_past;
+        } else if (finalized_context != nullptr) {
+            bmm_context = *finalized_context;
+            authenticated_parent_mtp = finalized_context->parent_median_time_past;
+        } else {
+            bmm_context.emplace();
+            std::string bmm_error;
+            const DrivechainBmmStatus bmm_status = GetDrivechainBmmBlockStatus(
+                block, *consensusParams.drivechain_slot, *bmm_context, &bmm_error);
+            if (bmm_status != DrivechainBmmStatus::VALID) {
+                return SetDrivechainBmmValidationFailure(state, bmm_status, block_hash, bmm_error);
+            }
+            authenticated_parent_mtp = bmm_context->parent_median_time_past;
+        }
+    } else if (candidate_context != nullptr) {
+        return state.Error("drivechain candidate context supplied on a network without an assigned drivechain slot");
+    }
+
+    if (bmm_context.has_value() && candidate_context == nullptr) {
+        const DrivechainAnchor active_anchor = MakeDrivechainAnchor(*bmm_context);
+        if (!active_anchor.IsSane()) {
+            return state.Error(strprintf("authenticated BIP301 context for block %s is internally inconsistent",
+                block_hash.GetHex()));
+        }
+        if (!pindex->m_drivechain_anchor.has_value()) {
+            // TestBlockValidity builds a dummy index and intentionally leaves
+            // it unpersisted. Every state-changing connect must already have
+            // been bound to its exact anchor by AcceptBlock.
+            if (!fJustCheck) {
+                return state.Error(strprintf("block %s has no persisted BIP301 anchor", block_hash.GetHex()));
+            }
+        } else {
+            // VerifyDB and reindex-style fJustCheck callers use real block
+            // indices. They must reauthenticate exactly the same anchor as a
+            // state-changing connect, rather than silently accepting whatever
+            // parent view happens to be live during the check.
+            if (*pindex->m_drivechain_anchor != active_anchor) {
+                return state.Error(strprintf("persisted BIP301 anchor for block %s does not exactly match the active parent chain",
+                    block_hash.GetHex()));
+            }
+            if (pindex->pprev && pindex->pprev->nHeight > 0 &&
+                !pindex->pprev->m_drivechain_anchor.has_value()) {
+                return state.Error(strprintf("persisted BIP301 anchor for block %s has an unanchored predecessor",
+                    block_hash.GetHex()));
+            }
+            if (pindex->pprev && pindex->pprev->m_drivechain_anchor.has_value() &&
+                !active_anchor.Follows(*pindex->pprev->m_drivechain_anchor)) {
+                return state.Error(strprintf("BIP301 anchor for block %s does not follow its sidechain predecessor's anchor",
+                    block_hash.GetHex()));
+            }
         }
     }
 
@@ -2464,6 +2852,9 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
     std::vector<PrecomputedTransactionData> txsdata;
     for (unsigned int i = 0; i< block.vtx.size(); i++ ){
         txsdata.push_back(PrecomputedTransactionData(m_params.HashGenesisBlock()));
+        if (authenticated_parent_mtp.has_value()) {
+            txsdata.back().m_bmm_parent_mtp = *authenticated_parent_mtp;
+        }
     }
 
     std::vector<int> prevheights;
@@ -2506,7 +2897,14 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
             if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, fee_map,
                         setPeginsSpent == NULL ? setPeginsSpentDummy : *setPeginsSpent,
                         g_parallel_script_checks ? &vChecks : NULL, fCacheResults, fScriptChecks, fedpegscripts)) {
-                // Any transaction validation failure in ConnectBlock is a block consensus failure
+                if (tx_state.IsError()) {
+                    state.Error(strprintf("Consensus::CheckTxInputs unavailable for %s: %s",
+                                          tx.GetHash().ToString(), tx_state.ToString()));
+                    return error("%s: Consensus::CheckTxInputs: %s, %s", __func__, tx.GetHash().ToString(), state.ToString());
+                }
+                // Deterministic transaction validation failures are block
+                // consensus failures. Runtime parent-chain availability is
+                // preserved above and must never set BLOCK_FAILED_*.
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                         tx_state.GetRejectReason(), tx_state.GetDebugMessage());
                 return error("%s: Consensus::CheckTxInputs: %s, %s", __func__, tx.GetHash().ToString(), state.ToString());
@@ -3069,6 +3467,10 @@ bool CChainState::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew
 {
     AssertLockHeld(cs_main);
     if (m_mempool) AssertLockHeld(m_mempool->cs);
+    // Cover the BMM edge check, peg-in ripeness reads, and nested ConnectBlock
+    // with one deadline while the chainstate/mempool locks are held.
+    DrivechainParentValidationBudget parent_budget{
+        m_params.GetConsensus().drivechain_slot.has_value()};
 
     assert(pindexNew->pprev == m_chain.Tip());
     // Read block from disk.
@@ -3084,6 +3486,33 @@ bool CChainState::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew
         pthisBlock = pblock;
     }
     const CBlock& blockConnecting = *pthisBlock;
+
+    std::optional<DrivechainBmmBlockContext> finalized_bmm_context;
+    const auto slot = m_params.GetConsensus().drivechain_slot;
+    if (slot.has_value() && blockConnecting.GetHash() != m_params.GetConsensus().hashGenesisBlock) {
+        finalized_bmm_context.emplace();
+        std::string bmm_error;
+        const DrivechainBmmStatus bmm_status = GetDrivechainBmmBlockStatus(
+            blockConnecting, *slot, *finalized_bmm_context, &bmm_error);
+        if (bmm_status == DrivechainBmmStatus::INVALID) {
+            SetDrivechainBmmValidationFailure(
+                state, bmm_status, blockConnecting.GetHash(), bmm_error);
+            InvalidBlockFound(pindexNew, state);
+            return false;
+        }
+        if (bmm_status != DrivechainBmmStatus::VALID) {
+            // PARENT_REJECTED is tied to the current authenticated P->Q edge,
+            // and UNAVAILABLE is purely a liveness failure. Neither may poison
+            // the block index. Suppress this candidate until the next anchor
+            // reconciliation pass observes a usable parent view.
+            setBlockIndexCandidates.erase(pindexNew);
+            m_drivechain_suppressed_candidates.insert(pindexNew);
+            LogPrintf("temporarily suppressing sidechain block %s during BIP301 validation: %s\n",
+                      blockConnecting.GetHash().GetHex(), bmm_error);
+            fStall = true;
+            return true;
+        }
+    }
 
     const auto& fedpegscripts = GetValidFedpegScripts(pindexNew, m_params.GetConsensus(), false /* nextblock_validation */);
     if (!CheckPeginRipeness(blockConnecting, fedpegscripts)) {
@@ -3103,7 +3532,10 @@ bool CChainState::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew
 
     {
         CCoinsViewCache view(&CoinsTip());
-        bool rv = ConnectBlock(blockConnecting, state, pindexNew, view, &setPeginsSpent);
+        bool rv = ConnectBlockInternal(
+            blockConnecting, state, pindexNew, view, &setPeginsSpent,
+            false, nullptr,
+            finalized_bmm_context.has_value() ? &*finalized_bmm_context : nullptr);
         GetMainSignals().BlockChecked(blockConnecting, state);
         if (!rv) {
             if (state.IsInvalid()) {
@@ -3141,6 +3573,238 @@ bool CChainState::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew
     LogPrint(BCLog::BENCH, "- Connect block: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime6 - nTime1) * MILLI, nTimeTotal * MICRO, nTimeTotal * MILLI / nBlocksTotal);
 
     connectTrace.BlockConnected(pindexNew, std::move(pthisBlock));
+    return true;
+}
+
+bool CChainState::ReconcileDrivechainAnchors(BlockValidationState& state, bool& blocks_disconnected, bool& stalled)
+{
+    AssertLockHeld(cs_main);
+    if (m_mempool) AssertLockHeld(m_mempool->cs);
+    blocks_disconnected = false;
+    stalled = false;
+
+    const auto slot = m_params.GetConsensus().drivechain_slot;
+    if (!slot.has_value()) return true;
+    // A deep parent reorg may inspect several persisted anchors. It must not
+    // multiply the synchronous parent-RPC allowance while consensus locks are
+    // held; stale replay work is left to the background warmer.
+    DrivechainParentValidationBudget parent_budget{/*enable=*/true};
+
+    struct CachedStatus {
+        DrivechainAnchorStatus status{DrivechainAnchorStatus::UNAVAILABLE};
+        std::string error;
+    };
+    std::map<const CBlockIndex*, CachedStatus> status_cache;
+    const auto get_status = [&](const CBlockIndex* index) -> const CachedStatus& {
+        auto [it, inserted] = status_cache.try_emplace(index);
+        if (!inserted) return it->second;
+        if (!index || index->nHeight == 0) {
+            it->second.status = DrivechainAnchorStatus::ACTIVE;
+            return it->second;
+        }
+        if (!index->m_drivechain_anchor.has_value()) {
+            it->second.error = "persisted drivechain anchor is absent";
+            return it->second;
+        }
+        it->second.status = IsDrivechainAnchorActive(*index->m_drivechain_anchor, *slot, &it->second.error);
+        return it->second;
+    };
+
+    // Parent reorgs invalidate a suffix. Checking backward from the active tip
+    // bounds normal operation to one lookup; deeper scans occur only across the
+    // exact reorg depth. An unavailable parent view never causes a disconnect.
+    DisconnectedBlockTransactions disconnectpool;
+    while (m_chain.Tip() && m_chain.Tip()->nHeight > 0) {
+        CBlockIndex* anchored_tip = m_chain.Tip();
+        const CachedStatus& checked = get_status(anchored_tip);
+        if (checked.status == DrivechainAnchorStatus::ACTIVE) break;
+        if (checked.status == DrivechainAnchorStatus::UNAVAILABLE) {
+            LogPrintf("drivechain anchor reconciliation stalled at sidechain block %s height %d: %s\n",
+                anchored_tip->GetBlockHash().GetHex(), anchored_tip->nHeight, checked.error);
+            stalled = true;
+            break;
+        }
+
+        assert(checked.status == DrivechainAnchorStatus::ORPHANED);
+        LogPrintf("disconnecting sidechain block %s height %d after its exact BIP301 P->Q anchor left the active parent chain: %s\n",
+            anchored_tip->GetBlockHash().GetHex(), anchored_tip->nHeight, checked.error);
+        setBlockIndexCandidates.erase(anchored_tip);
+        m_drivechain_suppressed_candidates.insert(anchored_tip);
+        if (pindexBestHeader && pindexBestHeader->nHeight >= anchored_tip->nHeight &&
+            pindexBestHeader->GetAncestor(anchored_tip->nHeight) == anchored_tip) {
+            pindexBestHeader = anchored_tip->pprev;
+        }
+        if (!DisconnectTip(state, &disconnectpool)) {
+            MaybeUpdateMempoolForReorg(disconnectpool, false);
+            return false;
+        }
+        blocks_disconnected = true;
+    }
+
+    if (blocks_disconnected) {
+        MaybeUpdateMempoolForReorg(disconnectpool, true);
+        CBlockIndex* new_tip = m_chain.Tip();
+        if (new_tip && new_tip->IsValid(BLOCK_VALID_TRANSACTIONS) && new_tip->HaveTxsDownloaded()) {
+            setBlockIndexCandidates.insert(new_tip);
+        }
+    }
+
+    std::set<CBlockIndex*> reconsider = m_drivechain_suppressed_candidates;
+    reconsider.insert(setBlockIndexCandidates.begin(), setBlockIndexCandidates.end());
+
+    // The same immutable sidechain block B can be recommitted after its old
+    // successor Q1 is reorged out: B still commits to P, while a new active
+    // successor Q2 contains the identical slot/M7 commitment. Process stored
+    // candidates ancestor-first so a suffix can be rebound without ever
+    // weakening anchor continuity. An ACTIVE or UNAVAILABLE old anchor is
+    // never eligible for replacement.
+    std::vector<CBlockIndex*> reanchor_candidates(
+        reconsider.begin(), reconsider.end());
+    std::sort(reanchor_candidates.begin(), reanchor_candidates.end(),
+              [](const CBlockIndex* a, const CBlockIndex* b) {
+                  if (a->nHeight != b->nHeight) return a->nHeight < b->nHeight;
+                  return a->GetBlockHash() < b->GetBlockHash();
+              });
+    bool anchors_replaced{false};
+    for (CBlockIndex* candidate : reanchor_candidates) {
+        if (!candidate || m_chain.Contains(candidate) ||
+            !candidate->m_drivechain_anchor.has_value() ||
+            !candidate->IsValid(BLOCK_VALID_TRANSACTIONS) ||
+            !candidate->HaveTxsDownloaded()) {
+            continue;
+        }
+
+        const CachedStatus& old_status = get_status(candidate);
+        if (old_status.status != DrivechainAnchorStatus::ORPHANED) continue;
+
+        const DrivechainAnchor* predecessor_anchor{nullptr};
+        if (candidate->pprev && candidate->pprev->nHeight > 0) {
+            if (!candidate->pprev->m_drivechain_anchor.has_value() ||
+                get_status(candidate->pprev).status !=
+                    DrivechainAnchorStatus::ACTIVE) {
+                continue;
+            }
+            predecessor_anchor = &*candidate->pprev->m_drivechain_anchor;
+        }
+
+        CBlock stored_block;
+        if (!ReadBlockFromDisk(stored_block, candidate,
+                               m_params.GetConsensus())) {
+            return AbortNode(
+                state,
+                strprintf("Failed to read drivechain block %s while replacing an orphaned BIP301 anchor",
+                          candidate->GetBlockHash().GetHex()));
+        }
+
+        DrivechainBmmBlockContext replacement_context;
+        std::string replacement_error;
+        const DrivechainBmmStatus replacement_status =
+            GetDrivechainBmmBlockStatus(
+                stored_block, *slot, replacement_context,
+                &replacement_error);
+        if (replacement_status != DrivechainBmmStatus::VALID) {
+            if (replacement_status == DrivechainBmmStatus::UNAVAILABLE) {
+                stalled = true;
+            }
+            LogPrintf("cannot replace orphaned BIP301 anchor for sidechain block %s yet: %s\n",
+                      candidate->GetBlockHash().GetHex(),
+                      replacement_error);
+            continue;
+        }
+
+        const DrivechainAnchor replacement =
+            MakeDrivechainAnchor(replacement_context);
+        const DrivechainAnchor old_anchor =
+            *candidate->m_drivechain_anchor;
+        if (!IsDrivechainAnchorReplacementAllowed(
+                old_status.status, old_anchor, replacement,
+                predecessor_anchor)) {
+            LogPrintf("refusing unauthorized BIP301 anchor replacement for sidechain block %s\n",
+                      candidate->GetBlockHash().GetHex());
+            continue;
+        }
+
+        candidate->m_drivechain_anchor = replacement;
+        m_blockman.m_dirty_blockindex.insert(candidate);
+        CachedStatus& updated = status_cache[candidate];
+        updated.status = DrivechainAnchorStatus::ACTIVE;
+        updated.error.clear();
+        anchors_replaced = true;
+        LogPrintf("replaced orphaned BIP301 anchor for sidechain block %s: old Q %s, active Q %s\n",
+                  candidate->GetBlockHash().GetHex(),
+                  old_anchor.bmm_block_hash.GetHex(),
+                  replacement.bmm_block_hash.GetHex());
+    }
+
+    // Persist every replacement in one synchronous block-index batch before
+    // making the candidate reconnectable. A crash either observes the old
+    // orphaned identity (and safely retries) or the complete new identity.
+    if (anchors_replaced && !m_blockman.WriteBlockIndexDB()) {
+        return AbortNode(
+            state,
+            "Failed to atomically persist replacement drivechain anchors");
+    }
+
+    // Recheck both ordinary candidates and previously parent-suppressed tips on
+    // every activation pass. Suppression is in-memory eligibility state only;
+    // no BLOCK_FAILED_* bit is ever set for an orphaned or unavailable anchor.
+    for (CBlockIndex* candidate : reconsider) {
+        if (!candidate || m_chain.Contains(candidate)) {
+            m_drivechain_suppressed_candidates.erase(candidate);
+            continue;
+        }
+        if (!candidate->IsValid(BLOCK_VALID_TRANSACTIONS) || !candidate->HaveTxsDownloaded()) {
+            setBlockIndexCandidates.erase(candidate);
+            m_drivechain_suppressed_candidates.erase(candidate);
+            continue;
+        }
+
+        DrivechainAnchorStatus chain_status{DrivechainAnchorStatus::ACTIVE};
+        std::string chain_error;
+        for (CBlockIndex* cursor = candidate; cursor && !m_chain.Contains(cursor); cursor = cursor->pprev) {
+            const CachedStatus& checked = get_status(cursor);
+            if (checked.status == DrivechainAnchorStatus::ORPHANED) {
+                chain_status = checked.status;
+                chain_error = checked.error;
+                break;
+            }
+            if (checked.status == DrivechainAnchorStatus::UNAVAILABLE) {
+                chain_status = checked.status;
+                chain_error = checked.error;
+                break;
+            }
+        }
+
+        if (chain_status == DrivechainAnchorStatus::ACTIVE) {
+            if (!setBlockIndexCandidates.value_comp()(candidate, m_chain.Tip())) {
+                setBlockIndexCandidates.insert(candidate);
+                m_drivechain_suppressed_candidates.erase(candidate);
+            }
+            if (IsDrivechainHeaderAuthenticated(candidate, m_params.GetConsensus()) &&
+                (pindexBestHeader == nullptr ||
+                 node::CBlockIndexWorkComparator()(pindexBestHeader, candidate))) {
+                pindexBestHeader = candidate;
+            }
+            continue;
+        }
+
+        setBlockIndexCandidates.erase(candidate);
+        m_drivechain_suppressed_candidates.insert(candidate);
+        if (chain_status == DrivechainAnchorStatus::ORPHANED && pindexBestHeader &&
+            pindexBestHeader->nHeight >= candidate->nHeight &&
+            pindexBestHeader->GetAncestor(candidate->nHeight) == candidate) {
+            pindexBestHeader = m_chain.Tip();
+        }
+        if (chain_status == DrivechainAnchorStatus::UNAVAILABLE) {
+            LogPrintf("drivechain candidate %s temporarily unavailable: %s\n",
+                candidate->GetBlockHash().GetHex(), chain_error);
+            stalled = true;
+        } else {
+            LogPrintf("drivechain candidate %s temporarily suppressed by a parent reorg: %s\n",
+                candidate->GetBlockHash().GetHex(), chain_error);
+        }
+    }
+
     return true;
 }
 
@@ -3388,10 +4052,22 @@ bool CChainState::ActivateBestChain(BlockValidationState& state, std::shared_ptr
             LOCK(MempoolMutex());
             CBlockIndex* starting_tip = m_chain.Tip();
             bool blocks_connected = false;
+            bool anchor_blocks_disconnected = false;
+            if (!ReconcileDrivechainAnchors(state, anchor_blocks_disconnected, fStall)) {
+                return false;
+            }
+            blocks_connected = anchor_blocks_disconnected;
+            if (anchor_blocks_disconnected) pindexNewTip = m_chain.Tip();
+            // Parent eligibility is dynamic. Always choose again after the
+            // reconciliation pass rather than retaining a formerly eligible
+            // most-work pointer across periodic ActivateBestChain calls.
+            pindexMostWork = nullptr;
             do {
                 // We absolutely may not unlock cs_main until we've made forward progress
                 // (with the exception of shutdown due to hardware issues, low disk space, etc).
                 ConnectTrace connectTrace; // Destructed before cs_main is unlocked
+
+                if (fStall) break;
 
                 if (pindexMostWork == nullptr) {
                     pindexMostWork = FindMostWorkChain();
@@ -3433,7 +4109,7 @@ bool CChainState::ActivateBestChain(BlockValidationState& state, std::shared_ptr
 
             // Notify external listeners about the new tip.
             // Enqueue while holding cs_main to ensure that UpdatedBlockTip is called in the order in which blocks are connected
-            if (pindexFork != pindexNewTip) {
+            if (pindexFork != pindexNewTip || anchor_blocks_disconnected) {
                 // Notify ValidationInterface subscribers
                 GetMainSignals().UpdatedBlockTip(pindexNewTip, pindexFork, fInitialDownload);
 
@@ -3463,6 +4139,28 @@ bool CChainState::ActivateBestChain(BlockValidationState& state, std::shared_ptr
         return false;
     }
 
+    return true;
+}
+
+bool CChainState::ReconcileDrivechainAnchorsForStartup(
+    BlockValidationState& state)
+{
+    AssertLockNotHeld(m_chainstate_mutex);
+    AssertLockNotHeld(::cs_main);
+
+    LOCK(m_chainstate_mutex);
+    LOCK(::cs_main);
+    LOCK(MempoolMutex());
+
+    bool blocks_disconnected{false};
+    bool stalled{false};
+    if (!ReconcileDrivechainAnchors(state, blocks_disconnected, stalled)) {
+        return false;
+    }
+    if (stalled) {
+        return state.Error(
+            "authenticated parent state unavailable during startup anchor reconciliation");
+    }
     return true;
 }
 
@@ -3791,6 +4489,28 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
                                  strprintf("Transaction check failed (tx hash %s) %s", tx->GetHash().ToString(), tx_state.GetDebugMessage()));
         }
     }
+
+    // A slot network has exactly one peg-in type: native BIP300 deposits.
+    // Bound their per-block replay/map work deterministically, independent of
+    // machine speed or the parent RPC wall-clock availability deadline. The
+    // witness is checked later; m_is_pegin itself is non-witness transaction
+    // data and is therefore safe to count in this context-free pass.
+    if (consensusParams.drivechain_slot.has_value()) {
+        unsigned int native_deposit_inputs{0};
+        for (const auto& tx : block.vtx) {
+            for (const CTxIn& input : tx->vin) {
+                if (input.m_is_pegin &&
+                    ++native_deposit_inputs >
+                        MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK) {
+                    return state.Invalid(
+                        BlockValidationResult::BLOCK_CONSENSUS,
+                        "bad-drivechain-deposit-count",
+                        strprintf("block contains more than %u native drivechain deposits",
+                                  MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK));
+                }
+            }
+        }
+    }
     unsigned int nSigOps = 0;
     for (const auto& tx : block.vtx)
     {
@@ -4105,7 +4825,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     return true;
 }
 
-bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, const CChainParams& chainparams, CBlockIndex** ppindex, bool* duplicate)
+bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValidationState& state, const CChainParams& chainparams, CBlockIndex** ppindex, bool* duplicate, const bool full_block_authenticated)
 {
     AssertLockHeld(cs_main);
     // Check for duplicate
@@ -4130,6 +4850,16 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             return true;
         }
 
+        if (chainparams.GetConsensus().drivechain_slot.has_value() &&
+            !full_block_authenticated) {
+            // BIP301 authentication is in the coinbase transaction. Unknown
+            // native-drivechain headers remain ephemeral at the network edge;
+            // only the full-block admission path may allocate a block index.
+            return state.Error(strprintf(
+                "drivechain header %s requires a preauthenticated full block",
+                hash.GetHex()));
+        }
+
         if (!CheckBlockHeader(block, state, chainparams.GetConsensus())) {
             LogPrint(BCLog::VALIDATION, "%s: Consensus::CheckBlockHeader: %s, %s\n", __func__, hash.ToString(), state.ToString());
             return false;
@@ -4146,6 +4876,17 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
         if (pindexPrev->nStatus & BLOCK_FAILED_MASK) {
             LogPrint(BCLog::VALIDATION, "%s: %s prev block invalid\n", __func__, hash.ToString());
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_PREV, "bad-prevblk");
+        }
+        if (chainparams.GetConsensus().drivechain_slot.has_value() &&
+            !IsDrivechainHeaderAuthenticated(pindexPrev, chainparams.GetConsensus())) {
+            // The BMM commitment is in the coinbase, so a header cannot
+            // authenticate itself or serve as the parent of another header.
+            // Requiring the predecessor's admitted full block bounds cheap
+            // child-header chains to one outstanding level without changing
+            // ordinary Elements header-first synchronization.
+            return state.Error(strprintf(
+                "drivechain header %s requires authenticated full predecessor %s",
+                hash.GetHex(), pindexPrev->GetBlockHash().GetHex()));
         }
         if (!ContextualCheckBlockHeader(block, state, m_blockman, chainparams, pindexPrev, GetAdjustedTime())) {
             LogPrint(BCLog::VALIDATION, "%s: Consensus::ContextualCheckBlockHeader: %s, %s\n", __func__, hash.ToString(), state.ToString());
@@ -4191,11 +4932,59 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             }
         }
     }
-    CBlockIndex* pindex{m_blockman.AddToBlockIndex(block)};
+    // Header-only drivechain work is not meaningful until the corresponding
+    // full block authenticates its coinbase BMM commitment. AcceptBlock
+    // promotes the index after that admission succeeds.
+    const bool update_best_header = !chainparams.GetConsensus().drivechain_slot.has_value();
+    CBlockIndex* pindex{m_blockman.AddToBlockIndex(block, update_best_header)};
 
     if (ppindex)
         *ppindex = pindex;
 
+    return true;
+}
+
+bool ChainstateManager::CheckDrivechainEphemeralHeader(
+    const CBlockHeader& header,
+    BlockValidationState& state,
+    const CChainParams& chainparams,
+    const CBlockIndex** predecessor)
+{
+    AssertLockHeld(cs_main);
+    if (predecessor) *predecessor = nullptr;
+    if (!chainparams.GetConsensus().drivechain_slot.has_value()) {
+        return state.Error("ephemeral full-block-first header validation is only available on a native drivechain");
+    }
+
+    const uint256 hash = header.GetHash();
+    if (m_blockman.LookupBlockIndex(hash) != nullptr) {
+        return state.Error("ephemeral drivechain header is already indexed");
+    }
+    if (!CheckBlockHeader(header, state, chainparams.GetConsensus())) {
+        return false;
+    }
+
+    CBlockIndex* pindex_prev =
+        m_blockman.LookupBlockIndex(header.hashPrevBlock);
+    if (pindex_prev == nullptr) {
+        return state.Invalid(BlockValidationResult::BLOCK_MISSING_PREV,
+                             "prev-blk-not-found");
+    }
+    if ((pindex_prev->nStatus & BLOCK_FAILED_MASK) != 0) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_PREV,
+                             "bad-prevblk");
+    }
+    if (!IsDrivechainHeaderAuthenticated(
+            pindex_prev, chainparams.GetConsensus())) {
+        return state.Error(strprintf(
+            "drivechain header %s requires authenticated full predecessor %s",
+            hash.GetHex(), pindex_prev->GetBlockHash().GetHex()));
+    }
+    if (!ContextualCheckBlockHeader(header, state, m_blockman, chainparams,
+                                    pindex_prev, GetAdjustedTime())) {
+        return false;
+    }
+    if (predecessor) *predecessor = pindex_prev;
     return true;
 }
 
@@ -4223,6 +5012,15 @@ bool ChainstateManager::ProcessNewBlockHeaders(const std::vector<CBlockHeader>& 
             if (ppindex) {
                 *ppindex = pindex;
             }
+
+            if (chainparams.GetConsensus().drivechain_slot.has_value() &&
+                (!duplicate || !IsDrivechainHeaderAuthenticated(
+                                   pindex, chainparams.GetConsensus()))) {
+                // Process duplicate authenticated prefixes, then admit at most
+                // one header whose full block still needs BMM validation. Its
+                // descendants are reconsidered after that block is received.
+                break;
+            }
         }
     }
     if (NotifyHeaderTip(ActiveChainstate())) {
@@ -4237,17 +5035,98 @@ bool ChainstateManager::ProcessNewBlockHeaders(const std::vector<CBlockHeader>& 
 }
 
 /** Store block on disk. If dbp is non-nullptr, the file is known to already reside on disk */
-bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock)
+bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, DrivechainBlockAdmissionInfo* drivechain_info)
 {
     const CBlock& block = *pblock;
+    DrivechainParentValidationBudget parent_budget{
+        m_params.GetConsensus().drivechain_slot.has_value()};
 
     if (fNewBlock) *fNewBlock = false;
+    if (drivechain_info) *drivechain_info = {};
     AssertLockHeld(cs_main);
 
     CBlockIndex *pindexDummy = nullptr;
     CBlockIndex *&pindex = ppindex ? *ppindex : pindexDummy;
 
-    bool accepted_header{m_chainman.AcceptBlockHeader(block, state, m_params, &pindex)};
+    bool drivechain_full_block_authenticated{false};
+    std::optional<DrivechainBmmBlockContext> preauthenticated_bmm_context;
+    const Consensus::Params& consensus = m_params.GetConsensus();
+    if (consensus.drivechain_slot.has_value() &&
+        block.GetHash() != consensus.hashGenesisBlock &&
+        m_blockman.LookupBlockIndex(block.GetHash()) == nullptr) {
+        // Unknown unsolicited full blocks must not turn the synchronous
+        // parent proof path into a cs_main RPC oracle. P2P ephemeral-header
+        // requests and local submit/mining paths explicitly force processing.
+        if (!fRequested) return true;
+
+        CBlockIndex* predecessor =
+            m_blockman.LookupBlockIndex(block.hashPrevBlock);
+        if (predecessor == nullptr) {
+            return state.Invalid(BlockValidationResult::BLOCK_MISSING_PREV,
+                                 "prev-blk-not-found");
+        }
+        if (!IsDrivechainHeaderAuthenticated(predecessor, consensus)) {
+            return state.Error(strprintf(
+                "drivechain full block %s requires authenticated predecessor %s",
+                block.GetHash().GetHex(), predecessor->GetBlockHash().GetHex()));
+        }
+
+        // No persistent block-index entry is allocated until the complete
+        // block has passed context-free/contextual checks, exact P->Q/M7
+        // authentication, and native-deposit preflight.
+        if (!CheckBlock(block, state, consensus) ||
+            !ContextualCheckBlock(block, state, consensus, predecessor)) {
+            return false;
+        }
+        preauthenticated_bmm_context.emplace();
+        std::string bmm_error;
+        const DrivechainBmmStatus bmm_status = GetDrivechainBmmBlockStatus(
+            block, *consensus.drivechain_slot,
+            *preauthenticated_bmm_context, &bmm_error);
+        if (drivechain_info) {
+            drivechain_info->bmm_status = bmm_status;
+            drivechain_info->parent_hash =
+                preauthenticated_bmm_context->parent_hash;
+            drivechain_info->successor_hash =
+                preauthenticated_bmm_context->bmm_block_hash;
+        }
+        if (bmm_status != DrivechainBmmStatus::VALID) {
+            return SetDrivechainBmmValidationFailure(
+                state, bmm_status, block.GetHash(), bmm_error);
+        }
+
+        const DrivechainAnchor preauthenticated_anchor =
+            MakeDrivechainAnchor(*preauthenticated_bmm_context);
+        if (!preauthenticated_anchor.IsSane()) {
+            return state.Error(strprintf(
+                "authenticated BIP301 context for sidechain block %s is internally inconsistent",
+                block.GetHash().GetHex()));
+        }
+        if (predecessor->nHeight > 0 &&
+            (!predecessor->m_drivechain_anchor.has_value() ||
+             !preauthenticated_anchor.Follows(
+                 *predecessor->m_drivechain_anchor))) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bad-drivechain-anchor-sequence",
+                "authenticated BIP301 anchor does not follow the full predecessor anchor");
+        }
+
+        const uint256 block_hash = block.GetHash();
+        CBlockIndex ephemeral_index(block);
+        ephemeral_index.phashBlock = &block_hash;
+        ephemeral_index.pprev = predecessor;
+        ephemeral_index.nHeight = predecessor->nHeight + 1;
+        if (!PreflightDrivechainDeposits(
+                block, &ephemeral_index, m_params, state)) {
+            return false;
+        }
+        drivechain_full_block_authenticated = true;
+    }
+
+    bool accepted_header{m_chainman.AcceptBlockHeader(
+        block, state, m_params, &pindex, nullptr,
+        drivechain_full_block_authenticated)};
     CheckBlockIndex();
 
     if (!accepted_header)
@@ -4296,19 +5175,77 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, Block
         return error("%s: %s", __func__, state.ToString());
     }
 
-    if (m_params.GetConsensus().hashGenesisBlock != block.GetHash()) {
-        const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
+    std::optional<DrivechainAnchor> authenticated_drivechain_anchor;
+    if (m_params.GetConsensus().hashGenesisBlock != block.GetHash() &&
+        m_params.GetConsensus().drivechain_slot.has_value()) {
+        DrivechainBmmBlockContext bmm_context;
         std::string bmm_error;
-        if (!IsDrivechainBmmCommitmentMined(block, sidechain_slot, &bmm_error)) {
-            state.Error(strprintf("missing mined BIP301 BMM commitment for sidechain block %s: %s",
-                block.GetHash().GetHex(), bmm_error));
+        DrivechainBmmStatus bmm_status{DrivechainBmmStatus::VALID};
+        if (preauthenticated_bmm_context.has_value()) {
+            bmm_context = *preauthenticated_bmm_context;
+        } else {
+            bmm_status = GetDrivechainBmmBlockStatus(
+                block, *m_params.GetConsensus().drivechain_slot,
+                bmm_context, &bmm_error);
+        }
+        if (drivechain_info) {
+            drivechain_info->bmm_status = bmm_status;
+            drivechain_info->parent_hash = bmm_context.parent_hash;
+            drivechain_info->successor_hash = bmm_context.bmm_block_hash;
+        }
+        if (bmm_status != DrivechainBmmStatus::VALID) {
+            SetDrivechainBmmValidationFailure(state, bmm_status, block.GetHash(), bmm_error);
+            if (state.IsInvalid()) {
+                pindex->nStatus |= BLOCK_FAILED_VALID;
+                m_chainman.m_failed_blocks.insert(pindex);
+                m_blockman.m_dirty_blockindex.insert(pindex);
+            }
             return error("%s: %s", __func__, state.ToString());
         }
+        const DrivechainAnchor anchor = MakeDrivechainAnchor(bmm_context);
+        if (!anchor.IsSane()) {
+            state.Error(strprintf("authenticated BIP301 context for sidechain block %s is internally inconsistent",
+                block.GetHash().GetHex()));
+            return error("%s: %s", __func__, state.ToString());
+        }
+        if (pindex->m_drivechain_anchor.has_value() && *pindex->m_drivechain_anchor != anchor) {
+            state.Error(strprintf("sidechain block %s was previously bound to a different BIP301 anchor",
+                block.GetHash().GetHex()));
+            return error("%s: %s", __func__, state.ToString());
+        }
+        if (pindex->pprev && pindex->pprev->nHeight > 0 && !pindex->pprev->m_drivechain_anchor.has_value()) {
+            state.Error(strprintf("sidechain block %s cannot be anchored before its predecessor",
+                block.GetHash().GetHex()));
+            return error("%s: %s", __func__, state.ToString());
+        }
+        if (pindex->pprev && pindex->pprev->m_drivechain_anchor.has_value() &&
+            !anchor.Follows(*pindex->pprev->m_drivechain_anchor)) {
+            state.Error(strprintf("BIP301 anchor for sidechain block %s does not follow its predecessor's anchor",
+                block.GetHash().GetHex()));
+            return error("%s: %s", __func__, state.ToString());
+        }
+
+        authenticated_drivechain_anchor = anchor;
+    }
+
+    // Authenticate the block's exact P->Q/M7 commitment before consulting
+    // any deposit proofs. Otherwise an uncommitted block could force costly
+    // parent-chain deposit queries. Keep the authenticated anchor local until
+    // every deposit passes preflight so a transiently unavailable claim never
+    // binds this header to stale parent-chain metadata.
+    if (m_params.GetConsensus().hashGenesisBlock != block.GetHash() &&
+        !PreflightDrivechainDeposits(block, pindex, m_params, state)) {
+        if (state.IsInvalid()) {
+            pindex->nStatus |= BLOCK_FAILED_VALID;
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
+        return error("%s: %s", __func__, state.ToString());
     }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW
     // (but if it does not build on our best tip, let the SendMessages loop relay it)
-    if (!IsInitialBlockDownload() && m_chain.Tip() == pindex->pprev)
+    if (!m_params.GetConsensus().drivechain_slot.has_value() &&
+        !IsInitialBlockDownload() && m_chain.Tip() == pindex->pprev)
         GetMainSignals().NewPoWValidBlock(pindex, pblock);
 
     // Write block to history file
@@ -4320,6 +5257,26 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, Block
             return false;
         }
         ReceivedBlockTransactions(block, pindex, blockPos);
+        if (authenticated_drivechain_anchor.has_value()) {
+            // Bind only after the full block is durably placed and its
+            // transaction metadata is installed. A storage failure therefore
+            // cannot leave a no-data index masquerading as authenticated.
+            pindex->m_drivechain_anchor =
+                *authenticated_drivechain_anchor;
+            m_blockman.m_dirty_blockindex.insert(pindex);
+            if (!IsInitialBlockDownload() &&
+                m_chain.Tip() == pindex->pprev) {
+                GetMainSignals().NewPoWValidBlock(pindex, pblock);
+            }
+        }
+        if (m_params.GetConsensus().drivechain_slot.has_value() &&
+            IsDrivechainHeaderAuthenticated(pindex, m_params.GetConsensus()) &&
+            (pindexBestHeader == nullptr ||
+             node::CBlockIndexWorkComparator()(pindexBestHeader, pindex))) {
+            // Only the admitted full block, never its cheap standalone header,
+            // may advance the global header-sync point on a drivechain.
+            pindexBestHeader = pindex;
+        }
     } catch (const std::runtime_error& e) {
         return AbortNode(state, std::string("System error: ") + e.what());
     }
@@ -4331,9 +5288,11 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, Block
     return true;
 }
 
-bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock>& block, bool force_processing, bool* new_block)
+bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock>& block, bool force_processing, bool* new_block, DrivechainBlockAdmissionInfo* drivechain_info)
 {
     AssertLockNotHeld(cs_main);
+
+    if (drivechain_info) *drivechain_info = {};
 
     {
         CBlockIndex *pindex = nullptr;
@@ -4352,7 +5311,9 @@ bool ChainstateManager::ProcessNewBlock(const CChainParams& chainparams, const s
         bool ret = CheckBlock(*block, state, chainparams.GetConsensus());
         if (ret) {
             // Store to disk
-            ret = ActiveChainstate().AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block);
+            ret = ActiveChainstate().AcceptBlock(
+                block, state, &pindex, force_processing, nullptr, new_block,
+                drivechain_info);
         }
         if (!ret) {
             GetMainSignals().BlockChecked(*block, state);
@@ -4374,6 +5335,8 @@ MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef&
 {
     AssertLockHeld(cs_main);
     CChainState& active_chainstate = ActiveChainstate();
+    DrivechainParentValidationBudget parent_budget{
+        active_chainstate.m_params.GetConsensus().drivechain_slot.has_value()};
     if (!active_chainstate.GetMempool()) {
         TxValidationState state;
         state.Invalid(TxValidationResult::TX_NO_MEMPOOL, "no-mempool");
@@ -4409,6 +5372,56 @@ bool TestBlockValidity(BlockValidationState& state,
     if (!ContextualCheckBlock(block, state, chainparams.GetConsensus(), pindexPrev))
         return error("%s: Consensus::ContextualCheckBlock: %s", __func__, state.ToString());
     if (!chainstate.ConnectBlock(block, state, &indexDummy, viewNew, NULL, true)) {
+        return false;
+    }
+    assert(state.IsValid());
+
+    return true;
+}
+
+bool TestBlockCandidateValidity(BlockValidationState& state,
+                                const CChainParams& chainparams,
+                                CChainState& chainstate,
+                                const CBlock& block,
+                                CBlockIndex* pindexPrev,
+                                bool fCheckPOW,
+                                bool fCheckMerkleRoot)
+{
+    AssertLockHeld(cs_main);
+    assert(pindexPrev && pindexPrev == chainstate.m_chain.Tip());
+    CCoinsViewCache viewNew(&chainstate.CoinsTip());
+    uint256 block_hash(block.GetHash());
+    CBlockIndex indexDummy(block);
+    indexDummy.pprev = pindexPrev;
+    indexDummy.nHeight = pindexPrev->nHeight + 1;
+    indexDummy.phashBlock = &block_hash;
+
+    // Candidate checking remains a complete block/UTXO/script self-check. The
+    // only unavailable fact is the successor-chain M7 commitment to this
+    // candidate's hash, which is necessarily mined after template creation.
+    if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainparams, pindexPrev, GetAdjustedTime()))
+        return error("%s: Consensus::ContextualCheckBlockHeader: %s", __func__, state.ToString());
+    if (!CheckBlock(block, state, chainparams.GetConsensus(), fCheckPOW, fCheckMerkleRoot))
+        return error("%s: Consensus::CheckBlock: %s", __func__, state.ToString());
+    if (!ContextualCheckBlock(block, state, chainparams.GetConsensus(), pindexPrev))
+        return error("%s: Consensus::ContextualCheckBlock: %s", __func__, state.ToString());
+
+    DrivechainParentBlockContext candidate_context;
+    const DrivechainParentBlockContext* candidate_context_ptr{nullptr};
+    // CreateNewBlock holds cs_main and the mempool lock. Bound the parent
+    // context read and the nested ConnectBlock self-check as one operation.
+    DrivechainParentValidationBudget parent_budget{
+        chainparams.GetConsensus().drivechain_slot.has_value()};
+    if (chainparams.GetConsensus().hashGenesisBlock != block_hash &&
+        chainparams.GetConsensus().drivechain_slot.has_value()) {
+        std::string context_error;
+        if (!GetDrivechainParentBlockContext(block, *chainparams.GetConsensus().drivechain_slot, candidate_context, &context_error)) {
+            return state.Error(strprintf("authenticated BIP301 parent context unavailable for block candidate %s: %s",
+                block_hash.GetHex(), context_error));
+        }
+        candidate_context_ptr = &candidate_context;
+    }
+    if (!chainstate.ConnectBlockInternal(block, state, &indexDummy, viewNew, nullptr, true, candidate_context_ptr)) {
         return false;
     }
     assert(state.IsValid());
@@ -4702,6 +5715,7 @@ void CChainState::UnloadBlockIndex()
     AssertLockHeld(::cs_main);
     nBlockSequenceId = 1;
     setBlockIndexCandidates.clear();
+    m_drivechain_suppressed_candidates.clear();
 }
 
 // May NOT be used after any connections are up as much
@@ -5017,7 +6031,7 @@ void CChainState::CheckBlockIndex()
                 // its setBlockIndexCandidates shouldn't have some entries (i.e. those past the
                 // snapshot block) which do exist in the block index for the active chainstate.
                 if (is_active && (pindexFirstMissing == nullptr || pindex == m_chain.Tip())) {
-                    assert(setBlockIndexCandidates.count(pindex));
+                    assert(setBlockIndexCandidates.count(pindex) || m_drivechain_suppressed_candidates.count(pindex));
                 }
                 // If some parent is missing, then it could be that this block was in
                 // setBlockIndexCandidates but had to be removed because of the missing data.
@@ -5054,7 +6068,9 @@ void CChainState::CheckBlockIndex()
             //    tip.
             // So if this block is itself better than m_chain.Tip() and it wasn't in
             // setBlockIndexCandidates, then it must be in m_blocks_unlinked.
-            if (!CBlockIndexWorkComparator()(pindex, m_chain.Tip()) && setBlockIndexCandidates.count(pindex) == 0) {
+            if (!CBlockIndexWorkComparator()(pindex, m_chain.Tip()) &&
+                setBlockIndexCandidates.count(pindex) == 0 &&
+                m_drivechain_suppressed_candidates.count(pindex) == 0) {
                 if (pindexFirstInvalid == nullptr) {
                     assert(foundInUnlinked);
                 }

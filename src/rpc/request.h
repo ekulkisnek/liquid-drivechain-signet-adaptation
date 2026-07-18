@@ -41,6 +41,8 @@ public:
 };
 
 // ELEMENTS:
+/** Return the parent-node cookie path relative to Bitcoin's data directory. */
+std::string GetDefaultMainchainAuthCookieFile(const std::string& chain);
 /** Needs to know cookiedir path info -cli doesn't require */
 bool GetMainchainAuthCookie(std::string *cookie_out);
 

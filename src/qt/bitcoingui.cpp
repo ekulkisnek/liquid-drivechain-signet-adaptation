@@ -257,26 +257,26 @@ void BitcoinGUI::createActions()
     tabGroup->addAction(overviewAction);
 
     sendCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/send"), tr("&Send"), this);
-    sendCoinsAction->setStatusTip(tr("Send coins to a %1 address").arg("Liquid"));
+    sendCoinsAction->setStatusTip(tr("Send coins to an Elements address"));
     sendCoinsAction->setToolTip(sendCoinsAction->statusTip());
     sendCoinsAction->setCheckable(true);
     sendCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_2));
     tabGroup->addAction(sendCoinsAction);
 
     receiveCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("&Receive"), this);
-    receiveCoinsAction->setStatusTip(tr("Request payments (generates QR codes and %1 addresses)").arg("Liquid"));
+    receiveCoinsAction->setStatusTip(tr("Request payments (generates QR codes and Elements addresses)"));
     receiveCoinsAction->setToolTip(receiveCoinsAction->statusTip());
     receiveCoinsAction->setCheckable(true);
     receiveCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_3));
     tabGroup->addAction(receiveCoinsAction);
 
     issueAssetAction = new QAction(platformStyle->SingleColorIcon(":/icons/send"), tr("&Issue Asset..."), this);
-    issueAssetAction->setStatusTip(tr("Issue a new asset on the Liquid sidechain (basic wallet functionality)"));
+    issueAssetAction->setStatusTip(tr("Issue a new asset on Elements (basic wallet functionality)"));
     issueAssetAction->setToolTip(issueAssetAction->statusTip());
     // not a main tab
 
     lwkWalletAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("L&WK Wallet..."), this);
-    lwkWalletAction->setStatusTip(tr("Open Liquid Wallet Kit (LWK) wallet dialog"));
+    lwkWalletAction->setStatusTip(tr("Open the LWK wallet dialog"));
     lwkWalletAction->setToolTip(lwkWalletAction->statusTip());
 
     historyAction = new QAction(platformStyle->SingleColorIcon(":/icons/history"), tr("&Transactions"), this);
@@ -325,9 +325,9 @@ void BitcoinGUI::createActions()
     changePassphraseAction = new QAction(tr("&Change Passphrase…"), this);
     changePassphraseAction->setStatusTip(tr("Change the passphrase used for wallet encryption"));
     signMessageAction = new QAction(tr("Sign &message…"), this);
-    signMessageAction->setStatusTip(tr("Sign messages with your %1 addresses to prove you own them").arg("Liquid"));
+    signMessageAction->setStatusTip(tr("Sign messages with your Elements addresses to prove you own them"));
     verifyMessageAction = new QAction(tr("&Verify message…"), this);
-    verifyMessageAction->setStatusTip(tr("Verify messages to ensure they were signed with specified %1 addresses").arg("Liquid"));
+    verifyMessageAction->setStatusTip(tr("Verify messages signed with specified Elements addresses"));
     m_load_psbt_action = new QAction(tr("&Load PSET from file…"), this);
     m_load_psbt_action->setStatusTip(tr("Load Partially Signed Elements Transaction"));
     m_load_psbt_clipboard_action = new QAction(tr("Load PSET from &clipboard…"), this);
@@ -962,7 +962,7 @@ void BitcoinGUI::updateNetworkState()
 
     if (m_node.getNetworkActive()) {
         //: A substring of the tooltip.
-        tooltip = tr("%n active connection(s) to %1 network", "", count).arg("Liquid");
+        tooltip = tr("%n active connection(s) to the Elements network", "", count);
     } else {
         //: A substring of the tooltip.
         tooltip = tr("Network activity disabled.");

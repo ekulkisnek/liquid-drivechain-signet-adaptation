@@ -9,6 +9,7 @@
 #include <consensus/merkle.h>
 #include <crypto/sha256.h>
 #include <deploymentinfo.h>
+#include <elements_drivechain_identity.h>
 #include <hash.h> // for signet block challenge hash
 #include <issuance.h>
 #include <primitives/transaction.h>
@@ -20,9 +21,19 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 
-static constexpr const char* LAYER_TWO_LABS_SIGNET_CHALLENGE = "00148835832e28c816b7acd8fdb19772ab2199603a56";
 static constexpr const char* LAYER_TWO_LABS_SIGNET_SEED = "172.105.148.135:38333";
-static constexpr const char* LAYER_TWO_LABS_SIGNET_GENESIS = "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6";
+static constexpr const char* LAYER_TWO_LABS_SIGNET_CHALLENGE =
+    ElementsDrivechainIdentity::PARENT_SIGNET_CHALLENGE;
+
+static bool ElementsP2PMagicMatchesDomain()
+{
+    const std::string domain{ElementsDrivechainIdentity::P2P_MAGIC_DOMAIN};
+    uint256 digest;
+    CHash256().Write(MakeUCharSpan(domain)).Finalize(digest);
+    return std::equal(
+        ElementsDrivechainIdentity::P2P_MESSAGE_START.begin(),
+        ElementsDrivechainIdentity::P2P_MESSAGE_START.end(), digest.begin());
+}
 
 static CScript StrHexToScriptWithDefault(std::string strScript, const CScript defaultScript)
 {
@@ -572,7 +583,7 @@ public:
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256S("0x00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"));
         assert(genesis.hashMerkleRoot == uint256S("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
-        parentGenesisBlockHash = uint256S(LAYER_TWO_LABS_SIGNET_GENESIS);
+        parentGenesisBlockHash = uint256S(ElementsDrivechainIdentity::PARENT_GENESIS);
 
         vFixedSeeds.clear();
 
@@ -589,6 +600,408 @@ public:
         fRequireStandard = true;
         m_is_test_chain = true;
         m_is_mockable_chain = false;
+    }
+};
+
+/**
+ * Elements: immutable drivechain on LayerTwo-Labs Signet slot 24.
+ *
+ * This is a dedicated built-in network rather than a mutable custom chain.
+ * Consensus and identity parameters in this class must never be made
+ * command-line configurable.
+ */
+class CElementsDrivechainParams : public CChainParams {
+public:
+    CElementsDrivechainParams()
+    {
+        strNetworkID = CBaseChainParams::ELEMENTS;
+
+        // The sidechain itself uses an OP_TRUE signed-block challenge. Its
+        // security boundary is the mandatory, independently verified BIP301
+        // commitment on the parent chain, not a second native PoW race.
+        consensus.signet_blocks = false;
+        consensus.signet_challenge.clear();
+        consensus.nSubsidyHalvingInterval = 210000;
+        consensus.BIP16Exception = uint256{};
+        consensus.BIP34Height = 1;
+        consensus.BIP34Hash = uint256{};
+        consensus.BIP65Height = 1;
+        consensus.BIP66Height = 1;
+        consensus.CSVHeight = 1;
+        consensus.SegwitHeight = 0;
+        consensus.MinBIP9WarningHeight = 0;
+        consensus.powLimit = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+        consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
+        consensus.nPowTargetSpacing = 10 * 60;
+        consensus.fPowAllowMinDifficultyBlocks = true;
+        consensus.fPowNoRetargeting = true;
+        consensus.nRuleChangeActivationThreshold = 1815;
+        consensus.nMinerConfirmationWindow = 2016;
+        consensus.nMinimumChainWork = uint256{};
+        consensus.defaultAssumeValid = uint256{};
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].min_activation_height = 0;
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].bit = 25;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_DYNA_FED].min_activation_height = 0;
+
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit =
+            ElementsDrivechainIdentity::TAPROOT_DEPLOYMENT_BIT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime =
+            ElementsDrivechainIdentity::DEPLOYMENT_ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout =
+            ElementsDrivechainIdentity::DEPLOYMENT_NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height =
+            ElementsDrivechainIdentity::DEPLOYMENT_MIN_ACTIVATION_HEIGHT;
+
+        // USDD controllers may exist from the first spendable block. Never
+        // leave 0xbe leaves to upgradable-leaf semantics on this chain.
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit =
+            ElementsDrivechainIdentity::SIMPLICITY_DEPLOYMENT_BIT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime =
+            ElementsDrivechainIdentity::DEPLOYMENT_ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nTimeout =
+            ElementsDrivechainIdentity::DEPLOYMENT_NO_TIMEOUT;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height =
+            ElementsDrivechainIdentity::DEPLOYMENT_MIN_ACTIVATION_HEIGHT;
+
+        // Immutable Elements and drivechain configuration.
+        g_con_elementsmode = true;
+        consensus.elements_mode = true;
+        g_con_blockheightinheader = true;
+        g_signed_blocks = true;
+        consensus.genesis_style = ElementsDrivechainIdentity::GENESIS_STYLE;
+        consensus.signblockscript = CScript() <<
+            static_cast<opcodetype>(ElementsDrivechainIdentity::SIGNBLOCK_CHALLENGE_OPCODE);
+        consensus.max_block_signature_size =
+            ElementsDrivechainIdentity::MAX_BLOCK_SIGNATURE_SIZE;
+        consensus.genesis_subsidy = 0;
+        consensus.connect_genesis_outputs = true;
+        consensus.mandatory_coinbase_destination = CScript();
+        consensus.has_parent_chain = true;
+        consensus.drivechain_slot = ElementsDrivechainIdentity::SIDECHAIN_SLOT;
+        // Assert the exact generic Elements proposal derived by replay at the
+        // historical milestones below. This network deliberately uses a distinct
+        // proposal; otherwise both child chains could mint the same later M5.
+        consensus.drivechain_parent_state_active_proposal_description = ParseHex(
+            ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_DESCRIPTION_HEX);
+        consensus.drivechain_parent_state_active_proposal_hash = uint256S(
+            ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_HASH);
+        consensus.drivechain_parent_state_proposal_height =
+            ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_HEIGHT;
+        consensus.drivechain_parent_state_proposal_block_hash = uint256S(
+            ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_BLOCK_HASH);
+        consensus.drivechain_parent_state_activation_height =
+            ElementsDrivechainIdentity::HISTORICAL_ACTIVATION_HEIGHT;
+        consensus.drivechain_parent_state_activation_block_hash = uint256S(
+            ElementsDrivechainIdentity::HISTORICAL_ACTIVATION_BLOCK_HASH);
+
+        // These checkpoint values are assertions over replay from authenticated
+        // parent genesis. They never seed proposal or CTIP state and authorize
+        // no child issuance.
+        consensus.drivechain_parent_state_height =
+            ElementsDrivechainIdentity::PARENT_CHECKPOINT_HEIGHT;
+        consensus.drivechain_parent_state_hash = uint256S(
+            ElementsDrivechainIdentity::PARENT_CHECKPOINT_HASH);
+        consensus.drivechain_parent_state_chainwork = uint256S(
+            ElementsDrivechainIdentity::PARENT_CHECKPOINT_CHAINWORK);
+        consensus.drivechain_parent_state_ctip_txid = uint256S(
+            ElementsDrivechainIdentity::PARENT_CHECKPOINT_CTIP_TXID);
+        consensus.drivechain_parent_state_ctip_vout =
+            ElementsDrivechainIdentity::PARENT_CHECKPOINT_CTIP_VOUT;
+        consensus.drivechain_parent_state_ctip_value =
+            ElementsDrivechainIdentity::PARENT_CHECKPOINT_CTIP_VALUE;
+        consensus.drivechain_unused_slot_proposal_max_age =
+            ElementsDrivechainIdentity::UNUSED_PROPOSAL_MAX_AGE;
+        consensus.drivechain_unused_slot_activation_threshold =
+            ElementsDrivechainIdentity::UNUSED_ACTIVATION_THRESHOLD;
+        consensus.drivechain_used_slot_proposal_max_age =
+            ElementsDrivechainIdentity::USED_PROPOSAL_MAX_AGE;
+        consensus.drivechain_used_slot_activation_threshold =
+            ElementsDrivechainIdentity::USED_ACTIVATION_THRESHOLD;
+        consensus.drivechain_parent_state_replay_version =
+            ElementsDrivechainIdentity::PARENT_REPLAY_VERSION;
+        consensus.drivechain_annex_feature_version =
+            ElementsDrivechainIdentity::ANNEX_FEATURE_VERSION;
+        consensus.enable_usdd_sp1_annex = true;
+        consensus.total_valid_epochs = 1;
+        consensus.dynamic_epoch_length = std::numeric_limits<uint32_t>::max();
+        consensus.start_p2wsh_script = false;
+
+        parentGenesisBlockHash = uint256S(
+            ElementsDrivechainIdentity::PARENT_GENESIS);
+        consensus.parentChainPowLimit = uint256S(ElementsDrivechainIdentity::PARENT_POW_LIMIT);
+        consensus.parent_chain_signblockscript = CScript();
+        consensus.parent_signet_challenge = ParseHex(
+            ElementsDrivechainIdentity::PARENT_SIGNET_CHALLENGE);
+        consensus.pegin_min_depth = ElementsDrivechainIdentity::PEGIN_MIN_DEPTH;
+
+        // Non-circular protocol identity: the M1 human fields carry a manifest
+        // commitment built only from already-fixed parent/replay parameters.
+        // The 32- and 20-byte trailing identifiers are informational under
+        // BIP300, but freezing them makes the proposal reproducible byte-for-byte.
+        CHashWriter manifest_writer(SER_GETHASH, 0);
+        manifest_writer
+            << std::string{"ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V2"}
+            << std::string{ElementsDrivechainIdentity::P2P_MAGIC_DOMAIN}
+            << std::string{
+                   ElementsDrivechainIdentity::PARENT_COMMITMENT_TAG.begin(),
+                   ElementsDrivechainIdentity::PARENT_COMMITMENT_TAG.end()}
+            << ElementsDrivechainIdentity::PUBKEY_ADDRESS_PREFIX
+            << ElementsDrivechainIdentity::SCRIPT_ADDRESS_PREFIX
+            << ElementsDrivechainIdentity::BLINDED_ADDRESS_PREFIX
+            << ElementsDrivechainIdentity::SECRET_KEY_PREFIX
+            << std::vector<unsigned char>(
+                   ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.begin(),
+                   ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.end())
+            << std::vector<unsigned char>(
+                   ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.begin(),
+                   ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.end())
+            << std::string{ElementsDrivechainIdentity::BECH32_HRP}
+            << std::string{ElementsDrivechainIdentity::BLECH32_HRP}
+            << consensus.elements_mode
+            << consensus.has_parent_chain
+            << consensus.connect_genesis_outputs
+            << consensus.genesis_subsidy
+            << consensus.genesis_style
+            << consensus.signblockscript
+            << consensus.max_block_signature_size
+            << consensus.enable_usdd_sp1_annex
+            << consensus.drivechain_m6_withdrawal_validation
+            << consensus.drivechain_annex_feature_version
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nTimeout
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height
+            << parentGenesisBlockHash
+            << consensus.parentChainPowLimit
+            << consensus.parent_signet_challenge
+            << *consensus.drivechain_slot
+            << consensus.drivechain_parent_state_active_proposal_description
+            << *consensus.drivechain_parent_state_active_proposal_hash
+            << consensus.drivechain_parent_state_proposal_height
+            << consensus.drivechain_parent_state_proposal_block_hash
+            << consensus.drivechain_parent_state_activation_height
+            << consensus.drivechain_parent_state_activation_block_hash
+            << consensus.drivechain_parent_state_height
+            << consensus.drivechain_parent_state_hash
+            << consensus.drivechain_parent_state_chainwork
+            << consensus.drivechain_parent_state_ctip_txid
+            << consensus.drivechain_parent_state_ctip_vout
+            << consensus.drivechain_parent_state_ctip_value
+            << consensus.pegin_min_depth
+            << consensus.drivechain_unused_slot_proposal_max_age
+            << consensus.drivechain_unused_slot_activation_threshold
+            << consensus.drivechain_used_slot_proposal_max_age
+            << consensus.drivechain_used_slot_activation_threshold
+            << consensus.drivechain_parent_state_replay_version;
+        consensus.drivechain_protocol_manifest_hash = manifest_writer.GetHash();
+
+        const std::string proposal_title{"Elements"};
+        const std::string proposal_text{
+            "Elements Drivechain v1; native USDD; replay v2; Simplicity active; slot 24"};
+        consensus.drivechain_proposal_description = {0, static_cast<uint8_t>(proposal_title.size())};
+        consensus.drivechain_proposal_description.insert(
+            consensus.drivechain_proposal_description.end(),
+            proposal_title.begin(), proposal_title.end());
+        consensus.drivechain_proposal_description.insert(
+            consensus.drivechain_proposal_description.end(),
+            proposal_text.begin(), proposal_text.end());
+        consensus.drivechain_proposal_description.insert(
+            consensus.drivechain_proposal_description.end(),
+            consensus.drivechain_protocol_manifest_hash.begin(),
+            consensus.drivechain_protocol_manifest_hash.end());
+        const std::string source_domain{"ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V2"};
+        std::vector<unsigned char> source_preimage(
+            source_domain.begin(), source_domain.end());
+        source_preimage.insert(source_preimage.end(),
+                               consensus.drivechain_protocol_manifest_hash.begin(),
+                               consensus.drivechain_protocol_manifest_hash.end());
+        const uint160 source_id = Hash160(source_preimage);
+        consensus.drivechain_proposal_description.insert(
+            consensus.drivechain_proposal_description.end(), source_id.begin(), source_id.end());
+        consensus.drivechain_proposal_hash = Hash(consensus.drivechain_proposal_description);
+        assert(consensus.drivechain_protocol_manifest_hash == uint256S(
+            ElementsDrivechainIdentity::PROTOCOL_MANIFEST_HASH));
+        assert(HexStr(consensus.drivechain_proposal_description) ==
+            ElementsDrivechainIdentity::PROPOSAL_DESCRIPTION_HEX);
+        assert(*consensus.drivechain_proposal_hash == uint256S(
+            ElementsDrivechainIdentity::PROPOSAL_HASH));
+
+        // The legacy federated peg is intentionally unspendable. Native
+        // BIP300 deposits are validated through the drivechain path.
+        consensus.fedpegScript = CScript() << OP_RETURN;
+        consensus.first_extension_space.clear();
+        consensus.parent_pegged_asset = CAsset();
+
+        anyonecanspend_aremine = false;
+        enforce_pak = false;
+        accept_unlimited_issuances = false;
+        multi_data_permitted = true;
+        accept_discount_ct = false;
+        create_discount_ct = false;
+        pegin_subsidy = PeginSubsidy();
+        pegin_minimum = PeginMinimum();
+        initialFreeCoins = 0;
+        initial_reissuance_tokens = 0;
+
+        // Bind the parent-chain identity, slot and Simplicity activation into
+        // both the pegged-asset entropy and child genesis transaction.
+        const std::vector<unsigned char> base_commitment = CommitToArguments(consensus, strNetworkID);
+        CHashWriter identity_writer(SER_GETHASH, 0);
+        identity_writer
+            << std::string{"ELEMENTS_DRIVECHAIN_NETWORK_V2"}
+            << std::string{ElementsDrivechainIdentity::P2P_MAGIC_DOMAIN}
+            << std::string{
+                   ElementsDrivechainIdentity::PARENT_COMMITMENT_TAG.begin(),
+                   ElementsDrivechainIdentity::PARENT_COMMITMENT_TAG.end()}
+            << ElementsDrivechainIdentity::PUBKEY_ADDRESS_PREFIX
+            << ElementsDrivechainIdentity::SCRIPT_ADDRESS_PREFIX
+            << ElementsDrivechainIdentity::BLINDED_ADDRESS_PREFIX
+            << ElementsDrivechainIdentity::SECRET_KEY_PREFIX
+            << std::vector<unsigned char>(
+                   ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.begin(),
+                   ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.end())
+            << std::vector<unsigned char>(
+                   ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.begin(),
+                   ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.end())
+            << std::string{ElementsDrivechainIdentity::BECH32_HRP}
+            << std::string{ElementsDrivechainIdentity::BLECH32_HRP}
+            << consensus.elements_mode
+            << consensus.has_parent_chain
+            << consensus.connect_genesis_outputs
+            << consensus.genesis_subsidy
+            << consensus.genesis_style
+            << consensus.signblockscript
+            << consensus.max_block_signature_size
+            << consensus.enable_usdd_sp1_annex
+            << consensus.drivechain_m6_withdrawal_validation
+            << consensus.drivechain_annex_feature_version
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout
+            << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nTimeout
+            << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height
+            << base_commitment
+            << parentGenesisBlockHash
+            << consensus.parentChainPowLimit
+            << consensus.parent_signet_challenge
+            << *consensus.drivechain_slot
+            << consensus.pegin_min_depth
+            << consensus.drivechain_protocol_manifest_hash
+            << consensus.drivechain_proposal_description
+            << *consensus.drivechain_proposal_hash
+            << consensus.drivechain_parent_state_active_proposal_description
+            << *consensus.drivechain_parent_state_active_proposal_hash
+            << consensus.drivechain_parent_state_proposal_height
+            << consensus.drivechain_parent_state_proposal_block_hash
+            << consensus.drivechain_parent_state_activation_height
+            << consensus.drivechain_parent_state_activation_block_hash
+            << consensus.drivechain_parent_state_height
+            << consensus.drivechain_parent_state_hash
+            << consensus.drivechain_parent_state_chainwork
+            << consensus.drivechain_parent_state_ctip_txid
+            << consensus.drivechain_parent_state_ctip_vout
+            << consensus.drivechain_parent_state_ctip_value
+            << consensus.drivechain_unused_slot_proposal_max_age
+            << consensus.drivechain_unused_slot_activation_threshold
+            << consensus.drivechain_used_slot_proposal_max_age
+            << consensus.drivechain_used_slot_activation_threshold
+            << consensus.drivechain_parent_state_replay_version;
+        const uint256 identity_commitment = identity_writer.GetHash();
+        const std::vector<unsigned char> commitment(identity_commitment.begin(), identity_commitment.end());
+        uint256 entropy;
+        GenerateAssetEntropy(entropy, COutPoint(uint256(commitment), 0), parentGenesisBlockHash);
+        CalculateAsset(consensus.pegged_asset, entropy);
+        consensus.subsidy_asset = consensus.pegged_asset;
+
+        // First four bytes of raw SHA256d(ELEMENTS_P2P_MESSAGE_MAGIC_DOMAIN).
+        // Pre-launch identities cannot handshake this sole Elements network.
+        std::copy(ElementsDrivechainIdentity::P2P_MESSAGE_START.begin(),
+                  ElementsDrivechainIdentity::P2P_MESSAGE_START.end(),
+                  pchMessageStart);
+        assert(ElementsP2PMagicMatchesDomain());
+        nDefaultPort = ElementsDrivechainIdentity::P2P_PORT;
+        nPruneAfterHeight = 1000;
+
+        // Signed-block genesis. Its hash commits to the frozen OP_TRUE block
+        // challenge; native PoW is not the security mechanism.
+        genesis = CreateGenesisBlock(
+            consensus,
+            CScript() << commitment,
+            CScript(OP_RETURN),
+            ElementsDrivechainIdentity::GENESIS_TIME,
+            ElementsDrivechainIdentity::GENESIS_NONCE,
+            ElementsDrivechainIdentity::GENESIS_BITS,
+            ElementsDrivechainIdentity::GENESIS_VERSION,
+            0);
+        consensus.hashGenesisBlock = genesis.GetHash();
+        assert(identity_commitment == uint256S(
+            ElementsDrivechainIdentity::IDENTITY_COMMITMENT));
+        assert(consensus.hashGenesisBlock == uint256S(
+            ElementsDrivechainIdentity::GENESIS_HASH));
+        assert(genesis.hashMerkleRoot == uint256S(
+            ElementsDrivechainIdentity::GENESIS_MERKLE_ROOT));
+        assert(consensus.pegged_asset == CAsset(uint256S(
+            ElementsDrivechainIdentity::PEGGED_ASSET)));
+
+        vSeeds.clear();
+        vFixedSeeds.clear();
+
+        // The distinct Elements child-chain namespace prevents accidental use of parent
+        // Signet addresses. Parent address encodings remain standard Signet.
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(
+            1, ElementsDrivechainIdentity::PUBKEY_ADDRESS_PREFIX);
+        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(
+            1, ElementsDrivechainIdentity::SCRIPT_ADDRESS_PREFIX);
+        base58Prefixes[SECRET_KEY] = std::vector<unsigned char>(
+            1, ElementsDrivechainIdentity::SECRET_KEY_PREFIX);
+        base58Prefixes[EXT_PUBLIC_KEY] = std::vector<unsigned char>(
+            ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.begin(),
+            ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.end());
+        base58Prefixes[EXT_SECRET_KEY] = std::vector<unsigned char>(
+            ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.begin(),
+            ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.end());
+        base58Prefixes[BLINDED_ADDRESS] = std::vector<unsigned char>(
+            1, ElementsDrivechainIdentity::BLINDED_ADDRESS_PREFIX);
+        base58Prefixes[PARENT_PUBKEY_ADDRESS] = std::vector<unsigned char>(
+            1, ElementsDrivechainIdentity::PARENT_PUBKEY_ADDRESS_PREFIX);
+        base58Prefixes[PARENT_SCRIPT_ADDRESS] = std::vector<unsigned char>(
+            1, ElementsDrivechainIdentity::PARENT_SCRIPT_ADDRESS_PREFIX);
+        bech32_hrp = ElementsDrivechainIdentity::BECH32_HRP;
+        blech32_hrp = ElementsDrivechainIdentity::BLECH32_HRP;
+        parent_bech32_hrp = ElementsDrivechainIdentity::PARENT_BECH32_HRP;
+        parent_blech32_hrp = ElementsDrivechainIdentity::PARENT_BLECH32_HRP;
+
+        fDefaultConsistencyChecks = false;
+        fRequireStandard = true;
+        m_is_test_chain = true;
+        m_is_mockable_chain = false;
+        m_assumed_blockchain_size = 0;
+        m_assumed_chain_state_size = 0;
+        checkpointData = {
+            {
+                {0, uint256S(ElementsDrivechainIdentity::GENESIS_HASH)},
+            }
+        };
+        m_assumeutxo_data = MapAssumeutxo{};
+        chainTxData = ChainTxData{0, 0, 0};
+
+        assert(consensus.hashGenesisBlock != parentGenesisBlockHash);
+        assert(consensus.elements_mode);
+        assert(consensus.drivechain_slot == uint8_t{24});
     }
 };
 
@@ -665,7 +1078,7 @@ public:
         // produces Elements transaction serialization. Keep local regtest on
         // Elements semantics by default so real LWK transactions can be
         // decoded, validated, mined, and indexed during device E2E runs.
-        g_con_elementsmode = gArgs.GetBoolArg("-con_elementsmode", true);
+        g_con_elementsmode = args.GetBoolArg("-con_elementsmode", true);
         consensus.elements_mode = g_con_elementsmode;
         g_con_blockheightinheader = false;
         consensus.total_valid_epochs = 0;
@@ -1694,6 +2107,134 @@ const CChainParams &Params() {
     return *globalChainParams;
 }
 
+bool IsCanonicalElementsProductionIdentity(const CChainParams& params,
+                                           const CBaseChainParams& base_params,
+                                           std::string* error)
+{
+    const auto fail = [error](const char* field) {
+        if (error) {
+            *error = strprintf(
+                "Elements production identity mismatch: %s", field);
+        }
+        return false;
+    };
+    const Consensus::Params& consensus = params.GetConsensus();
+
+    if (params.NetworkIDString() != ElementsDrivechainIdentity::NETWORK_ID) return fail("network id");
+    if (base_params.DataDir() != ElementsDrivechainIdentity::DATA_DIR) return fail("data directory");
+    if (base_params.RPCPort() != ElementsDrivechainIdentity::RPC_PORT) return fail("RPC port");
+    if (base_params.MainchainRPCPort() != ElementsDrivechainIdentity::MAINCHAIN_RPC_PORT) return fail("parent RPC port");
+    if (base_params.OnionServiceTargetPort() != ElementsDrivechainIdentity::ONION_TARGET_PORT) return fail("onion target port");
+    if (params.GetDefaultPort() != ElementsDrivechainIdentity::P2P_PORT) return fail("P2P port");
+    if (!ElementsP2PMagicMatchesDomain()) return fail("P2P message-magic derivation");
+    if (!std::equal(ElementsDrivechainIdentity::P2P_MESSAGE_START.begin(),
+                    ElementsDrivechainIdentity::P2P_MESSAGE_START.end(),
+                    params.MessageStart())) return fail("P2P message magic");
+
+    const auto prefix_is = [&params](const CChainParams::Base58Type type,
+                                     const std::vector<unsigned char>& expected) {
+        return params.Base58Prefix(type) == expected;
+    };
+    const std::vector<unsigned char> expected_ext_public(
+        ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.begin(),
+        ElementsDrivechainIdentity::EXT_PUBLIC_KEY_PREFIX.end());
+    const std::vector<unsigned char> expected_ext_secret(
+        ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.begin(),
+        ElementsDrivechainIdentity::EXT_SECRET_KEY_PREFIX.end());
+    if (!prefix_is(CChainParams::PUBKEY_ADDRESS, {ElementsDrivechainIdentity::PUBKEY_ADDRESS_PREFIX})) return fail("P2PKH prefix");
+    if (!prefix_is(CChainParams::SCRIPT_ADDRESS, {ElementsDrivechainIdentity::SCRIPT_ADDRESS_PREFIX})) return fail("P2SH prefix");
+    if (!prefix_is(CChainParams::SECRET_KEY, {ElementsDrivechainIdentity::SECRET_KEY_PREFIX})) return fail("WIF prefix");
+    if (!prefix_is(CChainParams::EXT_PUBLIC_KEY, expected_ext_public)) return fail("extended public key prefix");
+    if (!prefix_is(CChainParams::EXT_SECRET_KEY, expected_ext_secret)) return fail("extended secret key prefix");
+    if (!prefix_is(CChainParams::BLINDED_ADDRESS, {ElementsDrivechainIdentity::BLINDED_ADDRESS_PREFIX})) return fail("blinded address prefix");
+    if (!prefix_is(CChainParams::PARENT_PUBKEY_ADDRESS, {ElementsDrivechainIdentity::PARENT_PUBKEY_ADDRESS_PREFIX})) return fail("parent P2PKH prefix");
+    if (!prefix_is(CChainParams::PARENT_SCRIPT_ADDRESS, {ElementsDrivechainIdentity::PARENT_SCRIPT_ADDRESS_PREFIX})) return fail("parent P2SH prefix");
+    if (params.Bech32HRP() != ElementsDrivechainIdentity::BECH32_HRP ||
+        params.Blech32HRP() != ElementsDrivechainIdentity::BLECH32_HRP ||
+        params.ParentBech32HRP() != ElementsDrivechainIdentity::PARENT_BECH32_HRP ||
+        params.ParentBlech32HRP() != ElementsDrivechainIdentity::PARENT_BLECH32_HRP) return fail("bech32/blech32 namespaces");
+
+    if (!consensus.elements_mode || !consensus.has_parent_chain ||
+        !consensus.drivechain_slot ||
+        *consensus.drivechain_slot != ElementsDrivechainIdentity::SIDECHAIN_SLOT) return fail("Elements/parent/slot mode");
+    if (!g_con_elementsmode || !g_con_blockheightinheader || !g_signed_blocks) {
+        return fail("runtime Elements/header/signed-block codecs");
+    }
+    if (params.ParentGenesisBlockHash() != uint256S(ElementsDrivechainIdentity::PARENT_GENESIS) ||
+        consensus.parentChainPowLimit != uint256S(ElementsDrivechainIdentity::PARENT_POW_LIMIT) ||
+        consensus.parent_signet_challenge != ParseHex(ElementsDrivechainIdentity::PARENT_SIGNET_CHALLENGE) ||
+        consensus.pegin_min_depth != ElementsDrivechainIdentity::PEGIN_MIN_DEPTH ||
+        !consensus.parent_chain_signblockscript.empty()) return fail("parent-chain identity");
+
+    if (consensus.genesis_style != ElementsDrivechainIdentity::GENESIS_STYLE ||
+        consensus.signblockscript != CScript() << static_cast<opcodetype>(ElementsDrivechainIdentity::SIGNBLOCK_CHALLENGE_OPCODE) ||
+        consensus.max_block_signature_size != ElementsDrivechainIdentity::MAX_BLOCK_SIGNATURE_SIZE ||
+        !consensus.connect_genesis_outputs || consensus.genesis_subsidy != 0 ||
+        consensus.fedpegScript != CScript() << OP_RETURN ||
+        !consensus.parent_pegged_asset.IsNull()) return fail("signed-block/genesis mode");
+
+    const CBlock& genesis = params.GenesisBlock();
+    if (consensus.hashGenesisBlock != uint256S(ElementsDrivechainIdentity::GENESIS_HASH) ||
+        genesis.GetHash() != uint256S(ElementsDrivechainIdentity::GENESIS_HASH) ||
+        genesis.hashMerkleRoot != uint256S(ElementsDrivechainIdentity::GENESIS_MERKLE_ROOT) ||
+        genesis.nTime != ElementsDrivechainIdentity::GENESIS_TIME ||
+        genesis.nNonce != ElementsDrivechainIdentity::GENESIS_NONCE ||
+        genesis.nBits != ElementsDrivechainIdentity::GENESIS_BITS ||
+        genesis.nVersion != ElementsDrivechainIdentity::GENESIS_VERSION ||
+        consensus.pegged_asset != CAsset(uint256S(ElementsDrivechainIdentity::PEGGED_ASSET)) ||
+        consensus.subsidy_asset != consensus.pegged_asset) return fail("child genesis/asset identity");
+    const MapCheckpoints& checkpoints = params.Checkpoints().mapCheckpoints;
+    if (!params.DNSSeeds().empty() || !params.FixedSeeds().empty() ||
+        checkpoints.size() != 1 || checkpoints.begin()->first != 0 ||
+        checkpoints.begin()->second != uint256S(ElementsDrivechainIdentity::GENESIS_HASH)) {
+        return fail("peer seeds/genesis checkpoint");
+    }
+
+    if (!consensus.drivechain_proposal_hash ||
+        consensus.drivechain_protocol_manifest_hash != uint256S(ElementsDrivechainIdentity::PROTOCOL_MANIFEST_HASH) ||
+        consensus.drivechain_proposal_description != ParseHex(ElementsDrivechainIdentity::PROPOSAL_DESCRIPTION_HEX) ||
+        *consensus.drivechain_proposal_hash != uint256S(ElementsDrivechainIdentity::PROPOSAL_HASH)) return fail("Elements M1 proposal identity");
+    if (!consensus.drivechain_parent_state_active_proposal_hash ||
+        consensus.drivechain_parent_state_active_proposal_description != ParseHex(ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_DESCRIPTION_HEX) ||
+        *consensus.drivechain_parent_state_active_proposal_hash != uint256S(ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_HASH) ||
+        consensus.drivechain_parent_state_proposal_height != ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_HEIGHT ||
+        consensus.drivechain_parent_state_proposal_block_hash != uint256S(ElementsDrivechainIdentity::HISTORICAL_PROPOSAL_BLOCK_HASH) ||
+        consensus.drivechain_parent_state_activation_height != ElementsDrivechainIdentity::HISTORICAL_ACTIVATION_HEIGHT ||
+        consensus.drivechain_parent_state_activation_block_hash != uint256S(ElementsDrivechainIdentity::HISTORICAL_ACTIVATION_BLOCK_HASH)) return fail("historical parent proposal milestones");
+    if (consensus.drivechain_parent_state_height != ElementsDrivechainIdentity::PARENT_CHECKPOINT_HEIGHT ||
+        consensus.drivechain_parent_state_hash != uint256S(ElementsDrivechainIdentity::PARENT_CHECKPOINT_HASH) ||
+        consensus.drivechain_parent_state_chainwork != uint256S(ElementsDrivechainIdentity::PARENT_CHECKPOINT_CHAINWORK) ||
+        consensus.drivechain_parent_state_ctip_txid != uint256S(ElementsDrivechainIdentity::PARENT_CHECKPOINT_CTIP_TXID) ||
+        consensus.drivechain_parent_state_ctip_vout != ElementsDrivechainIdentity::PARENT_CHECKPOINT_CTIP_VOUT ||
+        consensus.drivechain_parent_state_ctip_value != ElementsDrivechainIdentity::PARENT_CHECKPOINT_CTIP_VALUE) return fail("parent replay checkpoint assertions");
+    if (consensus.drivechain_unused_slot_proposal_max_age != ElementsDrivechainIdentity::UNUSED_PROPOSAL_MAX_AGE ||
+        consensus.drivechain_unused_slot_activation_threshold != ElementsDrivechainIdentity::UNUSED_ACTIVATION_THRESHOLD ||
+        consensus.drivechain_used_slot_proposal_max_age != ElementsDrivechainIdentity::USED_PROPOSAL_MAX_AGE ||
+        consensus.drivechain_used_slot_activation_threshold != ElementsDrivechainIdentity::USED_ACTIVATION_THRESHOLD ||
+        consensus.drivechain_parent_state_replay_version != ElementsDrivechainIdentity::PARENT_REPLAY_VERSION ||
+        consensus.drivechain_annex_feature_version != ElementsDrivechainIdentity::ANNEX_FEATURE_VERSION ||
+        !consensus.enable_usdd_sp1_annex || consensus.drivechain_m6_withdrawal_validation) return fail("replay/annex identity");
+
+    const auto deployment_is_frozen = [&consensus](const Consensus::DeploymentPos pos,
+                                                   const int bit) {
+        const Consensus::BIP9Deployment& deployment = consensus.vDeployments[pos];
+        return deployment.bit == bit &&
+               deployment.nStartTime == ElementsDrivechainIdentity::DEPLOYMENT_ALWAYS_ACTIVE &&
+               deployment.nTimeout == ElementsDrivechainIdentity::DEPLOYMENT_NO_TIMEOUT &&
+               deployment.min_activation_height == ElementsDrivechainIdentity::DEPLOYMENT_MIN_ACTIVATION_HEIGHT &&
+               !deployment.nPeriod && !deployment.nThreshold;
+    };
+    if (!deployment_is_frozen(Consensus::DEPLOYMENT_TAPROOT,
+                              ElementsDrivechainIdentity::TAPROOT_DEPLOYMENT_BIT) ||
+        !deployment_is_frozen(Consensus::DEPLOYMENT_SIMPLICITY,
+                              ElementsDrivechainIdentity::SIMPLICITY_DEPLOYMENT_BIT)) return fail("Taproot/Simplicity activation");
+
+    if (params.anyonecanspend_aremine || params.GetEnforcePak() ||
+        params.GetAcceptUnlimitedIssuances() || !params.GetMultiDataPermitted() ||
+        params.GetAcceptDiscountCT() || params.GetCreateDiscountCT()) return fail("issuance/policy identity");
+    return true;
+}
+
 std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const std::string& chain)
 {
     // Reserved names for non-custom chains
@@ -1711,6 +2252,11 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
         return std::unique_ptr<CChainParams>(new CLiquidV1TestParams(args));
     } else if (chain == CBaseChainParams::LIQUIDTESTNET) {
         return std::unique_ptr<CChainParams>(new CLiquidTestNetParams(chain, args));
+    } else if (chain == CBaseChainParams::ELEMENTS) {
+        return std::unique_ptr<CChainParams>(new CElementsDrivechainParams());
+    } else if (chain == "usdd") {
+        throw std::runtime_error(
+            "The pre-launch 'usdd' chain identity is unsupported; use -chain=elements");
     }
 
     return std::unique_ptr<CChainParams>(new CCustomParams(chain, args));

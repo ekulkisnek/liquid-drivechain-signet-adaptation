@@ -1,5 +1,11 @@
 # Liquid/Elements as Native Drivechain Sidechain on Private Signet (BIP 300/301)
 
+> **QUARANTINED HISTORICAL DESIGN.** This document concerns the retired
+> slot-5/regtest prototype. It must not be used to configure or launch this
+> fork. The sole supported network is **Elements Drivechain** at BIP300 slot
+> **24**, selected with `elementsd -chain=elements`; see the
+> [canonical README](../../README.md). Everything below is audit history only.
+
 **Status (updated 2026-05-28)**: Real native BMM + side blocks + credit state recording + e2e harness exercised for ID5. **NEW**: Simplicity + BMM integration research complete (see docs/SIMPLICITY_BMM_INTEGRATION.md). Full code audit of exec.c / elementsJets.c / interpreter.cpp / chainparams / validation shows Simplicity (Tapscript 0xbe leaf) executes in *every* block via standard GetBlockScriptFlags + no BMM-specific paths exist in the node. Concrete test + minimal program (test_simplicity_in_bmm.py) + full gap analysis landed. BMM harness currently has zero Taproot/Simplicity coverage (the only gap; consensus is compatible). Real BMM txids achieved (e.g. 9c96f2b2...). Production participant + adapter in repo. Pure CUSF/BIP300/301, no federation.
 
 **Goal**: Production-ready adaptation/fork of Blockstream Elements/Liquid so it runs as a first-class native sidechain (e.g. ID 5) on Luke's existing private drivechain signet (the CUSF/BIP300/301 stack in drivechain-wallet-dev/local-dev), **without any federation or multisig pegin workaround**.
@@ -39,10 +45,10 @@ Mainchain (drivechaind + enforcer CUSF)
   |
   +-- Sidechain ID 5 (this work): Liquid/Elements (CT + assets + scripting)
         |
-        +-- elementsd (regtest or custom chain, stock or lightly patched for drivechain peg mode)
+        +-- elementsd (regtest or custom chain, patched with native drivechain peg validation)
         +-- liquid-drivechain-adapter (Rust, modeled on plain-bitassets miner/node split; or Python stub for v1)
               - Subscribes to enforcer events for ID 5
-              - On Deposit: constructs + submits pegin claim tx to elementsd (using bridge fedpeg key or direct credit path; **security from enforcer events + mainchain escrow, not from federation**)
+              - On Deposit: submits the exact event fields to elementsd; Elements consensus independently validates the BIP300 event and active mainchain block before minting
               - On BMM request: computes critical_hash from elements best block header, calls CreateBmm..., triggers L1 mine, confirms via events, submits to elementsd
               - On pegout intent (special Elements tx or RPC): builds bundle, calls BroadcastWithdrawalBundle
               - Exposes combined RPC surface (elements + drivechain peg status/proofs)
@@ -51,15 +57,15 @@ Mainchain (drivechaind + enforcer CUSF)
 **Why native / future BIP300/301 compatible**:
 - Uses **exactly** the same CUSF gRPC primitives and sidechain declaration/activation as ID 4 (plain-bitassets).
 - Peg is the drivechain two-way peg (escrow on main via hashrate, BMM commitments, withdrawal bundles with contest).
-- No standing multisig/federation for peg security. The "bridge" (adapter key or direct credit) only reacts to authenticated enforcer events (which are secured by mainchain consensus + enforcer validation).
+- No standing multisig/federation or adapter key for pegin authorization. The adapter only relays event data; Elements consensus queries the mainchain node and enforcer and rejects fabricated or altered deposits.
 - Elements provides the *sidechain consensus and features* (sovereign chain rules for CT/assets/scripts). Mainchain only handles peg + BMM commitments.
 - On real BIP300/301 soft-fork signet/mainnet: same protos, same adapter (or in-Element gRPC client), same flows. Only network params + challenge change.
 
-**Elements changes (minimal)**:
-- No core consensus changes required for v1.
-- Config: new chain param or -drivechainenforcer=... (future), or run as regtest + adapter handles peg translation.
-- Optional small patch: add `importdrivechaindeposit` RPC (or use existing pegin with known single-key fedpegscript controlled only by adapter for the sidechain instance).
-- The source tree here is the fork point; any patches live in this repo under `patches/` or `contrib/drivechain/`.
+**Elements changes (native peg)**:
+- `drivechain-deposit-v2` witnesses commit to the mainchain outpoint, containing block hash, amount, and destination address.
+- Consensus requires that block to be active through mainchain RPC and requires an exact matching deposit event from CUSF `GetTwoWayPegData` for the configured sidechain slot.
+- Consensus binds the credit transaction to one pegin input, one explicit recipient output, the committed script, and an exact recipient-plus-fee total.
+- `importdrivechaindeposit` constructs the claim but cannot bypass those checks; raw transactions are subject to the same validation.
 
 **Adapter (production path)**:
 - Rust binary (place in this repo under `drivechain-liquid-sidechain/adapter/` or contribute patterns back to LayerTwo-Labs).
@@ -102,7 +108,8 @@ Activation: `./scripts/activate-liquid-id5.sh` (wrapper around the canonical `ac
    - Enforcer creates + broadcasts special deposit tx on mainchain (locks to escrow for SC 5).
    - L1 block includes it.
    - Adapter (via SubscribeEvents or GetBlockInfo/GetTwoWayPegData for ID5) sees Deposit event (sequence, outpoint, output address/value).
-   - Adapter submits pegin claim (or direct credit tx) to elementsd. Elements credits the target (as L-BTC or issued asset). No fed multisig required for the credit decision.
+   - Adapter submits the exact event fields to `importdrivechaindeposit`.
+   - Elements independently verifies the containing block on the active mainchain and the exact event through `GetTwoWayPegData`, then credits only the committed sidechain address and value. No fed multisig or adapter authorization is involved.
 
 3. **Sidechain Transfer / Advanced Features**:
    - Normal Elements txs (CT, assets, AMM if extended, scripts). `elements-cli` or RPC or Electrum (via Floresta if wired later).
@@ -153,7 +160,7 @@ Docker: Extend `docker-compose.local-minimal.yml` with `liquid` and `liquid-adap
 - **Monitoring**: Healthchecks, SubscribeEvents for peg/BMM, proof export for lite clients.
 - **Future**: 
   - In-Element gRPC client (add tonic or grpc++ behind feature).
-  - Native drivechain_peg validation mode in Elements (bypass fedpeg for CUSF-reported deposits).
+  - Replace the command-line `grpcurl` transport with a native C++ gRPC client without changing the validation rule.
   - Floresta Electrum wiring for Liquid assets/CT (big win).
   - Real BIP300/301 signet: zero code change for adapter (just new challenge + public enforcer).
 - **Risks/Mitigations**: Adapter liveness (restartable, like bitassets), bridge key (single for v1; multi or removed with Elements patch later), private signet only (no public exposure).

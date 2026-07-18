@@ -5,6 +5,7 @@
 
 #include <rpc/request.h>
 
+#include <chainparamsbase.h>
 #include <fs.h>
 
 #include <random.h>
@@ -132,16 +133,21 @@ bool GetAuthCookie(std::string *cookie_out)
 //
 // ELEMENTS:
 
-/** Default name for mainchain auth cookie file */
-static const std::string MAINCHAIN_COOKIEAUTH_FILE = "regtest/.cookie";
+std::string GetDefaultMainchainAuthCookieFile(const std::string& chain)
+{
+    // The sole production Elements chain is anchored to Bitcoin Signet.
+    if (chain == CBaseChainParams::ELEMENTS) return "signet/.cookie";
+
+    // These paths exist only for inherited unit/functional-test contexts.
+    if (chain == CBaseChainParams::LIQUID1) return ".cookie";
+    return "regtest/.cookie";
+}
+
 /** Get name mainchain RPC authentication cookie file */
 static fs::path GetMainchainAuthCookieFile()
 {
-    std::string cookie_file = MAINCHAIN_COOKIEAUTH_FILE;
-    // Bitcoin mainnet exception
-    if (gArgs.GetChainName() == "liquidv1") {
-        cookie_file = ".cookie";
-    }
+    const std::string cookie_file =
+        GetDefaultMainchainAuthCookieFile(gArgs.GetChainName());
     fs::path cookie_path = fs::PathFromString(gArgs.GetArg("-mainchainrpccookiefile", cookie_file));
     if (cookie_path.is_absolute())
         return cookie_path;

@@ -172,6 +172,11 @@ enum : uint32_t {
     //
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH = (1U << 26),
 
+    // Apply the USDD-specific fail-closed SP1 proof-annex envelope. This must
+    // never alter Simplicity semantics on ordinary Elements networks.
+    //
+    SCRIPT_VERIFY_USDD_SP1_ANNEX = (1U << 27),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -224,6 +229,13 @@ struct PrecomputedTransactionData
 
     //! ELEMENTS: parent genesis hash
     const uint256 m_hash_genesis_block;
+    /**
+     * Median time past of the mainchain parent authenticated by this block's
+     * mined BIP301 commitment.  It is absent outside block validation (notably
+     * in today's mempool path) and must never be synthesized from wall clock
+     * time or an unauthenticated RPC response.
+     */
+    std::optional<uint64_t> m_bmm_parent_mtp;
     CHashWriter m_tapsighash_hasher;
 
     explicit PrecomputedTransactionData(const uint256& hash_genesis_block);

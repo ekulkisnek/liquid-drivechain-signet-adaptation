@@ -136,6 +136,12 @@ std::string ScriptErrorString(const ScriptError serror)
             return "EC scalar mult verify fail";
         case SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH:
             return "Simplicity witness has incorrect length";
+        case SCRIPT_ERR_USDD_SP1_ANNEX:
+            return "Malformed or unsupported USDD SP1 proof annex";
+        case SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING:
+            return "USDD proof evaluation requires authenticated BIP301 parent context";
+        case SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE:
+            return "USDD SP1 verifier is not implemented; proof rejected fail-closed";
         case SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_RANGE:
             return SIMPLICITY_ERR_MSG(SIMPLICITY_ERR_DATA_OUT_OF_RANGE);
         case SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_ORDER:

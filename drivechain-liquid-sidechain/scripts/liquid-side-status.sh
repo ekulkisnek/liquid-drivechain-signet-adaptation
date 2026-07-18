@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+printf '%s\n' 'ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.' >&2
+exit 64
+
 # liquid-side-status.sh — Quick status + evidence for Liquid/Elements ID 5 on drivechain signet.
 # Pure CUSF queries (no fed). Run anytime stack is up.
 set -euo pipefail

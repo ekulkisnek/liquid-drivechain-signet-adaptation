@@ -2,7 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparamsbase.h>
 #include <rpc/client.h>
+#include <rpc/request.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
 
@@ -49,6 +51,19 @@ UniValue RPCTestingSetup::CallRPC(std::string args)
 
 
 BOOST_FIXTURE_TEST_SUITE(rpc_tests, RPCTestingSetup)
+
+BOOST_AUTO_TEST_CASE(mainchain_cookie_network_defaults)
+{
+    BOOST_CHECK_EQUAL(
+        GetDefaultMainchainAuthCookieFile(CBaseChainParams::ELEMENTS),
+        "signet/.cookie");
+    BOOST_CHECK_EQUAL(
+        GetDefaultMainchainAuthCookieFile(CBaseChainParams::LIQUID1),
+        ".cookie");
+    BOOST_CHECK_EQUAL(
+        GetDefaultMainchainAuthCookieFile(CBaseChainParams::REGTEST),
+        "regtest/.cookie");
+}
 
 BOOST_AUTO_TEST_CASE(rpc_rawparams)
 {

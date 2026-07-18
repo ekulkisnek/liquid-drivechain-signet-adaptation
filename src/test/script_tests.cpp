@@ -14,6 +14,7 @@
 #include <script/sigcache.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
+#include <script/usdd_sp1_annex.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
@@ -117,6 +118,9 @@ static ScriptErrorDesc script_errors[]={
     {SCRIPT_ERR_ARITHMETIC64, "ARITHMETIC64"},
     {SCRIPT_ERR_ECMULTVERIFYFAIL, "ECMULTVERIFYFAIL"},
     {SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH, "SIMPLICITY_WRONG_LENGTH"},
+    {SCRIPT_ERR_USDD_SP1_ANNEX, "USDD_SP1_ANNEX"},
+    {SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING, "USDD_BMM_CONTEXT_MISSING"},
+    {SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE, "USDD_SP1_VERIFIER_UNAVAILABLE"},
     {SCRIPT_ERR_SIMPLICITY_NOT_YET_IMPLEMENTED, "SIMPLICITY_NOT_YET_IMPLEMENTED"},
     {SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_RANGE, "SIMPLICITY_DATA_OUT_OF_RANGE"},
     {SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_ORDER, "SIMPLICITY_DATA_OUT_OF_ORDER"},
@@ -162,6 +166,117 @@ static ScriptError_t ParseScriptError(const std::string& name)
 }
 
 BOOST_FIXTURE_TEST_SUITE(script_tests, BasicTestingSetup)
+
+namespace {
+
+void WriteUint32BE(std::vector<unsigned char>& bytes, std::size_t offset, uint32_t value)
+{
+    bytes[offset] = value >> 24;
+    bytes[offset + 1] = value >> 16;
+    bytes[offset + 2] = value >> 8;
+    bytes[offset + 3] = value;
+}
+
+std::vector<unsigned char> MakeUsddSp1Annex(uint32_t public_values_size = 3, uint32_t proof_size = 4)
+{
+    std::vector<unsigned char> annex(usdd::SP1_ANNEX_HEADER_SIZE + public_values_size + proof_size, 0);
+    annex[0] = usdd::SP1_ANNEX_TAG;
+    std::copy(usdd::SP1_ANNEX_MAGIC.begin(), usdd::SP1_ANNEX_MAGIC.end(), annex.begin() + 1);
+    annex[9] = 1;
+    annex[10] = 1;
+    annex[11] = static_cast<uint8_t>(usdd::Sp1StatementKind::ETH_STATE_V1);
+    annex[12] = 1;
+    WriteUint32BE(annex, 15, public_values_size);
+    WriteUint32BE(annex, 19, proof_size);
+    std::fill(annex.begin() + 23, annex.begin() + 55, 0x42);
+    std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
+              annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size, 0x17);
+    std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size, annex.end(), 0x99);
+    return annex;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
+{
+    usdd::Sp1ProofAnnexView view;
+    const auto valid = MakeUsddSp1Annex();
+    BOOST_CHECK(usdd::IsUsddSp1ProofAnnex(valid));
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(valid, view) == usdd::Sp1AnnexError::OK);
+    BOOST_CHECK(view.statement_kind == usdd::Sp1StatementKind::ETH_STATE_V1);
+    BOOST_CHECK_EQUAL(view.guest_vkey_hash.size(), 32U);
+    BOOST_CHECK_EQUAL(view.public_values.size(), 3U);
+    BOOST_CHECK_EQUAL(view.proof.size(), 4U);
+    BOOST_CHECK_EQUAL(view.public_values[0], 0x17);
+    BOOST_CHECK_EQUAL(view.proof[0], 0x99);
+
+    const std::vector<unsigned char> unrelated{0x50, 'O', 'T', 'H', 'R'};
+    BOOST_CHECK(!usdd::IsUsddSp1ProofAnnex(unrelated));
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(unrelated, view) == usdd::Sp1AnnexError::NOT_USDD);
+
+    for (std::size_t size = 5; size < usdd::SP1_ANNEX_HEADER_SIZE; ++size) {
+        const std::vector<unsigned char> truncated(valid.begin(), valid.begin() + size);
+        BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(truncated, view) == usdd::Sp1AnnexError::TRUNCATED);
+    }
+
+    auto changed = valid;
+    changed[5] ^= 1;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_MAGIC);
+    changed = valid;
+    changed[9] = 2;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_VERSION);
+    changed = valid;
+    changed[10] = 2;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_PROOF_SYSTEM);
+    changed = valid;
+    changed[11] = 0;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_STATEMENT_KIND);
+    changed = valid;
+    changed[11] = 2;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_STATEMENT_KIND);
+    changed = valid;
+    changed[12] = 2;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_DIGEST_MODE);
+    changed = valid;
+    changed[14] = 1;
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::BAD_FLAGS);
+    changed = valid;
+    WriteUint32BE(changed, 15, 0);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::EMPTY_PUBLIC_VALUES);
+    changed = valid;
+    WriteUint32BE(changed, 15, usdd::SP1_PUBLIC_VALUES_MAX_SIZE + 1);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::PUBLIC_VALUES_TOO_LARGE);
+    changed = valid;
+    WriteUint32BE(changed, 19, 0);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::EMPTY_PROOF);
+    changed = valid;
+    std::fill(changed.begin() + 23, changed.begin() + 55, 0);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::ZERO_GUEST_VKEY);
+    changed = valid;
+    WriteUint32BE(changed, 19, 5);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::LENGTH_MISMATCH);
+    changed = valid;
+    changed.push_back(0);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::LENGTH_MISMATCH);
+
+    const uint32_t max_proof_size = usdd::SP1_ANNEX_MAX_SIZE - usdd::SP1_ANNEX_HEADER_SIZE - 1;
+    const auto max_size = MakeUsddSp1Annex(1, max_proof_size);
+    BOOST_CHECK_EQUAL(max_size.size(), usdd::SP1_ANNEX_MAX_SIZE);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(max_size, view) == usdd::Sp1AnnexError::OK);
+    changed = max_size;
+    changed.push_back(0);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::TOO_LARGE);
+
+    // Consensus cannot accept even a canonical envelope: the pinned raw SP1
+    // verifier does not exist yet.  This assertion should change only alongside
+    // upstream Simplicity jet, CMR, dispatch, and deterministic-cost changes.
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(unrelated, false) == usdd::Sp1ConsensusGateResult::NOT_USDD);
+    changed = valid;
+    changed[9] = 2;
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(changed, true) == usdd::Sp1ConsensusGateResult::MALFORMED);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(valid, false) == usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(valid, true) == usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE);
+}
 
 void DoTest(const CScript& scriptPubKey, const CScript& scriptSig, const CScriptWitness& scriptWitness, uint32_t flags, const std::string& message, int scriptError, CAmount nValue = 0)
 {

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <hash.h>
+#include <primitives/block.h>
 #include <serialize.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
@@ -84,6 +85,38 @@ BOOST_AUTO_TEST_CASE(sizes)
     BOOST_CHECK_EQUAL(GetSerializeSize(int64_t(0), 0), 8U);
     BOOST_CHECK_EQUAL(GetSerializeSize(uint64_t(0), 0), 8U);
     BOOST_CHECK_EQUAL(GetSerializeSize(bool(0), 0), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(block_header_version_bit_30_has_standard_framing)
+{
+    // Version bit 30 is an ordinary version bit. It must not change block-header
+    // framing on Bitcoin-compatible networks.
+    BOOST_REQUIRE(!g_signed_blocks);
+    BOOST_REQUIRE(!g_con_blockheightinheader);
+
+    CBlockHeader header;
+    header.nVersion = 1U << 30;
+    header.hashPrevBlock = uint256S("01");
+    header.hashMerkleRoot = uint256S("02");
+    header.nTime = 3;
+    header.nBits = 4;
+    header.nNonce = 5;
+
+    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    stream << header;
+
+    BOOST_CHECK_EQUAL(stream.size(), 80U);
+    BOOST_CHECK_EQUAL(HexStr(MakeByteSpan(stream).first(4)), "00000040");
+
+    CBlockHeader decoded;
+    stream >> decoded;
+    BOOST_CHECK_EQUAL(decoded.nVersion, header.nVersion);
+    BOOST_CHECK(decoded.hashPrevBlock == header.hashPrevBlock);
+    BOOST_CHECK(decoded.hashMerkleRoot == header.hashMerkleRoot);
+    BOOST_CHECK_EQUAL(decoded.nTime, header.nTime);
+    BOOST_CHECK_EQUAL(decoded.nBits, header.nBits);
+    BOOST_CHECK_EQUAL(decoded.nNonce, header.nNonce);
+    BOOST_CHECK(stream.empty());
 }
 
 BOOST_AUTO_TEST_CASE(varints)

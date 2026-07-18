@@ -156,6 +156,8 @@ struct Params {
     uint256 parentChainPowLimit;
     uint32_t pegin_min_depth;
     CScript parent_chain_signblockscript;
+    /** BIP325 challenge when the parent is Signet, empty for non-Signet parents. */
+    std::vector<uint8_t> parent_signet_challenge;
     bool ParentChainHasPow() const { return parent_chain_signblockscript == CScript();}
     CScript fedpegScript;
     CAsset pegged_asset;
@@ -175,6 +177,52 @@ struct Params {
     size_t total_valid_epochs = 1;
     bool elements_mode = false;
     bool start_p2wsh_script = false;
+    /** BIP300/301 slot for a native drivechain, absent on ordinary networks. */
+    std::optional<uint8_t> drivechain_slot;
+    /**
+     * Immutable parent-chain launch identity for a native drivechain.  These
+     * fields are empty on ordinary Elements networks.  The proposal hash is a
+     * uint256 whose serialized (internal-order) bytes are the exact BIP300 M2
+     * payload. Validation derives the active proposal and canonical CTIP by
+     * replaying authenticated parent blocks from genesis. The launch
+     * milestones below are assertions over that derived state, never trusted
+     * assignments, and validation halts if the required slot is later replaced.
+     */
+    std::vector<uint8_t> drivechain_proposal_description;
+    std::optional<uint256> drivechain_proposal_hash;
+    uint256 drivechain_protocol_manifest_hash;
+    /** Historical parent milestones asserted during genesis-to-tip replay. */
+    std::vector<uint8_t> drivechain_parent_state_active_proposal_description;
+    std::optional<uint256> drivechain_parent_state_active_proposal_hash;
+    uint32_t drivechain_parent_state_proposal_height{0};
+    uint256 drivechain_parent_state_proposal_block_hash;
+    uint32_t drivechain_parent_state_activation_height{0};
+    uint256 drivechain_parent_state_activation_block_hash;
+    uint32_t drivechain_parent_state_height{0};
+    uint256 drivechain_parent_state_hash;
+    uint256 drivechain_parent_state_chainwork;
+    uint256 drivechain_parent_state_ctip_txid;
+    uint32_t drivechain_parent_state_ctip_vout{std::numeric_limits<uint32_t>::max()};
+    CAmount drivechain_parent_state_ctip_value{0};
+    uint16_t drivechain_unused_slot_proposal_max_age{0};
+    uint16_t drivechain_unused_slot_activation_threshold{0};
+    uint16_t drivechain_used_slot_proposal_max_age{0};
+    uint16_t drivechain_used_slot_activation_threshold{0};
+    uint32_t drivechain_parent_state_replay_version{0};
+    uint32_t drivechain_annex_feature_version{0};
+    /**
+     * True only after parent replay fully validates BIP300 M3/M4/M6 voting and
+     * CTIP decreases. Keep false for Elements Drivechain V1: creating a
+     * withdrawal bundle would otherwise produce a parent transition this node
+     * must terminally reject.
+     */
+    bool drivechain_m6_withdrawal_validation{false};
+    bool DrivechainWithdrawalValidationEnabled() const
+    {
+        return drivechain_slot.has_value() && drivechain_m6_withdrawal_validation;
+    }
+    /** Apply the fail-closed USDD SP1 annex envelope rules to Simplicity spends. */
+    bool enable_usdd_sp1_annex = false;
 };
 
 } // namespace Consensus

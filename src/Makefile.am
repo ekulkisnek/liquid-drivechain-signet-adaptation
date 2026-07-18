@@ -77,6 +77,8 @@ noinst_LTLIBRARIES =
 
 bin_PROGRAMS =
 noinst_PROGRAMS =
+noinst_LIBRARIES =
+check_PROGRAMS =
 TESTS =
 BENCHMARKS =
 
@@ -107,7 +109,10 @@ if BUILD_BITCOIN_UTIL
 endif
 
 if BUILD_BITCOIN_CHAINSTATE
-  bin_PROGRAMS += bitcoin-chainstate
+  # This utility is hardcoded to Bitcoin mainnet consensus for upstream kernel
+  # tests. Keep it buildable for CI, but never install or ship it as an Elements
+  # production program.
+  noinst_PROGRAMS += bitcoin-chainstate
 endif
 
 .PHONY: FORCE check-symbols check-security
@@ -153,6 +158,8 @@ BITCOIN_CORE_H = \
   dbwrapper.h \
   deploymentinfo.h \
   deploymentstatus.h \
+  drivechain_parent_replay.h \
+  elements_drivechain_identity.h \
   dynafed.h \
   external_signer.h \
   flatfile.h \
@@ -197,7 +204,6 @@ BITCOIN_CORE_H = \
   node/coin.h \
   node/coinstats.h \
   node/context.h \
-  node/drivechain_withdrawal_bundle.h \
   node/miner.h \
   node/minisketchwrapper.h \
   node/psbt.h \
@@ -357,6 +363,7 @@ libbitcoin_node_a_SOURCES = \
   dynafed.cpp \
   dbwrapper.cpp \
   deploymentstatus.cpp \
+  drivechain_parent_replay.cpp \
   flatfile.cpp \
   httprpc.cpp \
   httpserver.cpp \
@@ -580,6 +587,7 @@ libelements_consensus_a_SOURCES = \
   script/bitcoinconsensus.cpp \
   script/interpreter.cpp \
   script/interpreter.h \
+  script/usdd_sp1_annex.h \
   script/script.cpp \
   script/script.h \
   script/script_error.cpp \
@@ -915,6 +923,7 @@ bitcoin_chainstate_SOURCES += \
   common/bloom.cpp \
   confidential_validation.cpp \
   dynafed.cpp \
+  drivechain_parent_replay.cpp \
   issuance.cpp \
   mainchainrpc.cpp \
   merkleblock.cpp \

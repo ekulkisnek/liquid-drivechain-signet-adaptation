@@ -3,8 +3,10 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <attributes.h>
+#include <chainparams.h>
 #include <clientversion.h>
 #include <coins.h>
+#include <pegins.h>
 #include <script/standard.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
@@ -12,6 +14,7 @@
 #include <uint256.h>
 #include <undo.h>
 #include <util/strencodings.h>
+#include <validation.h>
 
 #include <map>
 #include <vector>
@@ -100,6 +103,62 @@ public:
 BOOST_FIXTURE_TEST_SUITE(coins_tests, BasicTestingSetup)
 
 static const unsigned int NUM_SIMULATION_ITERATIONS = 40000;
+
+BOOST_AUTO_TEST_CASE(drivechain_pegin_undo_is_network_scoped)
+{
+    const std::string ordinary_network{Params().NetworkIDString()};
+    struct ParamsRestorer {
+        const std::string network;
+        ~ParamsRestorer() { SelectParams(network); }
+    } restore_params{ordinary_network};
+
+    BOOST_REQUIRE(!Params().GetConsensus().drivechain_slot.has_value());
+
+    // Construct the native witness and its spent-key domain under the exact
+    // consensus identity that accepted the deposit in the first place.
+    SelectParams(CBaseChainParams::ELEMENTS);
+    BOOST_REQUIRE(Params().GetConsensus().drivechain_slot.has_value());
+
+    CCoinsViewTest base;
+    CCoinsViewCacheTest view(&base);
+    const COutPoint mainchain_outpoint(uint256S("01"), 0);
+    const CScriptWitness witness = CreateDrivechainDepositPeginWitness(
+        1000,
+        Params().GetConsensus().pegged_asset,
+        Params().ParentGenesisBlockHash(),
+        CScript() << OP_TRUE,
+        mainchain_outpoint,
+        uint256S("02"),
+        std::vector<unsigned char>{'x'});
+
+    CTxIn pegin_input(mainchain_outpoint);
+    pegin_input.m_is_pegin = true;
+    const auto spent_key = GetPeginSpentKey(witness, mainchain_outpoint);
+    view.SetPeginSpent(spent_key, true);
+    BOOST_REQUIRE(view.IsPeginSpent(spent_key));
+
+    std::vector<std::pair<CScript, CScript>> fedpegscripts;
+
+    // Bitcoin-compatible networks must never reinterpret the native
+    // Drivechain witness marker as a valid legacy peg-in during disconnect.
+    SelectParams(ordinary_network);
+    BOOST_REQUIRE(!Params().GetConsensus().drivechain_slot.has_value());
+    BOOST_CHECK(GetPeginSpentKey(witness, mainchain_outpoint) != spent_key);
+    BOOST_CHECK_EQUAL(
+        ApplyTxInUndo(Coin{}, view, mainchain_outpoint, pegin_input, witness, fedpegscripts),
+        DISCONNECT_UNCLEAN);
+    BOOST_CHECK(view.IsPeginSpent(spent_key));
+
+    // On the dedicated Drivechain, disconnect uses only the structural native
+    // witness check. It must not re-query mutable parent state after connect.
+    SelectParams(CBaseChainParams::ELEMENTS);
+    BOOST_REQUIRE(Params().GetConsensus().drivechain_slot.has_value());
+    BOOST_CHECK(GetPeginSpentKey(witness, mainchain_outpoint) == spent_key);
+    BOOST_CHECK_EQUAL(
+        ApplyTxInUndo(Coin{}, view, mainchain_outpoint, pegin_input, witness, fedpegscripts),
+        DISCONNECT_OK);
+    BOOST_CHECK(!view.IsPeginSpent(spent_key));
+}
 
 // This is a large randomized insert/remove simulation test on a variable-size
 // stack of caches on top of CCoinsViewTest.

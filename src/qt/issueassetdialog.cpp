@@ -25,13 +25,13 @@ IssueAssetDialog::IssueAssetDialog(ClientModel* clientModel, QWidget* parent)
     : QDialog(parent),
       m_client_model(clientModel)
 {
-    setWindowTitle(tr("Issue New Asset (Liquid)"));
+    setWindowTitle(tr("Issue New Asset (Elements)"));
     setModal(true);
     setMinimumWidth(500);
 
     auto* layout = new QVBoxLayout(this);
 
-    m_status_label = new QLabel(tr("Issue a new asset on the Liquid sidechain. This uses the 'issueasset' RPC. Amounts are in BTC units (8 decimals)."), this);
+    m_status_label = new QLabel(tr("Issue a new asset on Elements. This uses the 'issueasset' RPC. Amounts are in BTC units (8 decimals)."), this);
     m_status_label->setWordWrap(true);
     layout->addWidget(m_status_label);
 

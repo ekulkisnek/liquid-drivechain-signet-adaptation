@@ -11,6 +11,7 @@
 #include <crypto/sha256.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <script/usdd_sp1_annex.h>
 #include <uint256.h>
 extern "C" {
 #include <simplicity/elements/env.h>
@@ -776,6 +777,9 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
 
                     // If not enabled, keep the historical OP_NOP4 behavior.
                     if (!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY)) {
+                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) {
+                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                        }
                         break;
                     }
 
@@ -3228,10 +3232,17 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
 {
     simplicity_err error;
     elementsTapEnv* simplicityTapEnv = simplicity_elements_mallocTapEnv(&simplicityRawTap);
+    rawElementsBlockEnv simplicityRawBlock{};
+    if (txdata->m_bmm_parent_mtp.has_value()) {
+        simplicityRawBlock.bmmParentMtp = *txdata->m_bmm_parent_mtp;
+        simplicityRawBlock.bmmParentMtpPresent = true;
+    }
 
     assert(txdata->m_simplicity_tx_data);
     assert(simplicityTapEnv);
-    if (!simplicity_elements_execSimplicity(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
+    if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv,
+                                                        txdata->m_hash_genesis_block.data(), &simplicityRawBlock, 0, budget, 0,
+                                                        program.data(), program.size(), witness.data(), witness.size())) {
         assert(!"simplicity_elements_execSimplicity internal error");
     }
     simplicity_elements_freeTapEnv(simplicityTapEnv);
@@ -3383,9 +3394,11 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         // BIP341 Taproot: 32-byte non-P2SH witness v1 program (which encodes a P2C-tweaked pubkey)
         if (!(flags & SCRIPT_VERIFY_TAPROOT)) return set_success(serror);
         if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+        const valtype* tap_annex{nullptr};
         if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
             // Drop annex (this is non-standard; see IsWitnessStandard)
             const valtype& annex = SpanPopBack(stack);
+            tap_annex = &annex;
             execdata.m_annex_hash = (CHashWriter(SER_GETHASH, 0) << annex).GetSHA256();
             execdata.m_annex_present = true;
         } else {
@@ -3420,6 +3433,23 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if ((flags & SCRIPT_VERIFY_SIMPLICITY) && (control[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSIMPLICITY) {
                 if (stack.size() != 2 || script_bytes.size() != 32) return set_error(serror, SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH);
                 // Tapsimplicity (leaf version 0xbe)
+                if (tap_annex != nullptr && (flags & SCRIPT_VERIFY_USDD_SP1_ANNEX)) {
+                    const PrecomputedTransactionData* txdata = checker.GetPrecomputedTransactionData();
+                    switch (usdd::GateUsddSp1ProofAnnex(*tap_annex, txdata != nullptr && txdata->m_bmm_parent_mtp.has_value())) {
+                    case usdd::Sp1ConsensusGateResult::NOT_USDD:
+                        break;
+                    case usdd::Sp1ConsensusGateResult::MALFORMED:
+                        return set_error(serror, SCRIPT_ERR_USDD_SP1_ANNEX);
+                    case usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING:
+                        return set_error(serror, SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING);
+                    case usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE:
+                        // Parsing is not verification.  Keep this path
+                        // impossible to satisfy until a pinned SP1 verifier is
+                        // a real upstream Simplicity jet with generated
+                        // dispatch and deterministic cost.
+                        return set_error(serror, SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE);
+                    }
+                }
                 const valtype& simplicity_program = SpanPopBack(stack);
                 const valtype& simplicity_witness = SpanPopBack(stack);
                 const int64_t budget = ::GetSerializeSize(witness.stack, PROTOCOL_VERSION) + VALIDATION_WEIGHT_OFFSET;

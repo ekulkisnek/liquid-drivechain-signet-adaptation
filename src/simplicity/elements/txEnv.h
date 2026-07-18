@@ -252,6 +252,7 @@ typedef struct elementsTapEnv {
  * + the transaction data, which may be shared when Simplicity expressions are used for multiple inputs in the same transaction),
  * + the input index under consideration,
  * + the hash of the genesis block for the chain,
+ * + optional block context authenticated by the consensus caller.
  */
 typedef struct txEnv {
   const elementsTransaction* tx;
@@ -259,6 +260,8 @@ typedef struct txEnv {
   sha256_midstate genesisHash;
   sha256_midstate sigAllHash;
   uint_fast32_t ix;
+  uint_fast64_t bmmParentMtp;
+  bool bmmParentMtpPresent;
 } txEnv;
 
 /* Construct a txEnv structure from its components.
@@ -269,6 +272,8 @@ typedef struct txEnv {
  *               NULL != genesisHash
  *               ix < tx->numInputs
  */
-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, uint_fast32_t ix);
+txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
+                                      const sha256_midstate* genesisHash, uint_fast32_t ix,
+                                      bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp);
 
 #endif

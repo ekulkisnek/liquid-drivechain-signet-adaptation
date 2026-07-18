@@ -42,13 +42,14 @@
  *               unsigned char program[program_len]
  *               unsigned char witness[witness_len]
  */
-extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned char* ihr
-                                              , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
-                                              , const unsigned char* genesisBlockHash
-                                              , int64_t minCost, int64_t budget
-                                              , const unsigned char* amr
-                                              , const unsigned char* program, size_t program_len
-                                              , const unsigned char* witness, size_t witness_len) {
+extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* error, unsigned char* ihr
+                                                          , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
+                                                          , const unsigned char* genesisBlockHash
+                                                          , const rawElementsBlockEnv* blockEnv
+                                                          , int64_t minCost, int64_t budget
+                                                          , const unsigned char* amr
+                                                          , const unsigned char* program, size_t program_len
+                                                          , const unsigned char* witness, size_t witness_len) {
   simplicity_assert(NULL != error);
   simplicity_assert(NULL != tx);
   simplicity_assert(NULL != taproot);
@@ -125,7 +126,9 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
       simplicity_free(analysis);
     }
     if (IS_OK(*error)) {
-      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ix);
+      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ix,
+                                                  blockEnv && blockEnv->bmmParentMtpPresent,
+                                                  blockEnv ? blockEnv->bmmParentMtp : 0);
       static_assert(BUDGET_MAX <= UBOUNDED_MAX, "BUDGET_MAX doesn't fit in ubounded.");
       *error = evalTCOProgram( dag, type_dag, (size_t)dag_len
                              , minCost <= BUDGET_MAX ? (ubounded)minCost : BUDGET_MAX
@@ -137,4 +140,15 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
 
   simplicity_free(dag);
   return IS_PERMANENT(*error);
+}
+
+extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned char* ihr
+                                              , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
+                                              , const unsigned char* genesisBlockHash
+                                              , int64_t minCost, int64_t budget
+                                              , const unsigned char* amr
+                                              , const unsigned char* program, size_t program_len
+                                              , const unsigned char* witness, size_t witness_len) {
+  return simplicity_elements_execSimplicityWithBlockEnv(error, ihr, tx, ix, taproot, genesisBlockHash, NULL,
+                                                        minCost, budget, amr, program, program_len, witness, witness_len);
 }

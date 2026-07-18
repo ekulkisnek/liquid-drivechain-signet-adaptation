@@ -14,12 +14,11 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
-#include <node/drivechain_withdrawal_bundle.h>
+#include <pegins.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <pow.h>
 #include <primitives/transaction.h>
-#include <sync.h>
 #include <timedata.h>
 #include <util/moneystr.h>
 #include <util/system.h>
@@ -31,53 +30,6 @@
 #include <utility>
 
 namespace node {
-
-namespace {
-Mutex g_current_drivechain_withdrawal_bundle_mutex;
-uint256 g_current_drivechain_withdrawal_bundle_hash GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex);
-bool g_drivechain_withdrawal_bundle_creation_in_progress GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex) = false;
-} // namespace
-
-uint256 GetCurrentDrivechainWithdrawalBundleHash()
-{
-    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
-    return g_current_drivechain_withdrawal_bundle_hash;
-}
-
-bool TryBeginDrivechainWithdrawalBundleCreation(uint256& current_bundle_hash, bool& creation_in_progress)
-{
-    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
-    current_bundle_hash = g_current_drivechain_withdrawal_bundle_hash;
-    creation_in_progress = g_drivechain_withdrawal_bundle_creation_in_progress;
-    if (creation_in_progress || !current_bundle_hash.IsNull()) {
-        return false;
-    }
-    g_drivechain_withdrawal_bundle_creation_in_progress = true;
-    return true;
-}
-
-void CompleteDrivechainWithdrawalBundleCreation(const uint256& bundle_hash)
-{
-    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
-    g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
-    g_drivechain_withdrawal_bundle_creation_in_progress = false;
-}
-
-void AbortDrivechainWithdrawalBundleCreation()
-{
-    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
-    g_drivechain_withdrawal_bundle_creation_in_progress = false;
-}
-
-bool ClearCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
-{
-    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
-    if (g_current_drivechain_withdrawal_bundle_hash != bundle_hash) {
-        return false;
-    }
-    g_current_drivechain_withdrawal_bundle_hash.SetNull();
-    return true;
-}
 
 void ResetChallenge(CBlockHeader& block, const CBlockIndex& indexLast, const Consensus::Params& params)
 {
@@ -191,6 +143,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     CBlockIndex* pindexPrev = m_chainstate.m_chain.Tip();
     assert(pindexPrev != nullptr);
     nHeight = pindexPrev->nHeight + 1;
+    m_include_drivechain_pegins =
+        m_chainstate.IsDrivechainMempoolCurrentForMining();
 
     pblock->nVersion = g_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
     // -regtest only: allow overriding block.nVersion with
@@ -272,7 +226,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
 
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
-    pblock->hashWithdrawalBundle = GetCurrentDrivechainWithdrawalBundleHash();
     UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     pblock->nBits          = g_signed_blocks ? 0 : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     if (g_con_blockheightinheader) {
@@ -282,8 +235,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     pblocktemplate->vTxSigOpsCost[0] = WITNESS_SCALE_FACTOR * GetLegacySigOpCount(*pblock->vtx[0]);
 
     BlockValidationState state;
-    if (!TestBlockValidity(state, chainparams, m_chainstate, *pblock, pindexPrev, false, false)) {
-        throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, state.ToString()));
+    // The replay cache can publish a replacement generation without taking
+    // cs_main or the mempool lock. Never return a template containing a peg-in
+    // if that publication raced assembly; the next template fences deposits
+    // until the mempool sweep completes.
+    if (m_include_drivechain_pegins &&
+        !m_chainstate.IsDrivechainMempoolCurrentForMining() &&
+        std::any_of(pblock->vtx.begin(), pblock->vtx.end(),
+                    [](const CTransactionRef& tx) {
+                        return std::any_of(
+                            tx->vin.begin(), tx->vin.end(),
+                            [](const CTxIn& input) {
+                                return input.m_is_pegin;
+                            });
+                    })) {
+        throw std::runtime_error(
+            "authenticated parent replay changed during block assembly");
+    }
+    if (!TestBlockCandidateValidity(state, chainparams, m_chainstate, *pblock, pindexPrev, false, false)) {
+        throw std::runtime_error(strprintf("%s: TestBlockCandidateValidity failed: %s", __func__, state.ToString()));
     }
     int64_t nTime2 = GetTimeMicros();
 
@@ -323,6 +293,13 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package) const
 {
     for (CTxMemPool::txiter it : package) {
+        if (!m_include_drivechain_pegins &&
+            std::any_of(it->GetTx().vin.begin(), it->GetTx().vin.end(),
+                        [](const CTxIn& input) {
+                            return input.m_is_pegin;
+                        })) {
+            return false;
+        }
         if (!IsFinalTx(it->GetTx(), nHeight, m_lock_time_cutoff)) {
             return false;
         }
@@ -424,6 +401,34 @@ void BlockAssembler::SortForBlock(const CTxMemPool::setEntries& package, std::ve
 void BlockAssembler::addPackageTxs(int& nPackagesSelected, int& nDescendantsUpdated, std::chrono::seconds min_tx_age)
 {
     AssertLockHeld(m_mempool.cs);
+
+    // A native BIP300 deposit gives the sidechain its entire backing value to
+    // one committed recipient, so its one-input/one-output canonical form has
+    // no room to pay an Elements fee. Include only that exact standalone form
+    // before ordinary feerate selection. Requiring no mempool parents or
+    // children prevents this exception from subsidizing any package.
+    if (chainparams.GetConsensus().drivechain_slot.has_value()) {
+        for (auto iter = m_mempool.mapTx.begin(); iter != m_mempool.mapTx.end(); ++iter) {
+            if (iter->GetFee() != 0 ||
+                iter->GetCountWithAncestors() != 1 ||
+                iter->GetCountWithDescendants() != 1 ||
+                !iter->GetMemPoolParentsConst().empty() ||
+                !iter->GetMemPoolChildrenConst().empty() ||
+                !IsCanonicalFeeFreeDrivechainDeposit(iter->GetTx()) ||
+                (min_tx_age > std::chrono::seconds(0) &&
+                 iter->GetTime() > GetTime<std::chrono::seconds>() - min_tx_age)) {
+                continue;
+            }
+
+            CTxMemPool::setEntries singleton{iter};
+            if (!TestPackage(iter->GetTxSize(), iter->GetSigOpCost()) ||
+                !TestPackageTransactions(singleton)) {
+                continue;
+            }
+            AddToBlock(iter);
+            ++nPackagesSelected;
+        }
+    }
 
     // mapModifiedTx will store sorted packages after they are modified
     // because some of their txs are already in the block

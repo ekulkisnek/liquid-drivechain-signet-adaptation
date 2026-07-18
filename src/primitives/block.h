@@ -213,7 +213,6 @@ public:
     int32_t nVersion;
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;
-    uint256 hashWithdrawalBundle;
     uint32_t nTime;
     // Height in header as well as in coinbase for easier hsm validation
     // Is set for serialization with `-con_blockheightinheader=1`
@@ -236,13 +235,10 @@ public:
 
     // HF bit to detect dynamic federation blocks
     static const uint32_t DYNAFED_HF_MASK = 1 << 31;
-    // HF bit to detect block headers that commit to a withdrawal bundle hash.
-    static const uint32_t WITHDRAWAL_BUNDLE_HF_MASK = 1 << 30;
 
     template <typename Stream>
     inline void Serialize(Stream& s) const {
         const bool fAllowWitness = !(s.GetVersion() & SERIALIZE_TRANSACTION_NO_WITNESS);
-        const bool has_withdrawal_bundle_hash = !hashWithdrawalBundle.IsNull();
 
         // Detect dynamic federation block serialization using "HF bit",
         // or the signed bit which is invalid in Bitcoin
@@ -252,17 +248,11 @@ public:
             nVersion |= DYNAFED_HF_MASK;
             is_dyna = true;
         }
-        if (has_withdrawal_bundle_hash) {
-            nVersion |= WITHDRAWAL_BUNDLE_HF_MASK;
-        }
         s << (nVersion);
 
         if (is_dyna) {
             s << hashPrevBlock;
             s << hashMerkleRoot;
-            if (has_withdrawal_bundle_hash) {
-                s << hashWithdrawalBundle;
-            }
             s << nTime;
             s << block_height;
             s << m_dynafed_params;
@@ -273,9 +263,6 @@ public:
         } else {
             s << hashPrevBlock;
             s << hashMerkleRoot;
-            if (has_withdrawal_bundle_hash) {
-                s << hashWithdrawalBundle;
-            }
             s << nTime;
             if (g_con_blockheightinheader) {
                 s << block_height;
@@ -299,17 +286,11 @@ public:
         int32_t nVersion;
         s >> nVersion;
         is_dyna = nVersion < 0;
-        const bool has_withdrawal_bundle_hash = (static_cast<uint32_t>(nVersion) & WITHDRAWAL_BUNDLE_HF_MASK) != 0;
-        this->nVersion = static_cast<int32_t>(~(DYNAFED_HF_MASK | WITHDRAWAL_BUNDLE_HF_MASK) & static_cast<uint32_t>(nVersion));
+        this->nVersion = ~DYNAFED_HF_MASK & nVersion;
 
         if (is_dyna) {
             s >> hashPrevBlock;
             s >> hashMerkleRoot;
-            if (has_withdrawal_bundle_hash) {
-                s >> hashWithdrawalBundle;
-            } else {
-                hashWithdrawalBundle.SetNull();
-            }
             s >> nTime;
             s >> block_height;
             s >> m_dynafed_params;
@@ -320,11 +301,6 @@ public:
         } else {
             s >> hashPrevBlock;
             s >> hashMerkleRoot;
-            if (has_withdrawal_bundle_hash) {
-                s >> hashWithdrawalBundle;
-            } else {
-                hashWithdrawalBundle.SetNull();
-            }
             s >> nTime;
             if (g_con_blockheightinheader) {
                 s >> block_height;
@@ -343,7 +319,6 @@ public:
         nVersion = 0;
         hashPrevBlock.SetNull();
         hashMerkleRoot.SetNull();
-        hashWithdrawalBundle.SetNull();
         nTime = 0;
         block_height = 0;
         nBits = 0;
@@ -408,7 +383,6 @@ public:
         block.nVersion       = nVersion;
         block.hashPrevBlock  = hashPrevBlock;
         block.hashMerkleRoot = hashMerkleRoot;
-        block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.nTime          = nTime;
         block.block_height   = block_height;
         block.nBits          = nBits;

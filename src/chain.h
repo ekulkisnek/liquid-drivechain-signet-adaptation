@@ -14,6 +14,9 @@
 #include <tinyformat.h>
 #include <uint256.h>
 
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <vector>
 
 namespace node {
@@ -95,6 +98,84 @@ public:
             nHeightLast = nHeightIn;
         if (nTimeIn > nTimeLast)
             nTimeLast = nTimeIn;
+    }
+};
+
+/**
+ * Authenticated Bitcoin anchor for one drivechain block.
+ *
+ * This metadata is deliberately stored outside the Elements block header: the
+ * sidechain block commits to parent_block_hash in its coinbase, while these
+ * fields record the exact active-chain block that contained the slot-specific
+ * BIP301 M7 commitment and the parent context used by Simplicity. Persisting
+ * the complete tuple makes restart/reindex validation compare the same proof
+ * identity instead of reinterpreting an unversioned RPC response.
+ */
+struct DrivechainAnchor
+{
+    static constexpr uint8_t CURRENT_VERSION{1};
+
+    uint8_t version{CURRENT_VERSION};
+    uint256 parent_block_hash{};
+    uint256 bmm_block_hash{};
+    uint256 parent_chainwork{};
+    uint256 bmm_chainwork{};
+    uint32_t parent_height{0};
+    uint32_t bmm_height{0};
+    uint64_t parent_median_time_past{0};
+
+    bool IsSane() const
+    {
+        return version == CURRENT_VERSION &&
+               !parent_block_hash.IsNull() &&
+               !bmm_block_hash.IsNull() &&
+               !parent_chainwork.IsNull() &&
+               !bmm_chainwork.IsNull() &&
+               bmm_height == parent_height + 1 &&
+               UintToArith256(bmm_chainwork) > UintToArith256(parent_chainwork) &&
+               parent_median_time_past <= std::numeric_limits<uint32_t>::max();
+    }
+
+    bool operator==(const DrivechainAnchor& other) const
+    {
+        return version == other.version &&
+               parent_block_hash == other.parent_block_hash &&
+               bmm_block_hash == other.bmm_block_hash &&
+               parent_chainwork == other.parent_chainwork &&
+               bmm_chainwork == other.bmm_chainwork &&
+               parent_height == other.parent_height &&
+               bmm_height == other.bmm_height &&
+               parent_median_time_past == other.parent_median_time_past;
+    }
+
+    bool operator!=(const DrivechainAnchor& other) const { return !(*this == other); }
+
+    /**
+     * Return whether this anchor could follow `previous` on one active parent
+     * chain. Equality is required when this block uses the previous M7 block
+     * directly as its BMM parent; otherwise parent height and work must both
+     * advance. Active-chain ancestry is authenticated separately.
+     */
+    bool Follows(const DrivechainAnchor& previous) const
+    {
+        if (!IsSane() || !previous.IsSane() || parent_height < previous.bmm_height) return false;
+        if (parent_height == previous.bmm_height) {
+            return parent_block_hash == previous.bmm_block_hash &&
+                   parent_chainwork == previous.bmm_chainwork;
+        }
+        return UintToArith256(parent_chainwork) > UintToArith256(previous.bmm_chainwork);
+    }
+
+    SERIALIZE_METHODS(DrivechainAnchor, obj)
+    {
+        READWRITE(obj.version,
+                  obj.parent_block_hash,
+                  obj.bmm_block_hash,
+                  obj.parent_chainwork,
+                  obj.bmm_chainwork,
+                  obj.parent_height,
+                  obj.bmm_height,
+                  obj.parent_median_time_past);
     }
 };
 
@@ -206,10 +287,12 @@ public:
     //! block header
     int32_t nVersion{0};
     uint256 hashMerkleRoot{};
-    uint256 hashWithdrawalBundle{};
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
+
+    //! Persisted authenticated parent-chain anchor for drivechain blocks.
+    std::optional<DrivechainAnchor> m_drivechain_anchor{};
 
 protected:
     std::optional<CProof> proof{};
@@ -293,7 +376,6 @@ public:
     explicit CBlockIndex(const CBlockHeader& block)
         : nVersion{block.nVersion},
           hashMerkleRoot{block.hashMerkleRoot},
-          hashWithdrawalBundle{block.hashWithdrawalBundle},
           nTime{block.nTime},
           nBits{block.nBits},
           nNonce{block.nNonce},
@@ -333,7 +415,6 @@ public:
         if (pprev)
             block.hashPrevBlock = pprev->GetBlockHash();
         block.hashMerkleRoot = hashMerkleRoot;
-        block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;
@@ -388,10 +469,9 @@ public:
 
     std::string ToString() const
     {
-        return strprintf("CBlockIndex(pprev=%p, nHeight=%d, merkle=%s, withdrawal_bundle=%s, hashBlock=%s)",
+        return strprintf("CBlockIndex(pprev=%p, nHeight=%d, merkle=%s, hashBlock=%s)",
             pprev, nHeight,
             hashMerkleRoot.ToString(),
-            hashWithdrawalBundle.ToString(),
             GetBlockHash().ToString());
     }
 
@@ -484,20 +564,6 @@ public:
         return is_dynafed_block();
     }
 
-    bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) {
-        if (for_read) {
-            bool has_withdrawal_bundle_hash = ((uint32_t)nVersion & CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK) != 0;
-            nVersion = (int32_t) (~CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK & (uint32_t)nVersion);
-            return has_withdrawal_bundle_hash;
-        } else {
-            return !hashWithdrawalBundle.IsNull();
-        }
-    }
-    bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) const {
-        assert(!for_read);
-        return !hashWithdrawalBundle.IsNull();
-    }
-
     SERIALIZE_METHODS(CDiskBlockIndex, obj)
     {
         LOCK(::cs_main);
@@ -522,21 +588,12 @@ public:
             if (obj.is_dynafed_block()) {
                 nVersion |= (int32_t)CBlockHeader::DYNAFED_HF_MASK;
             }
-            if (!obj.hashWithdrawalBundle.IsNull()) {
-                nVersion |= (int32_t)CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
-            }
             READWRITE(nVersion);
         }
         bool is_dyna = obj.RemoveDynaFedMaskOnSerialize(ser_action.ForRead());
-        bool has_withdrawal_bundle_hash = obj.RemoveWithdrawalBundleMaskOnSerialize(ser_action.ForRead());
 
         READWRITE(obj.hashPrev);
         READWRITE(obj.hashMerkleRoot);
-        if (has_withdrawal_bundle_hash) {
-            READWRITE(obj.hashWithdrawalBundle);
-        } else {
-            SER_READ(obj, obj.hashWithdrawalBundle.SetNull());
-        }
         READWRITE(obj.nTime);
 
         // Allocate objects in the optional<> fields when reading, since READWRITE will not do this
@@ -568,7 +625,6 @@ public:
         block.nVersion = nVersion;
         block.hashPrevBlock = hashPrev;
         block.hashMerkleRoot = hashMerkleRoot;
-        block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;

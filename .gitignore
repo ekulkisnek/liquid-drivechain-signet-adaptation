@@ -11,6 +11,10 @@ src/elements-tx
 src/elements-util
 src/elements-chainstate
 src/elements-wallet
+src/elements-functional-test-node
+src/elements-functional-test-cli
+src/elements-functional-test-tx
+src/elements-functional-test-wallet
 src/test/fuzz/fuzz
 src/test/test_bitcoin
 src/qt/test/test_elements-qt

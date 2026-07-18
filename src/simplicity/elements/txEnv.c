@@ -8,11 +8,15 @@
  *               NULL != genesisHash
  *               ix < tx->numInputs
  */
-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, uint_fast32_t ix) {
+txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
+                                      const sha256_midstate* genesisHash, uint_fast32_t ix,
+                                      bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp) {
   txEnv result = { .tx = tx
                  , .taproot = taproot
                  , .genesisHash = *genesisHash
                  , .ix = ix
+                 , .bmmParentMtp = bmmParentMtp
+                 , .bmmParentMtpPresent = bmmParentMtpPresent
                  };
   sha256_context ctx = sha256_init(result.sigAllHash.s);
   sha256_hash(&ctx, genesisHash);

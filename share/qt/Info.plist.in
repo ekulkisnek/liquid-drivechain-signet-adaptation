@@ -37,27 +37,16 @@
   <string>Elements-Qt</string>
 
   <key>CFBundleName</key>
-  <string>Elements-Qt</string>
+  <string>Elements</string>
+
+  <key>CFBundleDisplayName</key>
+  <string>Elements</string>
 
   <key>LSHasLocalizedDisplayName</key>
   <true/>
 
   <key>CFBundleIdentifier</key>
-  <string>org.elementsproject.Elements-Qt</string>
-
-  <key>CFBundleURLTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleTypeRole</key>
-      <string>Editor</string>
-      <key>CFBundleURLName</key>
-      <string>org.bitcoin.BitcoinPayment</string>
-      <key>CFBundleURLSchemes</key>
-      <array>
-        <string>bitcoin</string>
-      </array>
-    </dict>
-  </array>
+  <string>org.elementsproject.Elements</string>
 
   <key>NSPrincipalClass</key>
     <string>NSApplication</string>

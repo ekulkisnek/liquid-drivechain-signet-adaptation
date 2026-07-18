@@ -14,7 +14,9 @@
 #include <script/script.h>
 #include <chain.h>
 
+#include <string>
 #include <variant>
+#include <vector>
 
 /** Calculates script necessary for p2ch peg-in transactions */
 CScript calculate_contract(const CScript& federationRedeemScript, const CScript& witnessProgram);
@@ -23,13 +25,37 @@ bool GetAmountFromParentChainPegin(CAmount& amount, const CTransaction& txBTC, u
 /** Check whether a parent chain block hash satisfies the proof-of-work requirement specified by nBits */
 bool CheckParentProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
 /** Checks pegin witness for validity */
-bool IsValidPeginWitness(const CScriptWitness& pegin_witness, const std::vector<std::pair<CScript, CScript>>& fedpegscripts, const COutPoint& prevout, std::string& err_msg, bool check_depth, bool* depth_failed = nullptr);
-/** Checks whether a pegin witness is a trusted BIP300/301 drivechain deposit import. */
-bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness, const COutPoint& prevout, CAmount* value = nullptr, CScript* claim_script = nullptr);
+bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
+                         const std::vector<std::pair<CScript, CScript>>& fedpegscripts,
+                         const COutPoint& prevout,
+                         std::string& err_msg,
+                         bool check_depth,
+                         bool* depth_failed = nullptr,
+                         bool* parent_unavailable = nullptr);
+/** Parse a BIP300 deposit witness. This does not by itself authorize minting. */
+bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
+                                     const COutPoint& prevout,
+                                     CAmount* value = nullptr,
+                                     CScript* claim_script = nullptr,
+                                     uint256* mainchain_block_hash = nullptr,
+                                     std::vector<unsigned char>* address = nullptr);
+/** Require the committed sidechain address to receive the exact deposit amount. */
+bool CheckDrivechainDepositOutputs(const CTransaction& tx, unsigned int pegin_index, std::string& err_msg);
+/**
+ * Match the uniquely bounded zero-fee native-deposit transaction shape used
+ * by relay and block assembly policy. This performs no parent RPC.
+ */
+bool IsCanonicalFeeFreeDrivechainDeposit(const CTransaction& tx);
 /** Return the duplicate-claim key used for sidechain pegin/deposit spent tracking. */
 std::pair<uint256, COutPoint> GetPeginSpentKey(const CScriptWitness& pegin_witness, const COutPoint& prevout);
-/** Create a pegin witness for a trusted BIP300/301 drivechain deposit import. */
-CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value, const CAsset& asset, const uint256& genesis_hash, const CScript& claim_script, const uint256& mainchain_txid);
+/** Create a proof reference for a BIP300/301 drivechain deposit import. */
+CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value,
+                                                   const CAsset& asset,
+                                                   const uint256& genesis_hash,
+                                                   const CScript& claim_script,
+                                                   const COutPoint& mainchain_outpoint,
+                                                   const uint256& mainchain_block_hash,
+                                                   const std::vector<unsigned char>& address);
 
 /* Consensus-critical. Matching against telescoped multisig used on Liquid v1:
  * Pseudo-structure:

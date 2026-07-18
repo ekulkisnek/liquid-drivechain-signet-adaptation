@@ -77,6 +77,7 @@
 #include <validationinterface.h>
 #include <walletinitinterface.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -91,8 +92,12 @@
 #ifndef WIN32
 #include <attributes.h>
 #include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #include <boost/algorithm/string/replace.hpp>
@@ -151,6 +156,281 @@ static uint256 GetMainchainBlockHash(const int64_t height)
     return uint256S(CallMainChainRPCChecked("getblockhash", params).get_str());
 }
 
+bool ComputeDrivechainBmmBid(const CAmount configured_bid,
+                             const CAmount sidechain_fees,
+                             CAmount& selected_bid,
+                             std::string* error)
+{
+    if (error) error->clear();
+    if (configured_bid <= 0 || !MoneyRange(configured_bid)) {
+        if (error) *error = "configured BMM bid must be positive and within the money range";
+        return false;
+    }
+    if (sidechain_fees < 0 || !MoneyRange(sidechain_fees)) {
+        if (error) *error = "sidechain candidate fees are outside the money range";
+        return false;
+    }
+    selected_bid = std::max(configured_bid, sidechain_fees);
+    if (selected_bid <= 0 || !MoneyRange(selected_bid)) {
+        if (error) *error = "selected BMM bid is outside the money range";
+        return false;
+    }
+    return true;
+}
+
+bool ParseDrivechainBmmBid(const std::string& value,
+                           CAmount& bid,
+                           std::string* error)
+{
+    if (error) error->clear();
+    int64_t parsed{0};
+    if (!ParseInt64(value, &parsed)) {
+        if (error) *error = "BMM bid must be a canonical base-10 integer";
+        return false;
+    }
+    CAmount selected{0};
+    if (!ComputeDrivechainBmmBid(parsed, 0, selected, error)) return false;
+    bid = selected;
+    return true;
+}
+
+static bool GetConfiguredDrivechainBmmBid(const ArgsManager& args,
+                                          CAmount& bid,
+                                          std::string* error)
+{
+    if (!args.IsArgSet("-drivechainbmmbid")) {
+        bid = DEFAULT_DRIVECHAIN_BMM_BID;
+        if (error) error->clear();
+        return true;
+    }
+    return ParseDrivechainBmmBid(
+        args.GetArg("-drivechainbmmbid", ""), bid, error);
+}
+
+BoundedCommandResult RunBoundedCommand(
+    const std::vector<std::string>& argv,
+    const std::chrono::milliseconds timeout,
+    const size_t max_output,
+    const std::function<bool()>& should_cancel)
+{
+    BoundedCommandResult result;
+    if (argv.empty() || argv.front().empty()) {
+        result.error = "bounded command has no executable";
+        return result;
+    }
+    if (timeout <= std::chrono::milliseconds::zero() || max_output == 0) {
+        result.error = "bounded command requires positive timeout and output limit";
+        return result;
+    }
+
+#ifdef WIN32
+    result.error = "direct bounded child processes are not supported on Windows";
+    return result;
+#else
+    int output_pipe[2]{-1, -1};
+    if (pipe(output_pipe) != 0) {
+        result.error = strprintf("failed to create child output pipe (%d)", errno);
+        return result;
+    }
+    const auto close_pipe = [&] {
+        if (output_pipe[0] >= 0) close(output_pipe[0]);
+        if (output_pipe[1] >= 0) close(output_pipe[1]);
+        output_pipe[0] = output_pipe[1] = -1;
+    };
+    if (fcntl(output_pipe[0], F_SETFD, FD_CLOEXEC) == -1 ||
+        fcntl(output_pipe[1], F_SETFD, FD_CLOEXEC) == -1) {
+        result.error = strprintf("failed to secure child output pipe (%d)", errno);
+        close_pipe();
+        return result;
+    }
+
+    std::vector<char*> child_argv;
+    child_argv.reserve(argv.size() + 1);
+    for (const std::string& argument : argv) {
+        child_argv.push_back(const_cast<char*>(argument.c_str()));
+    }
+    child_argv.push_back(nullptr);
+
+    const pid_t child = fork();
+    if (child < 0) {
+        result.error = strprintf("failed to fork child process (%d)", errno);
+        close_pipe();
+        return result;
+    }
+    if (child == 0) {
+        // Only async-signal-safe operations are permitted between fork and
+        // exec in this multithreaded process.
+        setpgid(0, 0);
+        close(output_pipe[0]);
+        if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
+            dup2(output_pipe[1], STDERR_FILENO) == -1) {
+            _exit(126);
+        }
+        close(output_pipe[1]);
+        execvp(child_argv[0], child_argv.data());
+        static constexpr char EXEC_ERROR[] = "execvp failed\n";
+        (void)write(STDERR_FILENO, EXEC_ERROR, sizeof(EXEC_ERROR) - 1);
+        _exit(127);
+    }
+
+    result.started = true;
+    close(output_pipe[1]);
+    output_pipe[1] = -1;
+    // The child sets its own process group before exec. This parent-side call
+    // closes the small fork race where termination arrives first.
+    (void)setpgid(child, child);
+    const int read_flags = fcntl(output_pipe[0], F_GETFL, 0);
+    const bool output_nonblocking = read_flags != -1 &&
+        fcntl(output_pipe[0], F_SETFL, read_flags | O_NONBLOCK) != -1;
+    if (!output_nonblocking) {
+        result.error = strprintf("failed to make child output nonblocking (%d)", errno);
+    }
+
+    int child_status{0};
+    bool child_reaped{false};
+    bool output_eof{false};
+    const auto reap_nonblocking = [&] {
+        if (child_reaped) return;
+        for (;;) {
+            const pid_t waited = waitpid(child, &child_status, WNOHANG);
+            if (waited == child) {
+                child_reaped = true;
+                return;
+            }
+            if (waited == 0) return;
+            if (waited < 0 && errno == EINTR) continue;
+            if (waited < 0 && errno == ECHILD) {
+                child_reaped = true;
+                return;
+            }
+            if (waited < 0 && result.error.empty()) {
+                result.error = strprintf("failed to reap child process (%d)", errno);
+            }
+            return;
+        }
+    };
+    const auto drain_output = [&] {
+        std::array<char, 4096> buffer;
+        for (;;) {
+            const ssize_t count = read(output_pipe[0], buffer.data(), buffer.size());
+            if (count > 0) {
+                const size_t available =
+                    max_output > result.output.size()
+                        ? max_output - result.output.size()
+                        : 0;
+                const size_t append = std::min<size_t>(
+                    available, static_cast<size_t>(count));
+                result.output.append(buffer.data(), append);
+                if (append != static_cast<size_t>(count)) {
+                    result.output_truncated = true;
+                    return true;
+                }
+                continue;
+            }
+            if (count == 0) {
+                output_eof = true;
+                return true;
+            }
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            if (result.error.empty()) {
+                result.error = strprintf("failed reading child output (%d)", errno);
+            }
+            return false;
+        }
+    };
+    const auto signal_group = [&](const int signal_number) {
+        // Negative pid addresses the dedicated child process group. Signal the
+        // child directly as a fallback if setpgid raced or was unavailable.
+        (void)kill(-child, signal_number);
+        if (!child_reaped) (void)kill(child, signal_number);
+    };
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool terminate_child{!result.error.empty()};
+    while (!terminate_child) {
+        if (!drain_output()) {
+            terminate_child = true;
+            break;
+        }
+        reap_nonblocking();
+        if (result.output_truncated) {
+            terminate_child = true;
+            break;
+        }
+        if (should_cancel && should_cancel()) {
+            result.cancelled = true;
+            terminate_child = true;
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            result.timed_out = true;
+            terminate_child = true;
+            break;
+        }
+        if (child_reaped && output_eof) break;
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        const int poll_timeout = static_cast<int>(
+            std::max<int64_t>(1, std::min<int64_t>(25, remaining.count())));
+        pollfd descriptor{output_pipe[0], POLLIN | POLLHUP | POLLERR, 0};
+        const int poll_result = poll(&descriptor, 1, poll_timeout);
+        if (poll_result < 0 && errno != EINTR) {
+            result.error = strprintf("failed polling child output (%d)", errno);
+            terminate_child = true;
+        }
+    }
+
+    if (terminate_child) {
+        signal_group(SIGTERM);
+        const auto grace_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
+        while (!child_reaped &&
+               std::chrono::steady_clock::now() < grace_deadline) {
+            reap_nonblocking();
+            if (child_reaped) break;
+            pollfd descriptor{output_pipe[0], POLLIN | POLLHUP | POLLERR, 0};
+            (void)poll(&descriptor, 1, 10);
+            if (output_nonblocking) (void)drain_output();
+        }
+        // Also kill descendants that inherited the output descriptor.
+        signal_group(SIGKILL);
+    }
+
+    if (!child_reaped) {
+        for (;;) {
+            const pid_t waited = waitpid(child, &child_status, 0);
+            if (waited == child) {
+                child_reaped = true;
+                break;
+            }
+            if (waited < 0 && errno == EINTR) continue;
+            if (waited < 0 && errno == ECHILD) {
+                child_reaped = true;
+                break;
+            }
+            if (waited < 0 && result.error.empty()) {
+                result.error = strprintf("failed to reap terminated child (%d)", errno);
+            }
+            break;
+        }
+    }
+    if (output_nonblocking) (void)drain_output();
+    close_pipe();
+
+    result.exited = child_reaped;
+    if (child_reaped) {
+        if (WIFEXITED(child_status)) {
+            result.exit_code = WEXITSTATUS(child_status);
+        } else if (WIFSIGNALED(child_status)) {
+            result.exit_code = 128 + WTERMSIG(child_status);
+        }
+    }
+    return result;
+#endif
+}
+
 static std::string ResolveDrivechainBmmGrpcurlPath()
 {
     const std::string configured_path = gArgs.GetArg("-drivechainbmmgrpcurl", "");
@@ -179,41 +459,73 @@ static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64
 #ifdef WIN32
     throw std::runtime_error("BIP301 gRPC request is not supported on Windows builds");
 #else
+    CAmount selected_bid{0};
+    std::string bid_error;
+    CAmount configured_bid{0};
+    if (!GetConfiguredDrivechainBmmBid(
+            gArgs, configured_bid, &bid_error) ||
+        !ComputeDrivechainBmmBid(
+            configured_bid, sidechain_fees, selected_bid, &bid_error)) {
+        throw std::runtime_error(bid_error);
+    }
+
     const std::string grpcurl_path = ResolveDrivechainBmmGrpcurlPath();
     const std::string grpc_addr = gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051");
     const std::string request = strprintf(
         "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
         sidechain_slot,
-        sidechain_fees,
+        selected_bid,
         mainchain_tip_height,
         sidechain_block_hash.GetHex(),
         mainchain_tip_hash.GetHex());
-    const std::string command = strprintf("%s -plaintext -d %s %s cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1",
-        ShellEscape(grpcurl_path),
-        ShellEscape(request),
-        ShellEscape(grpc_addr));
 
-    std::array<char, 512> buffer;
-    std::string output;
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        throw std::runtime_error("failed to launch grpcurl");
+    static constexpr size_t MAX_GRPCURL_OUTPUT{64 * 1024};
+    static constexpr auto GRPCURL_TIMEOUT{std::chrono::seconds{10}};
+    const BoundedCommandResult child = RunBoundedCommand(
+        {grpcurl_path,
+         "-plaintext",
+         "-d",
+         request,
+         grpc_addr,
+         "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction"},
+        std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
+        MAX_GRPCURL_OUTPUT,
+        [] { return ShutdownRequested(); });
+    if (!child.started) {
+        throw std::runtime_error(strprintf(
+            "failed to launch grpcurl: %s", child.error));
     }
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        output += buffer.data();
+    if (child.cancelled) {
+        throw std::runtime_error("grpcurl cancelled during shutdown");
     }
-    const int exit_code = pclose(pipe);
-    if (exit_code != 0) {
-        if (output.find("AlreadyExists") != std::string::npos ||
-            output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
+    if (child.timed_out) {
+        throw std::runtime_error("grpcurl exceeded its 10-second deadline");
+    }
+    if (child.output_truncated) {
+        throw std::runtime_error("grpcurl exceeded its 64 KiB output limit");
+    }
+    if (!child.error.empty()) {
+        throw std::runtime_error(strprintf(
+            "grpcurl process management failed: %s", child.error));
+    }
+    if (!child.exited) {
+        throw std::runtime_error("grpcurl was not reaped");
+    }
+    if (child.exit_code != 0) {
+        if (child.output.find("AlreadyExists") != std::string::npos ||
+            child.output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
             LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
                 sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
             return;
         }
-        throw std::runtime_error(strprintf("grpcurl exited with status %d: %s", exit_code, output));
+        throw std::runtime_error(strprintf(
+            "grpcurl exited with status %d: %s",
+            child.exit_code, child.output));
     }
-    LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, sidechain block %s, fees %s, response %s\n",
-        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height, sidechain_block_hash.GetHex(), FormatMoney(sidechain_fees), output);
+    LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, sidechain block %s, candidate fees %s, bid %s, response %s\n",
+        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height,
+        sidechain_block_hash.GetHex(), FormatMoney(sidechain_fees),
+        FormatMoney(selected_bid), child.output);
 #endif
 }
 
@@ -248,7 +560,15 @@ static bool WaitForDrivechainBmmCommitment(const uint256& sidechain_block_hash, 
             return true;
         }
 
-        if (bmm_error.rfind("L1 successor of parent", 0) == 0) {
+        // Once the exact active successor exists but carries no matching M7,
+        // this candidate cannot be committed on that P->Q edge.  Stop waiting
+        // after repeated observations and build a fresh candidate on the new
+        // parent tip.  Transport/RPC failures remain retryable indefinitely.
+        const bool definitive_mismatch =
+            bmm_error.find("BMM successor") != std::string::npos ||
+            bmm_error.find("not the exact successor of committed parent") != std::string::npos ||
+            bmm_error.find("not the active-chain block at its declared height") != std::string::npos;
+        if (definitive_mismatch) {
             ++definitive_failures;
             if (definitive_failures >= 3) {
                 LogPrintf("drivechain L1 block sync: abandoning sidechain block %s for parent %s because the mined L1 successor does not contain its BMM commitment: %s\n",
@@ -319,6 +639,11 @@ static bool AcceptPreparedDrivechainBlock(ChainstateManager& chainman, const CBl
 
 static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
 {
+    const auto& configured_slot = Params().GetConsensus().drivechain_slot;
+    if (!configured_slot.has_value()) {
+        LogPrintf("drivechain L1 block sync: refusing to mine on a network without an assigned drivechain slot\n");
+        return false;
+    }
     if (!node.chainman || !node.mempool) {
         LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n");
         return false;
@@ -335,8 +660,7 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
         side_height = tip->nHeight + 1;
     }
 
-    const std::vector<unsigned char> parent_hash_bytes(parent_hash.begin(), parent_hash.end());
-    const CScript parent_commitment = CScript() << OP_RETURN << parent_hash_bytes;
+    const CScript parent_commitment = CreateDrivechainParentCommitmentScript(parent_hash);
     const std::vector<CScript> commitments{parent_commitment};
 
     CScript coinbase_script(OP_TRUE);
@@ -347,7 +671,7 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
     }
 
     const CAmount sidechain_fees = -block_template->vTxFees[0];
-    const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
+    const int sidechain_slot = *configured_slot;
 
     if (!PrepareDrivechainBlock(*node.chainman, block_template->block)) {
         return false;
@@ -376,6 +700,9 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
 static void DrivechainL1BlockSyncTick(NodeContext& node)
 {
     if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", true)) {
+        return;
+    }
+    if (!Params().GetConsensus().drivechain_slot.has_value()) {
         return;
     }
 
@@ -433,6 +760,50 @@ static void StopDrivechainL1BlockSyncThread()
     }
 }
 
+/**
+ * Re-run activation even when no child block or transaction arrives.
+ *
+ * On a native drivechain this is also the parent-reorg wakeup: the first step
+ * in ActivateBestChain reconciles every persisted BIP301 anchor against the
+ * authenticated parent view.  This callback is deliberately independent of
+ * -drivechainl1blocksync, which controls local block production only.
+ */
+static void PeriodicChainstateReverification(ChainstateManager& chainman,
+                                             const bool native_drivechain)
+{
+    if (native_drivechain) {
+        // Replay/authenticate new parent blocks before taking cs_main in
+        // ActivateBestChain. Locked consensus paths only consume a tiny fixed
+        // catch-up allowance and never wait for this warmer's cache mutex.
+        std::string warm_error;
+        if (!WarmDrivechainParentState(&warm_error)) {
+            LogPrintf("Failed to warm authenticated drivechain parent state; locked validation remains fail-closed (%s)\n",
+                      warm_error);
+        } else {
+            const uint64_t replay_epoch =
+                GetDrivechainParentReplayEpoch();
+            if (!chainman.ActiveChainstate()
+                     .IsDrivechainMempoolCurrentForMining()) {
+                std::string mempool_error;
+                if (!chainman.ActiveChainstate()
+                         .RevalidateDrivechainMempoolForParentEpoch(
+                             replay_epoch, &mempool_error)) {
+                    LogPrintf(
+                        "Native drivechain peg-ins remain fenced from mining while mempool revalidation waits: %s\n",
+                        mempool_error);
+                }
+            }
+        }
+    }
+
+    BlockValidationState state;
+    if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
+        LogPrintf("Failed to periodically %s (%s)\n",
+                  native_drivechain ? "reconcile drivechain anchors" : "activate best chain",
+                  state.ToString());
+    }
+}
+
 static const bool DEFAULT_PROXYRANDOMIZE = true;
 static const bool DEFAULT_REST_ENABLE = false;
 
@@ -450,11 +821,7 @@ static const char* DEFAULT_ASMAP_FILENAME="ip_asn.map";
 /**
  * The PID file facilities.
  */
-#ifdef LIQUID
-const char * const BITCOIN_PID_FILENAME = "liquid.pid";
-#else
 const char * const BITCOIN_PID_FILENAME = "elementsd.pid";
-#endif
 
 static fs::path GetPidFile(const ArgsManager& args)
 {
@@ -706,15 +1073,7 @@ void SetupServerArgs(ArgsManager& argsman)
     init::AddLoggingArgs(argsman);
 
     const auto defaultBaseParams = CreateBaseChainParams(CBaseChainParams::DEFAULT);
-    const auto mainnetBaseParams = CreateBaseChainParams(CBaseChainParams::MAIN);
-    const auto testnetBaseParams = CreateBaseChainParams(CBaseChainParams::TESTNET);
-    const auto signetBaseParams = CreateBaseChainParams(CBaseChainParams::SIGNET);
-    const auto regtestBaseParams = CreateBaseChainParams(CBaseChainParams::REGTEST);
     const auto defaultChainParams = CreateChainParams(argsman, CBaseChainParams::DEFAULT);
-    const auto mainnetChainParams = CreateChainParams(argsman, CBaseChainParams::MAIN);
-    const auto testnetChainParams = CreateChainParams(argsman, CBaseChainParams::TESTNET);
-    const auto signetChainParams = CreateChainParams(argsman, CBaseChainParams::SIGNET);
-    const auto regtestChainParams = CreateChainParams(argsman, CBaseChainParams::REGTEST);
 
     // Hidden Options
     std::vector<std::string> hidden_args = {
@@ -726,7 +1085,7 @@ void SetupServerArgs(ArgsManager& argsman)
 #if HAVE_SYSTEM
     argsman.AddArg("-alertnotify=<cmd>", "Execute command when an alert is raised (%s in cmd is replaced by message)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
-    argsman.AddArg("-assumevalid=<hex>", strprintf("If this block is in the chain assume that it and its ancestors are valid and potentially skip their script verification (0 to verify all, default: %s, testnet: %s, signet: %s)", defaultChainParams->GetConsensus().defaultAssumeValid.GetHex(), testnetChainParams->GetConsensus().defaultAssumeValid.GetHex(), signetChainParams->GetConsensus().defaultAssumeValid.GetHex()), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-assumevalid=<hex>", strprintf("If this block is in the chain assume that it and its ancestors are valid and potentially skip their script verification (0 to verify all, Elements default: %s)", defaultChainParams->GetConsensus().defaultAssumeValid.GetHex()), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksdir=<dir>", "Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for testing purposes", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
 #if HAVE_SYSTEM
@@ -746,7 +1105,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-mnemonic-seed-phrase-path=<path>", "Accepted for BitWindow seed-aware sidechain launcher compatibility. Elements manages its wallet through the wallet directory, so this option is a no-op.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-maxorphantx=<n>", strprintf("Keep at most <n> unconnectable transactions in memory (default: %u)", DEFAULT_MAX_ORPHAN_TRANSACTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-mempoolexpiry=<n>", strprintf("Do not keep transactions in the mempool longer than <n> hours (default: %u)", DEFAULT_MEMPOOL_EXPIRY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-minimumchainwork=<hex>", strprintf("Minimum work assumed to exist on a valid chain in hex (default: %s, testnet: %s, signet: %s)", defaultChainParams->GetConsensus().nMinimumChainWork.GetHex(), testnetChainParams->GetConsensus().nMinimumChainWork.GetHex(), signetChainParams->GetConsensus().nMinimumChainWork.GetHex()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-minimumchainwork=<hex>", strprintf("Minimum work assumed to exist on the Elements chain in hex (default: %s)", defaultChainParams->GetConsensus().nMinimumChainWork.GetHex()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-par=<n>", strprintf("Set the number of script verification threads (%u to %d, 0 = auto, <0 = leave that many cores free, default: %d)",
         -GetNumCores(), MAX_SCRIPTCHECK_THREADS, DEFAULT_SCRIPTCHECK_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-persistmempool", strprintf("Whether to save the mempool on shutdown and load on restart (default: %u)", DEFAULT_PERSIST_MEMPOOL), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -775,7 +1134,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-addnode=<ip>", strprintf("Add a node to connect to and attempt to keep the connection open (see the addnode RPC help for more info). This option can be specified multiple times to add multiple nodes; connections are limited to %u at a time and are counted separately from the -maxconnections limit.", MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers (default: %s). Relative paths will be prefixed by the net-specific datadir location.", DEFAULT_ASMAP_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion)", defaultBaseParams->OnionServiceTargetPort(), testnetBaseParams->OnionServiceTargetPort(), signetBaseParams->OnionServiceTargetPort(), regtestBaseParams->OnionServiceTargetPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (Elements default: 127.0.0.1:%u=onion)", defaultBaseParams->OnionServiceTargetPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-cjdnsreachable", "If set then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -800,7 +1159,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-permitbaremultisig", strprintf("Relay non-P2SH multisig (default: %u)", DEFAULT_PERMIT_BAREMULTISIG), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     // TODO: remove the sentence "Nodes not using ... incoming connections." once the changes from
     // https://github.com/bitcoin/bitcoin/pull/23542 have become widespread.
-    argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port>. Nodes not using the default ports (default: %u, testnet: %u, signet: %u, regtest: %u) are unlikely to get incoming connections. Not relevant for I2P (see doc/i2p.md).", defaultChainParams->GetDefaultPort(), testnetChainParams->GetDefaultPort(), signetChainParams->GetDefaultPort(), regtestChainParams->GetDefaultPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port>. Nodes not using the Elements default port (%u) are unlikely to get incoming connections. Not relevant for I2P (see doc/i2p.md).", defaultChainParams->GetDefaultPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-proxy=<ip:port>", "Connect through SOCKS5 proxy, set -noproxy to disable (default: disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-proxyrandomize", strprintf("Randomize credentials for every proxy connection. This enables Tor stream isolation (default: %u)", DEFAULT_PROXYRANDOMIZE), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-seednode=<ip>", "Connect to a node to retrieve peer addresses, and disconnect. This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -859,9 +1218,9 @@ void SetupServerArgs(ArgsManager& argsman)
 
     argsman.AddArg("-checkblocks=<n>", strprintf("How many blocks to check at startup (default: %u, 0 = all)", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checklevel=<n>", strprintf("How thorough the block verification of -checkblocks is: %s (0-4, default: %u)", Join(CHECKLEVEL_DOC, ", "), DEFAULT_CHECKLEVEL), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures occasionally. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-checkblockindex", strprintf("Do a consistency check for the block tree, chainstate, and other validation data structures occasionally. (Elements default: %u)", defaultChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkaddrman=<n>", strprintf("Run addrman consistency checks every <n> operations. Use 0 to disable. (default: %u)", DEFAULT_ADDRMAN_CONSISTENCY_CHECKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (default: %u, regtest: %u)", defaultChainParams->DefaultConsistencyChecks(), regtestChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-checkmempool=<n>", strprintf("Run mempool consistency checks every <n> transactions. Use 0 to disable. (Elements default: %u)", defaultChainParams->DefaultConsistencyChecks()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-checkpoints", strprintf("Enable rejection of any forks from the known historical chain until block %s (default: %u)", defaultChainParams->Checkpoints().GetHeight(), DEFAULT_CHECKPOINTS_ENABLED), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-deprecatedrpc=<method>", "Allows deprecated RPC method(s) to be used", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-stopafterblockimport", strprintf("Stop running after importing blocks from disk (default: %u)", DEFAULT_STOPAFTERBLOCKIMPORT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -880,7 +1239,7 @@ void SetupServerArgs(ArgsManager& argsman)
 
     SetupChainParamsBaseOptions(argsman);
 
-    argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (%sdefault: %u)", "testnet/regtest only; ", !testnetChainParams->RequireStandard()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (Elements default: %u)", !defaultChainParams->RequireStandard()), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-incrementalrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define cost of relay, used for mempool limiting and BIP 125 replacement. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_INCREMENTAL_RELAY_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-dustrelayfee=<amt>", strprintf("Fee rate (in %s/kvB) used to define dust, the value of an output such that it will cost more than its value in fees at this fee rate to spend it. (default: %s)", CURRENCY_UNIT, FormatMoney(DUST_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-bytespersigop", strprintf("Equivalent bytes per sigop in transactions for relay and mining (default: %u)", DEFAULT_BYTES_PER_SIGOP), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
@@ -903,7 +1262,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-rpcbind=<addr>[:port]", "Bind to given address to listen for JSON-RPC connections. Do not expose the RPC server to untrusted networks such as the public internet! This option is ignored unless -rpcallowip is also passed. Port is optional and overrides -rpcport. Use [host]:port notation for IPv6. This option can be specified multiple times (default: 127.0.0.1 and ::1 i.e., localhost)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY | ArgsManager::SENSITIVE, OptionsCategory::RPC);
     argsman.AddArg("-rpccookiefile=<loc>", "Location of the auth cookie. Relative paths will be prefixed by a net-specific datadir location. (default: data dir)", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcpassword=<pw>", "Password for JSON-RPC connections", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::RPC);
-    argsman.AddArg("-rpcport=<port>", strprintf("Listen for JSON-RPC connections on <port> (default: %u, testnet: %u, signet: %u, regtest: %u)", defaultBaseParams->RPCPort(), testnetBaseParams->RPCPort(), signetBaseParams->RPCPort(), regtestBaseParams->RPCPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::RPC);
+    argsman.AddArg("-rpcport=<port>", strprintf("Listen for JSON-RPC connections on <port> (Elements default: %u)", defaultBaseParams->RPCPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::RPC);
     argsman.AddArg("-rpcserialversion", strprintf("Sets the serialization of raw transaction or block hex returned in non-verbose mode, non-segwit(0) or segwit(1) (default: %d)", DEFAULT_RPC_SERIALIZE_VERSION), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcservertimeout=<n>", strprintf("Timeout during HTTP requests (default: %d)", DEFAULT_HTTP_SERVER_TIMEOUT), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::RPC);
     argsman.AddArg("-rpcthreads=<n>", strprintf("Set the number of threads to service RPC calls (default: %d)", DEFAULT_HTTP_THREADS), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
@@ -944,18 +1303,19 @@ void SetupServerArgs(ArgsManager& argsman)
     std::vector<std::string> elements_hidden_args = {"-con_fpowallowmindifficultyblocks", "-con_fpownoretargeting", "-con_nsubsidyhalvinginterval", "-con_bip16exception", "-con_bip34height", "-con_bip65height", "-con_bip66height", "-con_npowtargettimespan", "-con_npowtargetspacing", "-con_nrulechangeactivationthreshold", "-con_nminerconfirmationwindow", "-con_powlimit", "-con_bip34hash", "-con_nminimumchainwork", "-con_defaultassumevalid", "-npruneafterheight", "-fdefaultconsistencychecks", "-fmineblocksondemand", "-fallback_fee_enabled", "-pchmessagestart"};
 
     argsman.AddArg("-initialfreecoins", strprintf("The amount of OP_TRUE coins created in the genesis block. Primarily for testing. (default: %d)", 0), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-validatepegin", "Validate peg-in claims. An RPC connection will be attempted to the trusted mainchain daemon using the `mainchain*` settings below. All functionaries must run this enabled. (default: 1 if chain has federated peg)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpchost=<host>", "The address which the daemon will try to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpcport=<n>", strprintf("The port which the daemon will try to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: %u)", defaultBaseParams->MainchainRPCPort()), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpcuser=<user>", "The rpc username that the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpcpassword=<pwd>", "The rpc password which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpccookiefile=<file>", "The bitcoind cookie auth path which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins. (default: `<datadir>/regtest/.cookie`)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. (default: %d)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-validatepegin", "Validate legacy peg-in claims through a fully validating mainchain node. Native drivechain deposits and BMM anchors always require their authenticated mainchain checks regardless of this setting. (default: 1 if chain has a parent)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpchost=<host>", "Address of the operator's fully validating mainchain node. Native drivechain consensus must not use a third-party RPC service. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpcport=<n>", strprintf("RPC port of the fully validating mainchain node. (default: %u)", defaultBaseParams->MainchainRPCPort()), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpcuser=<user>", "RPC username for the fully validating mainchain node. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpcpassword=<pwd>", "RPC password for the fully validating mainchain node. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpccookiefile=<file>", "The Bitcoin Signet cookie auth path used to connect to the fully validating parent node. Relative paths are resolved under Bitcoin's data directory. (Elements default: signet/.cookie)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. Native drivechain validation requires 1..2 seconds because these requests may run on consensus paths. (ordinary-network default: %d; drivechain default: 2)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used for mined BMM commitment enforcement. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used for BIP301 requests and mined commitment verification. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used for BIP301 requests and mined commitment verification. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the funded local enforcer wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used only to submit BIP301 requests; enforcer responses are not consensus evidence. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used only for BIP301 request submission. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-peginconfirmationdepth=<n>", strprintf("Peg-in claims must be this deep to be considered valid. (default: %d)", DEFAULT_PEGIN_CONFIRMATION_DEPTH), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-parentpubkeyprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 pubkey address. (default: %d)", 111), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-parentscriptprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 script address. (default: %d)", 196), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
@@ -1137,6 +1497,22 @@ std::set<BlockFilterType> g_enabled_filter_types;
 bool AppInitBasicSetup(const ArgsManager& args)
 {
     // ********************************************************* Step 1: setup
+    // Fail before shutdown setup, sockets, or the data-directory lock. Other
+    // parameter sets remain available to unit tests, but are never production
+    // startup identities for this binary.
+#ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
+    if (args.GetChainName() != CBaseChainParams::ELEMENTS) {
+        return InitError(Untranslated(
+            "This binary only supports the canonical -chain=elements production network"));
+    }
+    std::string identity_error;
+    if (!IsCanonicalElementsProductionIdentity(
+            Params(), BaseParams(), &identity_error)) {
+        return InitError(strprintf(Untranslated(
+            "Refusing to start with a noncanonical Elements production identity: %s"),
+            identity_error));
+    }
+#endif
 #ifdef _MSC_VER
     // Turn off Microsoft heap dump noise
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -1179,7 +1555,33 @@ bool AppInitBasicSetup(const ArgsManager& args)
     return true;
 }
 
-bool AppInitParameterInteraction(const ArgsManager& args)
+bool IsMainchainRPCHostAllowed(const std::string& host,
+                               const bool native_drivechain)
+{
+    if (!native_drivechain) return true;
+    CNetAddr numeric_address;
+    if (!LookupHost(host, numeric_address, /*fAllowLookup=*/false)) return false;
+
+    // Consensus authentication uses HTTP Basic credentials. Until the parent
+    // connection supports an authenticated local transport (for example a
+    // Unix-domain socket), do not permit even numeric LAN addresses: a network
+    // attacker could substitute a fork view while learning the credentials.
+    if (numeric_address.IsIPv4()) {
+        // GetAddrBytes() uses the 16-byte addr-v1 serialization for IPv4, so
+        // inspect the canonical 32-bit IPv4 value instead of its wire form.
+        return (numeric_address.GetLinkedIPv4() >> 24) == 127;
+    }
+    if (numeric_address.IsIPv6()) {
+        const std::vector<unsigned char> bytes = numeric_address.GetAddrBytes();
+        static constexpr std::array<unsigned char, ADDR_IPV6_SIZE> IPV6_LOOPBACK{
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        return bytes.size() == IPV6_LOOPBACK.size() &&
+               std::equal(bytes.begin(), bytes.end(), IPV6_LOOPBACK.begin());
+    }
+    return false;
+}
+
+bool AppInitParameterInteraction(ArgsManager& args)
 {
     const CChainParams& chainparams = Params();
     // ********************************************************* Step 2: parameter interactions
@@ -1192,6 +1594,67 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     std::string network = args.GetChainName();
     if (network == CBaseChainParams::SIGNET) {
         LogPrintf("Signet derived magic (message start): %s\n", HexStr(chainparams.MessageStart()));
+    }
+    const auto& drivechain_slot = chainparams.GetConsensus().drivechain_slot;
+    if (drivechain_slot.has_value()) {
+        if (args.GetIntArg("-drivechainbmmslot", *drivechain_slot) != *drivechain_slot) {
+            return InitError(strprintf(Untranslated("-drivechainbmmslot is immutable for this chain and must be %d"),
+                                       *drivechain_slot));
+        }
+        CAmount configured_bid{0};
+        CAmount selected_bid{0};
+        std::string bid_error;
+        if (!GetConfiguredDrivechainBmmBid(
+                args, configured_bid, &bid_error) ||
+            !ComputeDrivechainBmmBid(
+                configured_bid,
+                /*sidechain_fees=*/0, selected_bid, &bid_error)) {
+            return InitError(Untranslated(strprintf(
+                "Invalid -drivechainbmmbid: %s", bid_error)));
+        }
+
+        // Parent-chain validity checks are synchronous and some callers hold
+        // cs_main (and, during activation/mempool work, the mempool lock).
+        // A stalled local RPC must fail closed quickly instead of freezing all
+        // sidechain consensus and networking work for the ordinary 15-minute
+        // client default. Multiple authenticated reads can occur per proof, so
+        // keep the per-request bound deliberately small.
+        static constexpr int MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT{2};
+        const int parent_rpc_timeout = args.GetIntArg(
+            "-mainchainrpctimeout", MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT);
+        if (parent_rpc_timeout < 1 || parent_rpc_timeout > MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT) {
+            return InitError(strprintf(
+                Untranslated("-mainchainrpctimeout must be between 1 and %d seconds on a native drivechain network"),
+                MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT));
+        }
+        // Materialize the drivechain-specific default because the low-level
+        // RPC client otherwise falls back to its ordinary-network default.
+        args.ForceSetArg("-mainchainrpctimeout", ToString(parent_rpc_timeout));
+
+        // libevent's connection timeout starts after its synchronous hostname
+        // lookup. Consensus paths may hold cs_main while contacting the
+        // operator's parent node, so accepting a DNS name would leave that
+        // lookup outside the hard validation deadline. Require a numeric
+        // loopback address. HTTP Basic authentication over a LAN is not an
+        // authenticated consensus transport and is therefore forbidden.
+        const std::string parent_rpc_host =
+            args.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT);
+        if (!IsMainchainRPCHostAllowed(parent_rpc_host,
+                                       /*native_drivechain=*/true)) {
+            return InitError(Untranslated(
+                "-mainchainrpchost must be an IPv4 127/8 or IPv6 ::1 loopback address on a native drivechain network"));
+        }
+    } else {
+        if (args.IsArgSet("-drivechainbmmslot")) {
+            return InitError(Untranslated("-drivechainbmmslot may only be used on a native drivechain network"));
+        }
+        if (args.IsArgSet("-drivechainbmmbid")) {
+            return InitError(Untranslated("-drivechainbmmbid may only be used on a native drivechain network"));
+        }
+    }
+    if (network == CBaseChainParams::SIGNET && args.IsArgSet("-parentgenesisblockhash") &&
+        args.GetArg("-parentgenesisblockhash", "") != chainparams.ParentGenesisBlockHash().GetHex()) {
+        return InitError(Untranslated("-parentgenesisblockhash cannot override the Signet chainparams identity"));
     }
     bilingual_str errors;
     for (const auto& arg : args.GetUnsuitableSectionOnlyArgs()) {
@@ -1549,7 +2012,7 @@ bool MainchainRPCCheck()
                 return false;
             }
             result = reply["result"];
-            const std::string expected_parent_genesis = gArgs.GetArg("-parentgenesisblockhash", Params().ParentGenesisBlockHash().GetHex());
+            const std::string expected_parent_genesis = Params().ParentGenesisBlockHash().GetHex();
             if (!result.isStr() || result.get_str() != expected_parent_genesis) {
                 LogPrintf("ERROR: Invalid parent genesis block hash response via RPC. Contacting wrong parent daemon? got=%s expected=%s\n",
                     result.isStr() ? result.get_str() : result.write(),
@@ -2270,6 +2733,53 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     connOptions.m_i2p_accept_incoming = args.GetBoolArg("-i2pacceptincoming", true);
 
+    const bool native_drivechain =
+        chainparams.GetConsensus().drivechain_slot.has_value();
+    if (native_drivechain) {
+        // Native BIP300/BIP301 validity is mandatory even when legacy
+        // -validatepegin is disabled. Authenticate the parent replay cache and
+        // reconcile persisted anchors before P2P can deliver work and before
+        // RPC warmup exposes a child-chain tip to callers.
+        uiInterface.InitMessage(
+            _("Authenticating drivechain parent state").translated);
+        std::string warm_error;
+        if (!WarmDrivechainParentState(&warm_error)) {
+            return InitError(Untranslated(strprintf(
+                "ERROR: cannot authenticate the configured drivechain parent state: %s",
+                warm_error)));
+        }
+
+        const uint64_t replay_epoch = GetDrivechainParentReplayEpoch();
+        if (replay_epoch == 0) {
+            return InitError(Untranslated(
+                "ERROR: authenticated drivechain parent replay did not publish a generation"));
+        }
+        std::string mempool_error;
+        if (!chainman.ActiveChainstate()
+                 .RevalidateDrivechainMempoolForParentEpoch(
+                     replay_epoch, &mempool_error)) {
+            // Preserve potentially valid entries on temporary parent
+            // unavailability. Their mismatched epoch prevents every block
+            // template from selecting them until a later successful sweep.
+            LogPrintf(
+                "Native drivechain peg-ins remain fenced from mining after startup mempool revalidation: %s\n",
+                mempool_error);
+        }
+
+        BlockValidationState activation_state;
+        if (!chainman.ActiveChainstate().ReconcileDrivechainAnchorsForStartup(
+                activation_state)) {
+            return InitError(Untranslated(strprintf(
+                "ERROR: cannot reconcile the child chain with the authenticated parent state: %s",
+                activation_state.ToString())));
+        }
+        if (!chainman.ActiveChainstate().ActivateBestChain(activation_state)) {
+            return InitError(Untranslated(strprintf(
+                "ERROR: cannot activate the child chain after parent-state reconciliation: %s",
+                activation_state.ToString())));
+        }
+    }
+
     if (!node.connman->Start(*node.scheduler, connOptions)) {
         return false;
     }
@@ -2330,19 +2840,19 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     // Call ActivateBestChain every 30 seconds. This is almost always a
-    // harmless no-op. It is necessary in the unusual case where:
+    // harmless no-op. On a native drivechain it also guarantees that an L1
+    // reorg triggers anchor reconciliation even if automatic BMM mining is
+    // disabled and no unrelated child-chain traffic arrives. It is otherwise
+    // necessary in the unusual case where:
     // (1) Our connection to bitcoind is lost, and
     // (2) we build up a queue of blocks to validate in the meantime, and then
     // (3) our connection to bitcoind is restored, but
     // (4) nothing after that causes ActivateBestChain to be called, including
     //     no further blocks arriving for us to validate.
     // Unfortunately, this unusual case happens in the functional test suite.
-    ChainstateManager *pchainman = node.chainman.get();
-    node.reverification_scheduler->scheduleEvery([pchainman]{
-        BlockValidationState state;
-        if (!pchainman->ActiveChainstate().ActivateBestChain(state)) {
-            LogPrintf("Failed to periodically activate best chain (%s)\n", state.ToString());
-        }
+    ChainstateManager* pchainman = node.chainman.get();
+    node.reverification_scheduler->scheduleEvery([pchainman, native_drivechain] {
+        PeriodicChainstateReverification(*pchainman, native_drivechain);
     }, std::chrono::seconds{30});
 
     uiInterface.InitMessage(_("Done loading").translated);
@@ -2356,11 +2866,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         banman->DumpBanlist();
     }, DUMP_BANS_INTERVAL);
 
-    if (args.GetBoolArg("-drivechainl1blocksync", true)) {
+    if (Params().GetConsensus().drivechain_slot.has_value() &&
+        args.GetBoolArg("-drivechainl1blocksync", true)) {
         const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
         LogPrintf("Starting drivechain L1 block sync thread, interval %d seconds, mined BIP301 BMM enforcement, sidechain slot %d\n",
             interval_seconds,
-            args.GetIntArg("-drivechainbmmslot", 24));
+            *Params().GetConsensus().drivechain_slot);
         StartDrivechainL1BlockSyncThread(node, interval_seconds);
     }
 

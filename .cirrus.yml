@@ -158,7 +158,7 @@ win64_native_common: &win64_native_common
   build_script:
     - cd %CIRRUS_WORKING_DIR%
     - python build_msvc\msvc-autogen.py
-    - msbuild build_msvc\bitcoin.sln -property:Configuration=Release -maxCpuCount -verbosity:minimal -noLogo
+    - msbuild build_msvc\elements.sln -property:Configuration=Release -maxCpuCount -verbosity:minimal -noLogo
 
 task:
   name: "Win64 native [msvc] (Short running functional tests)"

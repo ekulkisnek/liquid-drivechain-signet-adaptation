@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+if __name__ == "__main__":
+    import sys as _quarantine_sys
+    _quarantine_sys.stderr.write(
+        "ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only "
+        "Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.\n"
+    )
+    raise SystemExit(64)
+
 """
 liquid_id5_side_stub.py — Minimal Python sidechain participant stub for Liquid/Elements ID 5.
 

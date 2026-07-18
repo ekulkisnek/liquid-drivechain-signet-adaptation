@@ -1,5 +1,11 @@
 # Simplicity + BMM Integration Research and Test Plan
 
+> **QUARANTINED HISTORICAL TEST PLAN.** The ID5/regtest harness described here
+> is incompatible with this fork and its entrypoints are disabled. The only
+> supported network is **Elements Drivechain**, `-chain=elements`, BIP300 slot
+> **24**. See the [canonical README](../../README.md). The research notes below
+> are retained for auditability, not as current operating instructions.
+
 **Date**: 2026 (current session)  
 **Workspace**: /Volumes/T705/code/liquid-signet-sidechain (Elements/Liquid fork with Simplicity + drivechain BMM support for ID5 sidechain)  
 **Goal**: Determine if Simplicity scripts (Tapscript leaf version 0xbe) can be executed inside BMM-driven transactions/blocks on the Liquid sidechain.

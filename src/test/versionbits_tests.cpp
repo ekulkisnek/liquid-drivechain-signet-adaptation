@@ -417,7 +417,12 @@ BOOST_AUTO_TEST_CASE(versionbits_computeblockversion)
     // check that any deployment on any chain can conceivably reach both
     // ACTIVE and FAILED states in roughly the way we expect
     for (const auto& chain_name : {CBaseChainParams::MAIN, CBaseChainParams::TESTNET, CBaseChainParams::SIGNET, CBaseChainParams::REGTEST}) {
-        const auto chainParams = CreateChainParams(*m_node.args, chain_name);
+        ArgsManager bitcoin_regtest_args;
+        bitcoin_regtest_args.ForceSetArg("-con_elementsmode", "0");
+        const ArgsManager& chain_args = chain_name == CBaseChainParams::REGTEST
+            ? bitcoin_regtest_args
+            : *m_node.args;
+        const auto chainParams = CreateChainParams(chain_args, chain_name);
         uint32_t chain_all_vbits{0};
         for (int i = 0; i < (int)Consensus::MAX_VERSION_BITS_DEPLOYMENTS; ++i) {
             const auto dep = static_cast<Consensus::DeploymentPos>(i);
@@ -437,6 +442,7 @@ BOOST_AUTO_TEST_CASE(versionbits_computeblockversion)
         // Use regtest/testdummy to ensure we always exercise some
         // deployment that's not always/never active
         ArgsManager args;
+        args.ForceSetArg("-con_elementsmode", "0");
         args.ForceSetArg("-vbparams", "testdummy:1199145601:1230767999"); // January 1, 2008 - December 31, 2008
         const auto chainParams = CreateChainParams(args, CBaseChainParams::REGTEST);
         check_computeblockversion(chainParams->GetConsensus(), Consensus::DEPLOYMENT_TESTDUMMY);
@@ -447,6 +453,7 @@ BOOST_AUTO_TEST_CASE(versionbits_computeblockversion)
         // min_activation_height test, even if we're not using that in a
         // live deployment
         ArgsManager args;
+        args.ForceSetArg("-con_elementsmode", "0");
         args.ForceSetArg("-vbparams", "testdummy:1199145601:1230767999:403200"); // January 1, 2008 - December 31, 2008, min act height 403200
         const auto chainParams = CreateChainParams(args, CBaseChainParams::REGTEST);
         check_computeblockversion(chainParams->GetConsensus(), Consensus::DEPLOYMENT_TESTDUMMY);

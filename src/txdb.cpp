@@ -25,6 +25,7 @@ static constexpr uint8_t DB_COIN{'C'};
 static constexpr uint8_t DB_COINS{'c'};
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
 static constexpr uint8_t DB_BLOCK_INDEX{'b'};
+static constexpr uint8_t DB_DRIVECHAIN_ANCHOR{'D'};
 
 static constexpr uint8_t DB_BEST_BLOCK{'B'};
 static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
@@ -305,6 +306,13 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
     batch.Write(DB_LAST_BLOCK, nLastFile);
     for (std::vector<const CBlockIndex*>::const_iterator it=blockinfo.begin(); it != blockinfo.end(); it++) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, (*it)->GetBlockHash()), CDiskBlockIndex(*it));
+        const auto anchor_key = std::make_pair(DB_DRIVECHAIN_ANCHOR, (*it)->GetBlockHash());
+        if ((*it)->m_drivechain_anchor.has_value()) {
+            assert((*it)->m_drivechain_anchor->IsSane());
+            batch.Write(anchor_key, *(*it)->m_drivechain_anchor);
+        } else {
+            batch.Erase(anchor_key);
+        }
     }
     return WriteBatch(batch, true);
 }
@@ -359,12 +367,12 @@ const CBlockIndex *CBlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTr
     pindexNew->nUndoPos       = pindexTrimmed->nUndoPos;
     pindexNew->nVersion       = pindexTrimmed->nVersion;
     pindexNew->hashMerkleRoot = pindexTrimmed->hashMerkleRoot;
-    pindexNew->hashWithdrawalBundle = pindexTrimmed->hashWithdrawalBundle;
     pindexNew->nTime          = pindexTrimmed->nTime;
     pindexNew->nBits          = pindexTrimmed->nBits;
     pindexNew->nNonce         = pindexTrimmed->nNonce;
     pindexNew->nStatus        = pindexTrimmed->nStatus;
     pindexNew->nTx            = pindexTrimmed->nTx;
+    pindexNew->m_drivechain_anchor = pindexTrimmed->m_drivechain_anchor;
 
     pindexNew->proof               = tmp.proof;
     pindexNew->m_dynafed_params    = tmp.m_dynafed_params;
@@ -401,12 +409,19 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->nUndoPos       = diskindex.nUndoPos;
                 pindexNew->nVersion       = diskindex.nVersion;
                 pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-                pindexNew->hashWithdrawalBundle = diskindex.hashWithdrawalBundle;
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
+
+                DrivechainAnchor drivechain_anchor;
+                if (Read(std::make_pair(DB_DRIVECHAIN_ANCHOR, pindexNew->GetBlockHash()), drivechain_anchor)) {
+                    if (!drivechain_anchor.IsSane()) {
+                        return error("%s: malformed persisted drivechain anchor for %s", __func__, pindexNew->GetBlockHash().GetHex());
+                    }
+                    pindexNew->m_drivechain_anchor = drivechain_anchor;
+                }
 
                 pindexNew->proof               = diskindex.proof;
                 pindexNew->m_dynafed_params    = diskindex.m_dynafed_params;

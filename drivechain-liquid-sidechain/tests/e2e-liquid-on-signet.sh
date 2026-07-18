@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+printf '%s\n' 'ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.' >&2
+exit 64
+
 # e2e-liquid-on-signet.sh — Production E2E validation for Liquid/Elements as native drivechain sidechain ID 5.
 # Uses ONLY the live CUSF enforcer (WalletService + ValidatorService) — exactly the same native BIP300/301 mechanisms as plain-bitassets ID 4.
 # No federation, no multisig pegin, no shortcuts.
@@ -142,7 +145,17 @@ fi
 # --- Step 2: Deposit (native pegin via CreateDepositTransaction) ---
 echo ""
 echo "[E2E] === DEPOSIT (main -> liquid sidechain, native CUSF two-way peg) ==="
-TEST_ADDR="liquidtestdeposit_$(date +%s)"   # middle component; enforcer formats the sidechain deposit address
+ELEMENTS_CLI="$REPO_ROOT/src/elements-cli"
+ELEMENTS_DATADIR="${ELEMENTS_DATADIR:-/tmp/liquid-id5-regtest}"
+if [ -x "$ELEMENTS_CLI" ] && [ -f "$ELEMENTS_DATADIR/regtest/.cookie" ]; then
+  TEST_ADDR=$(
+    "$ELEMENTS_CLI" -regtest -datadir="$ELEMENTS_DATADIR" -rpcport=18443 \
+      -rpccookiefile="$ELEMENTS_DATADIR/regtest/.cookie" getnewaddress "" bech32
+  )
+else
+  TEST_ADDR="liquidtestdeposit_$(date +%s)"
+  echo "[E2E] No live Elements wallet; using a non-importable placeholder address for CUSF-only coverage."
+fi
 DEPOSIT_VALUE=100000   # 0.001 BTC in sats
 DEPOSIT_FEE=2000
 CUR_HEIGHT=$(get_mainchain_height)

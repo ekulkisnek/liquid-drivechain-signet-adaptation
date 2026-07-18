@@ -4,13 +4,43 @@
 
 #include <qt/test/uritests.h>
 
+#include <chainparams.h>
+#include <chainparamsbase.h>
+#include <qt/guiconstants.h>
 #include <qt/guiutil.h>
+#include <qt/networkstyle.h>
 #include <qt/walletmodel.h>
 
+#include <QScopedPointer>
 #include <QUrl>
 
 void URITests::uriTests()
 {
+    QCOMPARE(QString(QAPP_ORG_NAME), QString("Elements"));
+    QCOMPARE(QString(QAPP_ORG_DOMAIN), QString("elementsproject.org"));
+    QCOMPARE(QString(QAPP_APP_NAME_DEFAULT), QString("Elements"));
+    QCOMPARE(QString(QAPP_APP_NAME_ELEMENTS), QString("Elements"));
+
+    QScopedPointer<const NetworkStyle> elements_style{
+        NetworkStyle::instantiate(CBaseChainParams::ELEMENTS)};
+    QVERIFY(!elements_style.isNull());
+    QCOMPARE(elements_style->getAppName(), QString(QAPP_APP_NAME_ELEMENTS));
+    QCOMPARE(elements_style->getTitleAddText(), QString());
+
+    // The canonical production path must never emit or accept a Liquid URI.
+    SelectParams(CBaseChainParams::ELEMENTS);
+    g_con_elementsmode = true;
+    SendCoinsRecipient elements_info{"canonical-elements-address", "label", 1, "message"};
+    const QString elements_uri = GUIUtil::formatBitcoinURI(elements_info);
+    QCOMPARE(elements_uri.split(QString(":"))[0], QString("elements"));
+    SendCoinsRecipient elements_rcv;
+    QVERIFY(GUIUtil::parseBitcoinURI(elements_uri, &elements_rcv));
+    QVERIFY(!GUIUtil::parseBitcoinURI(
+        QString("liquidnetwork:canonical-elements-address"), &elements_rcv));
+
+    // Legacy codecs remain available only to the internal test context.
+    SelectParams(CBaseChainParams::REGTEST);
+
     // liquid URI tests
     g_con_elementsmode = true;
     SendCoinsRecipient info{"lq1qq0ha4ml3dsqexnkdssskvt203kl54xj5zxt9sfwgzpy7unf49aagslltf4k7pqjtwk4j8emny0k8vppj88k0z9pa4y0mwfzyu", "label", 100000000, "message"};

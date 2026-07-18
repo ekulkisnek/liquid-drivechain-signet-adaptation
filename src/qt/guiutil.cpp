@@ -14,6 +14,7 @@
 #include <base58.h>
 #include <assetsdir.h>
 #include <chainparams.h>
+#include <chainparamsbase.h>
 #include <fs.h>
 #include <interfaces/node.h>
 #include <key_io.h>
@@ -129,7 +130,11 @@ void setupAddressWidget(QValidatedLineEdit *widget, QWidget *parent)
     widget->setFont(fixedPitchFont());
     // We don't want translators to use own addresses in translations
     // and this is the only place, where this address is supplied.
-    widget->setPlaceholderText(QObject::tr("Enter a Liquid address (e.g. %1)").arg(
+    const char* placeholder =
+        Params().NetworkIDString() == CBaseChainParams::ELEMENTS
+            ? QT_TRANSLATE_NOOP("GUIUtil", "Enter an Elements address (e.g. %1)")
+            : QT_TRANSLATE_NOOP("GUIUtil", "Enter a Liquid address (e.g. %1)");
+    widget->setPlaceholderText(QCoreApplication::translate("GUIUtil", placeholder).arg(
         QString::fromStdString(DummyAddress(Params()))));
     widget->setValidator(new BitcoinAddressEntryValidator(parent));
     widget->setCheckValidator(new BitcoinAddressCheckValidator(parent));
@@ -143,9 +148,13 @@ void AddButtonShortcut(QAbstractButton* button, const QKeySequence& shortcut)
 bool parseBitcoinURI(const QUrl &uri, SendCoinsRecipient *out)
 {
     // return if URI is not valid or incorrect scheme
-    bool valid_liquid = g_con_elementsmode && (uri.scheme() == QString("liquidnetwork") || uri.scheme() == QString("liquidtestnet"));
+    const bool canonical_elements =
+        Params().NetworkIDString() == CBaseChainParams::ELEMENTS;
+    bool valid_elements = g_con_elementsmode && canonical_elements && uri.scheme() == QString("elements");
+    bool valid_liquid = g_con_elementsmode && !canonical_elements &&
+        (uri.scheme() == QString("liquidnetwork") || uri.scheme() == QString("liquidtestnet"));
     bool valid_bitcoin = !g_con_elementsmode && (uri.scheme() == QString("bitcoin"));
-    if (!uri.isValid() || !(valid_liquid || valid_bitcoin))
+    if (!uri.isValid() || !(valid_elements || valid_liquid || valid_bitcoin))
         return false;
 
     SendCoinsRecipient rv;
@@ -211,7 +220,11 @@ QString formatBitcoinURI(const SendCoinsRecipient &info)
 
     QString network = QString("bitcoin:%1");
     if (g_con_elementsmode) {
-        network = Params().NetworkIDString() == "liquidtestnet" ? QString("liquidtestnet:%1") : QString("liquidnetwork:%1");
+        if (Params().NetworkIDString() == CBaseChainParams::ELEMENTS) {
+            network = QString("elements:%1");
+        } else {
+            network = Params().NetworkIDString() == "liquidtestnet" ? QString("liquidtestnet:%1") : QString("liquidnetwork:%1");
+        }
     }
     QString ret = network.arg(bech_32 ? info.address.toUpper() : info.address);
     int paramCount = 0;
@@ -512,6 +525,8 @@ bool LabelOutOfFocusEventFilter::eventFilter(QObject* watched, QEvent* event)
 fs::path static StartupShortcutPath()
 {
     std::string chain = gArgs.GetChainName();
+    if (chain == CBaseChainParams::ELEMENTS)
+        return GetSpecialFolderPath(CSIDL_STARTUP) / "Elements.lnk";
     if (chain == CBaseChainParams::MAIN)
         return GetSpecialFolderPath(CSIDL_STARTUP) / "Bitcoin.lnk";
     if (chain == CBaseChainParams::LIQUID1)
@@ -597,6 +612,8 @@ fs::path static GetAutostartDir()
 fs::path static GetAutostartFilePath()
 {
     std::string chain = gArgs.GetChainName();
+    if (chain == CBaseChainParams::ELEMENTS)
+        return GetAutostartDir() / "elements.desktop";
     if (chain == CBaseChainParams::MAIN)
         return GetAutostartDir() / "bitcoin.desktop";
     if (chain == CBaseChainParams::LIQUID1)
@@ -641,10 +658,12 @@ bool SetStartOnSystemStartup(bool fAutoStart)
         if (!optionFile.good())
             return false;
         std::string chain = gArgs.GetChainName();
-        // Write a bitcoin.desktop file to the autostart directory:
+        // Write one chain-specific desktop entry to the autostart directory.
         optionFile << "[Desktop Entry]\n";
         optionFile << "Type=Application\n";
-        if (chain == CBaseChainParams::MAIN)
+        if (chain == CBaseChainParams::ELEMENTS)
+            optionFile << "Name=Elements\n";
+        else if (chain == CBaseChainParams::MAIN)
             optionFile << "Name=Bitcoin\n";
         else if (chain == CBaseChainParams::LIQUID1)
             optionFile << "Name=Liquid\n";

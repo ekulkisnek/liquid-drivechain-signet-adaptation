@@ -24,7 +24,6 @@ BITCOIN_GUI_NAME=elements-qt
 BITCOIN_CLI_NAME=elements-cli
 BITCOIN_TX_NAME=elements-tx
 BITCOIN_UTIL_NAME=elements-util
-BITCOIN_CHAINSTATE_NAME=elements-chainstate
 BITCOIN_WALLET_TOOL_NAME=elements-wallet
 dnl Multi Process
 BITCOIN_MP_NODE_NAME=elements-node
@@ -263,17 +262,15 @@ AC_ARG_ENABLE([asm],
 
 AC_ARG_ENABLE([liquid],
   [AS_HELP_STRING([--enable-liquid],
-  [Enable build that defaults to -chain=liquidv1])],
-  [liquid_build=yes],
-  [liquid_build=no])
+  [removed: legacy Liquid config/datadir/pid namespaces are incompatible with the canonical Elements network])],
+  [if test "$enableval" != "no"; then
+     AC_MSG_ERROR([--enable-liquid is unsupported; use the canonical Elements filenames and elements-v1 network directory])
+   fi])
 
 if test "$use_asm" = "yes"; then
   AC_DEFINE([USE_ASM], [1], [Define this symbol to build in assembly routines])
 fi
 
-if test "$liquid_build" = "yes"; then
-  AC_DEFINE(LIQUID, 1, [Define this symbol for Liquid builds])
-fi
 AC_ARG_ENABLE([zmq],
   [AS_HELP_STRING([--disable-zmq],
   [disable ZMQ notifications])],
@@ -294,8 +291,11 @@ AC_ARG_WITH([mpgen],
 
 AC_ARG_ENABLE([multiprocess],
   [AS_HELP_STRING([--enable-multiprocess],
-  [build multiprocess bitcoin-node, bitcoin-wallet, and bitcoin-gui executables in addition to monolithic bitcoind and bitcoin-qt executables. Requires libmultiprocess library. Experimental (default is no)])],
-  [enable_multiprocess=$enableval],
+  [unsupported in the single-network Elements production build; IPC startup has not been separately audited])],
+  [if test "$enableval" != "no"; then
+     AC_MSG_ERROR([--enable-multiprocess is unsupported in the single-network Elements production build])
+   fi
+   enable_multiprocess=no],
   [enable_multiprocess=no])
 
 AC_ARG_ENABLE(man,
@@ -657,7 +657,7 @@ AC_ARG_ENABLE([util-util],
 
 AC_ARG_ENABLE([experimental-util-chainstate],
   [AS_HELP_STRING([--enable-experimental-util-chainstate],
-  [build experimental bitcoin-chainstate executable (default=no)])],
+  [build non-installed, test-only bitcoin-chainstate executable (default=no)])],
   [build_bitcoin_chainstate=$enableval],
   [build_bitcoin_chainstate=no])
 
@@ -1632,7 +1632,7 @@ AC_MSG_CHECKING([whether to build bitcoin-util])
 AM_CONDITIONAL([BUILD_BITCOIN_UTIL], [test $build_bitcoin_util = "yes"])
 AC_MSG_RESULT($build_bitcoin_util)
 
-AC_MSG_CHECKING([whether to build experimental bitcoin-chainstate])
+AC_MSG_CHECKING([whether to build non-installed test-only bitcoin-chainstate])
 AM_CONDITIONAL([BUILD_BITCOIN_CHAINSTATE], [test $build_bitcoin_chainstate = "yes"])
 AC_MSG_RESULT($build_bitcoin_chainstate)
 
@@ -1828,8 +1828,6 @@ AM_CONDITIONAL([USE_ASM], [test "$use_asm" = "yes"])
 AM_CONDITIONAL([WORDS_BIGENDIAN], [test "$ac_cv_c_bigendian" = "yes"])
 AM_CONDITIONAL([USE_NATPMP], [test "$use_natpmp" = "yes"])
 AM_CONDITIONAL([USE_UPNP], [test "$use_upnp" = "yes"])
-AM_CONDITIONAL([LIQUID], [test "$liquid_build" = "yes"])
-
 dnl for minisketch
 AM_CONDITIONAL([ENABLE_CLMUL], [test "$enable_clmul" = "yes"])
 
@@ -1855,7 +1853,6 @@ AC_SUBST(BITCOIN_GUI_NAME)
 AC_SUBST(BITCOIN_CLI_NAME)
 AC_SUBST(BITCOIN_TX_NAME)
 AC_SUBST(BITCOIN_UTIL_NAME)
-AC_SUBST(BITCOIN_CHAINSTATE_NAME)
 AC_SUBST(BITCOIN_WALLET_TOOL_NAME)
 AC_SUBST(BITCOIN_MP_NODE_NAME)
 AC_SUBST(BITCOIN_MP_GUI_NAME)
@@ -1981,7 +1978,6 @@ echo "  with bench      = $use_bench"
 echo "  with upnp       = $use_upnp"
 echo "  with natpmp     = $use_natpmp"
 echo "  use asm         = $use_asm"
-echo "  liquid_build    = $liquid_build"
 echo "  USDT tracing    = $use_usdt"
 echo "  sanitizers      = $use_sanitizers"
 echo "  debug enabled   = $enable_debug"

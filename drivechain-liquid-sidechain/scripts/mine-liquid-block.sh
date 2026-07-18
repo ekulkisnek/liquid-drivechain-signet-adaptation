@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+printf '%s\n' 'ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.' >&2
+exit 64
+
 # mine-liquid-block.sh — BMM + Elements sidechain block advance (native CUSF).
 # Mirrors mine-bitassets-block.sh mechanism. Full version requires adapter + running elementsd.
 set -euo pipefail

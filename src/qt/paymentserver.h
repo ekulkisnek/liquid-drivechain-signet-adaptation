@@ -6,7 +6,7 @@
 #define BITCOIN_QT_PAYMENTSERVER_H
 
 // This class handles payment requests from clicking on
-// bitcoin: URIs
+// elements: URIs
 //
 // This is somewhat tricky, because we have to deal with
 // the situation where the user clicks on a link during
@@ -66,8 +66,8 @@ public:
     // Returns true if there were URIs on the command line
     // which were successfully sent to an already-running
     // process.
-    // Note: if a payment request is given, SelectParams(MAIN/TESTNET)
-    // will be called so we startup in the right mode.
+    // If a valid Elements payment request is given, the canonical Elements
+    // parameters are selected. No inherited network can be selected here.
     static bool ipcSendCommandLine();
 
     // parent should be QApplication object

@@ -3,6 +3,7 @@
   <Import Project="..\common.init.vcxproj" />
   <PropertyGroup Label="Globals">
     <ProjectGuid>{D4513DDF-6013-44DC-ADCC-12EAF6D1F038}</ProjectGuid>
+    <ProjectName>elementsd</ProjectName>
   </PropertyGroup>
   <PropertyGroup Label="Configuration">
     <TargetName>elementsd</TargetName>

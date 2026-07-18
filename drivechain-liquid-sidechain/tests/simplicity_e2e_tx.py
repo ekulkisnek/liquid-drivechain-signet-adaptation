@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+if __name__ == "__main__":
+    import sys as _quarantine_sys
+    _quarantine_sys.stderr.write(
+        "ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only "
+        "Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.\n"
+    )
+    raise SystemExit(64)
+
 """
 simplicity_e2e_tx.py
 Broadcasts and mines a real Simplicity (0xbe) transaction on the ID5 Elements regtest.

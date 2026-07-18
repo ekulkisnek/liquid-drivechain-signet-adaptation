@@ -65,8 +65,8 @@ static bool WalletAppInit(ArgsManager& args, int argc, char* argv[])
         } else {
             strUsage += "\n"
                         "elements-wallet is an offline tool for creating and interacting with " PACKAGE_NAME " wallet files.\n"
-                        "By default elements-wallet will act on wallets in the default mainnet wallet directory in the datadir.\n"
-                        "To change the target wallet, use the -datadir, -wallet and -regtest/-signet/-testnet arguments.\n\n"
+                        "elements-wallet only operates on the canonical Elements network wallet directory.\n"
+                        "To change the target wallet, use the -datadir and -wallet arguments.\n\n"
                         "Usage:\n"
                         "  elements-wallet [options] <command>\n";
             strUsage += "\n" + args.GetHelpMessage();
@@ -82,7 +82,10 @@ static bool WalletAppInit(ArgsManager& args, int argc, char* argv[])
         tfm::format(std::cerr, "Error: Specified data directory \"%s\" does not exist.\n", args.GetArg("-datadir", ""));
         return false;
     }
-    // Check for chain settings (Params() calls are only valid after this clause)
+    // Reject before resolving a network wallet directory or decoding keys.
+#ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
+    EnsureElementsProductionChain(args);
+#endif
     SelectParams(args.GetChainName());
 
     return true;

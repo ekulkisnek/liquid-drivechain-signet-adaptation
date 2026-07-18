@@ -9,6 +9,7 @@
 #include <qt/bitcoin.h>
 
 #include <chainparams.h>
+#include <chainparamsbase.h>
 #include <init.h>
 #include <interfaces/handler.h>
 #include <interfaces/init.h>
@@ -198,6 +199,25 @@ static bool InitSettings()
     return true;
 }
 
+/**
+ * Apply the installed GUI's single-network boundary before SelectParams or a
+ * network-specific filesystem lookup. This is intentionally repeated after
+ * reading the configuration file because `chain=` may be supplied there.
+ */
+static bool EnsureElementsGuiChain()
+{
+    try {
+        EnsureElementsProductionChain(gArgs);
+        return true;
+    } catch (const std::exception& e) {
+        InitError(Untranslated(strprintf("%s\n", e.what())));
+        QMessageBox::critical(
+            nullptr, PACKAGE_NAME,
+            QObject::tr("Error: %1").arg(QString::fromStdString(e.what())));
+        return false;
+    }
+}
+
 /* qDebug() message handler --> debug.log */
 void DebugMessageHandler(QtMsgType type, const QMessageLogContext& context, const QString &msg)
 {
@@ -210,7 +230,7 @@ void DebugMessageHandler(QtMsgType type, const QMessageLogContext& context, cons
 }
 
 static int qt_argc = 1;
-static const char* qt_argv = "bitcoin-qt";
+static const char* qt_argv = "elements-qt";
 
 BitcoinApplication::BitcoinApplication():
     QApplication(qt_argc, const_cast<char **>(&qt_argv)),
@@ -524,6 +544,10 @@ int GuiMain(int argc, char* argv[])
         return EXIT_SUCCESS;
     }
 
+    // Intro::showIfNeeded may select parameters to calculate disk estimates.
+    // Refuse command-line legacy/custom identities before it can do so.
+    if (!EnsureElementsGuiChain()) return EXIT_FAILURE;
+
     // Install global event filter that makes sure that long tooltips can be word-wrapped
     app.installEventFilter(new GUIUtil::ToolTipToRichTextFilter(TOOLTIP_WRAP_THRESHOLD, &app));
 
@@ -548,6 +572,10 @@ int GuiMain(int argc, char* argv[])
             QObject::tr("Error: Cannot parse configuration file: %1.").arg(QString::fromStdString(error)));
         return EXIT_FAILURE;
     }
+
+    // `chain=` may have come from elements.conf. Reject it before selecting
+    // params, reading settings.json, or deriving a network-specific path.
+    if (!EnsureElementsGuiChain()) return EXIT_FAILURE;
 
     /// 7. Determine network (and switch to network specific options)
     // - Do not call Params() before this step
@@ -574,7 +602,7 @@ int GuiMain(int argc, char* argv[])
     // Re-initialize translations after changing application name (language in network-specific settings can be different)
     initTranslations(qtTranslatorBase, qtTranslator, translatorBase, translator);
 
-    /// 8. Payment server removed in Elements since we do not have "elements:" URIs
+    /// 8. Payment server remains disabled; canonical URI formatting uses "elements:"
 
     /// 9. Main GUI initialization
     // Install global event filter that makes sure that out-of-focus labels do not contain text cursor.

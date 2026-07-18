@@ -1,10 +1,16 @@
 # liquid-drivechain-adapter (stub + integration plan)
 
+> **QUARANTINED — DO NOT DEPLOY OR RUN.** This adapter targets the retired
+> slot-5/regtest prototype. Its executable files fail closed before contacting
+> either chain. The canonical node is **Elements Drivechain** at BIP300 slot
+> **24**, selected with `elementsd -chain=elements`; see the
+> [repository README](../../README.md). The text below is historical only.
+
 This dir will hold the Rust (preferred, following plain-bitassets) or Python bridge between:
 - CUSF enforcer gRPC (WalletService/ValidatorService for ID 5)
 - elementsd (regtest or custom chain for Liquid CT/assets/scripting)
 
-**Security model (native, no fed shortcut)**: Peg credits and BMM inclusions are driven by *enforcer events* (secured by mainchain hashrate escrows + BMM commitments + contest periods). The adapter only *reacts* (constructs pegin claims or direct credits, submits side blocks). A compromised adapter cannot steal peg funds without mainchain consensus.
+**Security model (native, no fed shortcut)**: Peg credits and BMM inclusions are driven by *enforcer events* (secured by mainchain hashrate escrows + BMM commitments + contest periods). The adapter only reacts. Elements consensus independently checks the exact BIP300 deposit outpoint, containing active-chain block, amount, and destination before accepting a pegin, so the adapter is not trusted to authorize credits.
 
 ## Current State (2026-05-25)
 - Empty except this doc (prior "completion" was scaffold).
@@ -21,8 +27,7 @@ This dir will hold the Rust (preferred, following plain-bitassets) or Python bri
    - Connect to enforcer:50051.
    - SubscribeEvents or poll GetBlockInfo / GetTwoWayPegData for sidechain_id=5.
    - On Deposit event (outpoint, value, address, sequence): 
-     - Build + sign pegin witness tx (using elements RPC createrawpegin or raw tx + claimpegin if wallet funded?).
-     - Or (simpler v1): call a new `importdrivechaindeposit` RPC (small Elements patch) that credits the target without full pegin witness (trusted because event from enforcer).
+     - Call `importdrivechaindeposit` with the event's exact txid, vout, block hash, address, and value. The RPC constructs a `drivechain-deposit-v2` witness; normal transaction consensus then rechecks those fields against `GetTwoWayPegData` and Bitcoin's active chain.
    - On BMM request (from side miner or internal): compute critical_hash = sha256(Elements block header + merkle or body), call CreateBmmCriticalDataTransaction, trigger L1 mine (or wait), confirm via GetBmmHStarCommitment, then elementsd submitblock.
    - On pegout intent (Elements tx with special marker or adapter RPC): collect bundle, call BroadcastWithdrawalBundle.
    - Expose unified RPC (elements + drivechain status, proofs for Floresta).
@@ -39,12 +44,9 @@ This dir will hold the Rust (preferred, following plain-bitassets) or Python bri
      command: elementsd -regtest -rpcallowip=... -mainchain-signet ... (or drivechain flags)
    ```
 
-## Elements Patch Sketch (optional, for clean native feel)
-```diff
-# src/rpc/blockchain.cpp or wallet/rpc
-RPCHelpMan importdrivechaindeposit() { ... }  // credits value to address, records source main outpoint/height for audit/proofs. Bypasses fedpeg witness for drivechain SCs.
-```
-Or extend fedpeg to support "drivechain" mode where adapter key is the sole trusted claimer (still no multisig federation for the peg security root).
+## Elements native drivechain validation
+
+`importdrivechaindeposit` is a transaction-construction convenience, not an authorization bypass. Every drivechain pegin is consensus-valid only when the configured mainchain node confirms the containing block is active and the configured CUSF enforcer returns the exact deposit event for this sidechain slot. Consensus also binds the deposit to one input, one recipient, the committed address, and an exact recipient-plus-fee total.
 
 See Elements docs/elements-*.md and src/pegins.* for current fedpeg/claimpegin details.
 

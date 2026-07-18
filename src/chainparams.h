@@ -208,6 +208,15 @@ protected:
 std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const std::string& chain);
 
 /**
+ * Release-mode startup gate for the sole built-in Elements Drivechain.
+ * Returns false if any consensus, wire, address, or base-network identity
+ * field differs from the frozen identity bundle.
+ */
+bool IsCanonicalElementsProductionIdentity(const CChainParams& params,
+                                           const CBaseChainParams& base_params,
+                                           std::string* error = nullptr);
+
+/**
  * Return the currently selected parameters. This won't change after app
  * startup, except for unit tests.
  */

@@ -7,6 +7,18 @@
 #include <simplicity/errorCodes.h>
 #include <simplicity/elements/env.h>
 
+/**
+ * Block data authenticated by the Elements consensus caller.
+ *
+ * The Simplicity library cannot authenticate an RPC response itself.  A value
+ * may be marked present only after the caller has tied the mainchain parent to
+ * the sidechain block through its mined BIP301 commitment.
+ */
+typedef struct rawElementsBlockEnv {
+  uint64_t bmmParentMtp;
+  bool bmmParentMtpPresent;
+} rawElementsBlockEnv;
+
 /* Deserialize a Simplicity 'program' with its 'witness' data and execute it in the environment of the 'ix'th input of 'tx' with `taproot`.
  *
  * If at any time malloc fails then '*error' is set to 'SIMPLICITY_ERR_MALLOC' and 'false' is returned,
@@ -45,4 +57,17 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
                                               , const unsigned char* amr
                                               , const unsigned char* program, size_t program_len
                                               , const unsigned char* witness, size_t witness_len);
+
+/**
+ * Execute with optional authenticated block context.  This only threads the
+ * context into txEnv; no released Simplicity jet exposes bmmParentMtp yet.
+ */
+extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* error, unsigned char* ihr
+                                                           , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
+                                                           , const unsigned char* genesisBlockHash
+                                                           , const rawElementsBlockEnv* blockEnv
+                                                           , int64_t minCost, int64_t budget
+                                                           , const unsigned char* amr
+                                                           , const unsigned char* program, size_t program_len
+                                                           , const unsigned char* witness, size_t witness_len);
 #endif

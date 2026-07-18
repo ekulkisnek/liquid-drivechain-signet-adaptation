@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+if __name__ == "__main__":
+    import sys as _quarantine_sys
+    _quarantine_sys.stderr.write(
+        "ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only "
+        "Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.\n"
+    )
+    raise SystemExit(64)
+
 """
 Simple visible BMM loop for ID5 - uses the proven working code from grpc_bmm_id5.py.
 Replicates the lib/miner.rs tolerate pattern + mine + poll for real inclusion evidence.
