@@ -536,6 +536,17 @@ bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env) 
   return true;
 }
 
+/* current_bmm_parent_mtp : ONE |- S TWO^64 */
+bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src; // src is unused;
+  if (writeBit(dst, env->bmmParentMtpPresent)) {
+    simplicity_write64(dst, env->bmmParentMtp);
+  } else {
+    skipBits(dst, 64);
+  }
+  return true;
+}
+
 /* current_index : ONE |- TWO^32 */
 bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env) {
   (void) src; // src is unused;

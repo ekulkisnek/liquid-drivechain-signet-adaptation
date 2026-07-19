@@ -90,6 +90,7 @@ src/qt/bitcoin-qt.includes
 *.patch
 !contrib/guix/patches/*.patch
 !depends/patches/**/*.patch
+!contrib/devtools/simplicity-current-bmm-parent-mtp-*.patch
 
 #libtool object files
 *.lo

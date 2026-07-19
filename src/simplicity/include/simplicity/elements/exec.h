@@ -59,8 +59,8 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
                                               , const unsigned char* witness, size_t witness_len);
 
 /**
- * Execute with optional authenticated block context.  This only threads the
- * context into txEnv; no released Simplicity jet exposes bmmParentMtp yet.
+ * Execute with optional authenticated block context.  The
+ * current_bmm_parent_mtp environmental jet exposes this value as Maybe Word64.
  */
 extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* error, unsigned char* ihr
                                                            , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot

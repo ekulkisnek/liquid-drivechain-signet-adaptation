@@ -1,0 +1,480 @@
+diff --git a/C/elements/decodeElementsJets.inc b/C/elements/decodeElementsJets.inc
+index 8420f64..7ff05d8 100644
+--- a/C/elements/decodeElementsJets.inc
++++ b/C/elements/decodeElementsJets.inc
+@@ -130,6 +130,7 @@
+         case 48: *result = VERSION; return SIMPLICITY_NO_ERROR;
+         case 49: *result = GENESIS_BLOCK_HASH; return SIMPLICITY_NO_ERROR;
+         case 50: *result = TRANSACTION_ID; return SIMPLICITY_NO_ERROR;
++        case 51: *result = CURRENT_BMM_PARENT_MTP; return SIMPLICITY_NO_ERROR;
+       }
+       break;
+   }
+diff --git a/C/elements/elementsJets.c b/C/elements/elementsJets.c
+index 93b2c58..190fcec 100644
+--- a/C/elements/elementsJets.c
++++ b/C/elements/elementsJets.c
+@@ -543,6 +543,17 @@ bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env) {
+   return true;
+ }
+
++/* current_bmm_parent_mtp : ONE |- S TWO^64 */
++bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEnv* env) {
++  (void) src; // src is unused;
++  if (writeBit(dst, env->bmmParentMtpPresent)) {
++    simplicity_write64(dst, env->bmmParentMtp);
++  } else {
++    skipBits(dst, 64);
++  }
++  return true;
++}
++
+ /* current_pegin : ONE |- S TWO^256 */
+ bool simplicity_current_pegin(frameItem* dst, frameItem src, const txEnv* env) {
+   (void) src; // src is unused;
+diff --git a/C/elements/elementsJets.h b/C/elements/elementsJets.h
+index d6779e3..743db01 100644
+--- a/C/elements/elementsJets.h
++++ b/C/elements/elementsJets.h
+@@ -36,6 +36,7 @@ bool simplicity_genesis_block_hash(frameItem* dst, frameItem src, const txEnv* e
+ bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env);
+ bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env);
+ bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env);
++bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEnv* env);
+ bool simplicity_current_pegin(frameItem* dst, frameItem src, const txEnv* env);
+ bool simplicity_current_prev_outpoint(frameItem* dst, frameItem src, const txEnv* env);
+ bool simplicity_current_asset(frameItem* dst, frameItem src, const txEnv* env);
+diff --git a/C/elements/exec.c b/C/elements/exec.c
+index 4dfcf42..7b08f50 100644
+--- a/C/elements/exec.c
++++ b/C/elements/exec.c
+@@ -125,7 +125,7 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned
+       simplicity_free(analysis);
+     }
+     if (IS_OK(*error)) {
+-      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ix);
++      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ix, false, 0);
+       static_assert(BUDGET_MAX <= UBOUNDED_MAX, "BUDGET_MAX doesn't fit in ubounded.");
+       *error = evalTCOProgram( dag, type_dag, (size_t)dag_len
+                              , minCost <= BUDGET_MAX ? (ubounded)minCost : BUDGET_MAX
+diff --git a/C/elements/primitiveEnumJet.inc b/C/elements/primitiveEnumJet.inc
+index 5742091..78f9ab7 100644
+--- a/C/elements/primitiveEnumJet.inc
++++ b/C/elements/primitiveEnumJet.inc
+@@ -42,6 +42,7 @@ COMPLEMENT_8,
+ CURRENT_AMOUNT,
+ CURRENT_ANNEX_HASH,
+ CURRENT_ASSET,
++CURRENT_BMM_PARENT_MTP,
+ CURRENT_INDEX,
+ CURRENT_ISSUANCE_ASSET_AMOUNT,
+ CURRENT_ISSUANCE_ASSET_PROOF,
+diff --git a/C/elements/primitiveJetNode.inc b/C/elements/primitiveJetNode.inc
+index 683de89..fdb8f7b 100644
+--- a/C/elements/primitiveJetNode.inc
++++ b/C/elements/primitiveJetNode.inc
+@@ -343,6 +343,14 @@
+ , .targetIx = ty_spbw256w256
+ , .cost = 171 /* milli weight units */
+ }
++,[CURRENT_BMM_PARENT_MTP] =
++{ .tag = JET
++, .jet = simplicity_current_bmm_parent_mtp
++, .cmr = {{0x12dc3d4fu, 0x22466873u, 0xdaaf83b1u, 0x0e1cfa1eu, 0xa551e23au, 0xe7d0fbd6u, 0xd9da64ceu, 0x7e89a3e2u}}
++, .sourceIx = ty_u
++, .targetIx = ty_mw64
++, .cost = 108 /* milli weight units */
++}
+ ,[CURRENT_INDEX] =
+ { .tag = JET
+ , .jet = simplicity_current_index
+diff --git a/C/elements/txEnv.c b/C/elements/txEnv.c
+index a7b9f8e..360748b 100644
+--- a/C/elements/txEnv.c
++++ b/C/elements/txEnv.c
+@@ -8,11 +8,15 @@
+  *               NULL != genesisHash
+  *               ix < tx->numInputs
+  */
+-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, uint_fast32_t ix) {
++txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
++                                      const sha256_midstate* genesisHash, uint_fast32_t ix,
++                                      bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp) {
+   txEnv result = { .tx = tx
+                  , .taproot = taproot
+                  , .genesisHash = *genesisHash
+                  , .ix = ix
++                 , .bmmParentMtp = bmmParentMtp
++                 , .bmmParentMtpPresent = bmmParentMtpPresent
+                  };
+   sha256_context ctx = sha256_init(result.sigAllHash.s);
+   sha256_hash(&ctx, genesisHash);
+diff --git a/C/elements/txEnv.h b/C/elements/txEnv.h
+index d9a8908..1124be0 100644
+--- a/C/elements/txEnv.h
++++ b/C/elements/txEnv.h
+@@ -252,6 +252,7 @@ typedef struct elementsTapEnv {
+  * + the transaction data, which may be shared when Simplicity expressions are used for multiple inputs in the same transaction),
+  * + the input index under consideration,
+  * + the hash of the genesis block for the chain,
++ * + optional BIP301-authenticated mainchain parent median-time-past.
+  */
+ typedef struct txEnv {
+   const elementsTransaction* tx;
+@@ -259,6 +260,8 @@ typedef struct txEnv {
+   sha256_midstate genesisHash;
+   sha256_midstate sigAllHash;
+   uint_fast32_t ix;
++  uint_fast64_t bmmParentMtp;
++  bool bmmParentMtpPresent;
+ } txEnv;
+
+ /* Construct a txEnv structure from its components.
+@@ -269,6 +272,8 @@ typedef struct txEnv {
+  *               NULL != genesisHash
+  *               ix < tx->numInputs
+  */
+-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, uint_fast32_t ix);
++txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
++                                      const sha256_midstate* genesisHash, uint_fast32_t ix,
++                                      bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp);
+
+ #endif
+diff --git a/Haskell/Elements/Simplicity/Elements/Primitive.hs b/Haskell/Elements/Simplicity/Elements/Primitive.hs
+index 05173e8..30ef8cb 100644
+--- a/Haskell/Elements/Simplicity/Elements/Primitive.hs
++++ b/Haskell/Elements/Simplicity/Elements/Primitive.hs
+@@ -2,7 +2,8 @@
+ -- | This module provides the Simplicity primitives specific for Elements sidechain applications.
+ module Simplicity.Elements.Primitive
+   ( Prim(..), primPrefix, primName
+-  , PrimEnv, primEnv, envTx, envIx, envTap, envGenesisBlock
++  , PrimEnv, primEnv, primEnvWithBmmParentMtp
++  , envTx, envIx, envTap, envGenesisBlock, envBmmParentMtp
+   , primEnvHash
+   , primSem
+   -- * Re-exported Types
+@@ -38,6 +39,7 @@ just_ f = some_ f
+ data Prim a b where
+   Version :: Prim () Word32
+   LockTime :: Prim () Word32
++  CurrentBmmParentMtp :: Prim () (S Word64)
+   InputPegin :: Prim Word32 (S (S Word256))
+   InputPrevOutpoint :: Prim Word32 (S (Word256,Word32))
+   InputAsset :: Prim Word32 (S (Conf Word256))
+@@ -71,6 +73,7 @@ data Prim a b where
+ instance Eq (Prim a b) where
+   Version == Version = True
+   LockTime == LockTime = True
++  CurrentBmmParentMtp == CurrentBmmParentMtp = True
+   InputPegin == InputPegin = True
+   InputPrevOutpoint == InputPrevOutpoint = True
+   InputAsset == InputAsset = True
+@@ -109,6 +112,7 @@ primPrefix = "Elements"
+ primName :: Prim a b -> String
+ primName Version = "version"
+ primName LockTime = "lockTime"
++primName CurrentBmmParentMtp = "currentBmmParentMtp"
+ primName InputPegin = "inputPegin"
+ primName InputPrevOutpoint = "inputPrevOutpoint"
+ primName InputAsset = "inputAsset"
+@@ -143,6 +147,7 @@ data PrimEnv = PrimEnv { envTx :: SigTx
+                        , envIx :: Data.Word.Word32
+                        , envTap :: TapEnv
+                        , envGenesisBlock :: Hash256
++                       , envBmmParentMtp :: Maybe Data.Word.Word64
+                        }
+
+ instance Show PrimEnv where
+@@ -153,13 +158,26 @@ instance Show PrimEnv where
+                   . showsPrec 11 (envIx env)
+                   . showString " "
+                   . showsPrec 11 (envTap env)
++                  . showString " "
++                  . showsPrec 11 (envBmmParentMtp env)
+
+ primEnv :: SigTx -> Data.Word.Word32 -> TapEnv -> Hash256 -> Maybe PrimEnv
+-primEnv tx ix tap gen | cond = Just $ PrimEnv { envTx = tx
+-                                              , envIx = ix
+-                                              , envTap = tap
+-                                              , envGenesisBlock = gen
+-                                              }
++primEnv tx ix tap gen = primEnvWithBmmParentMtp tx ix tap gen Nothing
++
++-- | Build an Elements primitive environment with optional block context.
++--
++-- The caller must supply 'Just' only for an MTP authenticated by the sidechain
++-- block's mined BIP301 commitment.  'Nothing' is the only safe default for
++-- context-free evaluation.
++primEnvWithBmmParentMtp :: SigTx -> Data.Word.Word32 -> TapEnv -> Hash256
++                        -> Maybe Data.Word.Word64 -> Maybe PrimEnv
++primEnvWithBmmParentMtp tx ix tap gen bmmParentMtp
++                      | cond = Just $ PrimEnv { envTx = tx
++                                             , envIx = ix
++                                             , envTap = tap
++                                             , envGenesisBlock = gen
++                                             , envBmmParentMtp = bmmParentMtp
++                                             }
+                       | otherwise = Nothing
+  where
+   cond = fromIntegral ix < Vector.length (sigTxIn tx)
+@@ -230,6 +248,9 @@ primSem p a env = interpret p a
+   issuanceTokenAmount = either newIssuanceTokenAmount (const (Amount (Explicit 0)))
+   interpret Version = element . return . toWord32 . toInteger $ sigTxVersion tx
+   interpret LockTime = element . return . toWord32 . toInteger $ sigTxLock tx
++  interpret CurrentBmmParentMtp = element . return
++                                . maybe (Left ()) (Right . toWord64 . toInteger)
++                                $ envBmmParentMtp env
+   interpret InputPegin = return . (atInput $ cast . fmap encodeHash . sigTxiPegin)
+   interpret InputPrevOutpoint = return . (atInput $ encodeOutpoint . sigTxiPreviousOutpoint)
+   interpret InputAsset = return . (atInput $ encodeAsset . utxoAsset . sigTxiTxo)
+diff --git a/Haskell/Simplicity/Elements/Benchmarks.hs b/Haskell/Simplicity/Elements/Benchmarks.hs
+index 6ea4469..4fad64f 100644
+--- a/Haskell/Simplicity/Elements/Benchmarks.hs
++++ b/Haskell/Simplicity/Elements/Benchmarks.hs
+@@ -45,6 +45,10 @@ rawBenchmark "CurrentAmount" = 125.233683871098
+ rawBenchmark "CurrentAnnexHash" = 43.96303036926559
+ rawBenchmark "CurrentAsset" = 95.55358469768584
+ rawBenchmark "CurrentIndex" = 49.14822556250178
++-- Conservative fixed proxy for a one-bit presence tag plus a 64-bit
++-- environment read.  Replace only through a consensus-versioned catalogue
++-- update after reproducible benchmarking; this value is consensus-critical.
++rawBenchmark "CurrentBmmParentMtp" = 60.0
+ rawBenchmark "CurrentIssuanceAssetAmount" = 91.68812641475432
+ rawBenchmark "CurrentIssuanceAssetProof" = 78.32085006755332
+ rawBenchmark "CurrentIssuanceTokenAmount" = 104.56443464343835
+diff --git a/Haskell/Simplicity/Elements/FFI/Env.hs b/Haskell/Simplicity/Elements/FFI/Env.hs
+index 7cfd011..5f21a45 100644
+--- a/Haskell/Simplicity/Elements/FFI/Env.hs
++++ b/Haskell/Simplicity/Elements/FFI/Env.hs
+@@ -11,7 +11,7 @@ import qualified Data.ByteString.Lazy as BSL
+ import Data.Foldable (toList)
+ import Data.Serialize (Serialize, encode, runPut)
+ import Data.Vector (Vector)
+-import Data.Word (Word32)
++import Data.Word (Word32, Word64)
+ import Foreign.C.Types (CSize(..), CChar(..), CUChar(..), CUInt(..))
+ import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
+ import Foreign.Marshal.Alloc (allocaBytes)
+@@ -55,7 +55,7 @@ foreign import ccall unsafe "" c_set_rawElementsTransaction :: Ptr RawTransactio
+                                                                           -> Ptr RawOutput -> CUInt
+                                                                           -> CUInt -> IO ()
+ foreign import ccall unsafe "" c_set_rawElementsTapEnv :: Ptr RawTapEnv -> Ptr CChar -> CUChar -> Ptr CChar -> IO ()
+-foreign import ccall unsafe "" c_set_txEnv :: Ptr CTxEnv -> Ptr CTransaction -> Ptr CTapEnv -> Ptr CChar -> CUInt -> IO ()
++foreign import ccall unsafe "" c_set_txEnv :: Ptr CTxEnv -> Ptr CTransaction -> Ptr CTapEnv -> Ptr CChar -> CUInt -> CUChar -> Word64 -> IO ()
+
+ foreign import ccall unsafe "" simplicity_elements_mallocTransaction :: Ptr RawTransaction -> IO (Ptr CTransaction)
+ foreign import ccall unsafe "&" simplicity_elements_freeTransaction :: FunPtr (Ptr CTransaction -> IO ())
+@@ -195,17 +195,18 @@ marshallTapEnv :: TapEnv -> IO (ForeignPtr CTapEnv)
+ marshallTapEnv env = withRawTapEnv env
+                    $ \pRawTapEnv -> simplicity_elements_mallocTapEnv pRawTapEnv >>= newForeignPtr simplicity_elements_freeTapEnv
+
+-withEnv :: ForeignPtr CTransaction -> Word32 -> ForeignPtr CTapEnv -> Hash256 -> (Ptr CTxEnv -> IO b) -> IO b
+-withEnv cTransaction ix cTapEnv genesisHash k =
++withEnv :: ForeignPtr CTransaction -> Word32 -> ForeignPtr CTapEnv -> Hash256 -> Maybe Word64 -> (Ptr CTxEnv -> IO b) -> IO b
++withEnv cTransaction ix cTapEnv genesisHash bmmParentMtp k =
+   allocaBytes sizeof_txEnv $ \pTxEnv ->
+   withForeignPtr cTransaction $ \pTransaction ->
+   withForeignPtr cTapEnv $ \pTapEnv ->
+   BS.useAsCString (encode genesisHash) $ \pGenesis -> do
+    c_set_txEnv pTxEnv pTransaction pTapEnv pGenesis (fromIntegral ix)
++               (maybe 0 (const 1) bmmParentMtp) (maybe 0 id bmmParentMtp)
+    k pTxEnv
+
+ withPrimEnv :: PrimEnv -> (Ptr CTxEnv -> IO b) -> IO b
+ withPrimEnv env k = do
+   cTransaction <- marshallTransaction (envTx env)
+   cTapEnv <- marshallTapEnv (envTap env)
+-  withEnv cTransaction (envIx env) cTapEnv (envGenesisBlock env) k
++  withEnv cTransaction (envIx env) cTapEnv (envGenesisBlock env) (envBmmParentMtp env) k
+diff --git a/Haskell/Simplicity/Elements/FFI/Jets.hs b/Haskell/Simplicity/Elements/FFI/Jets.hs
+index a97eed3..efc5b58 100644
+--- a/Haskell/Simplicity/Elements/FFI/Jets.hs
++++ b/Haskell/Simplicity/Elements/FFI/Jets.hs
+@@ -31,6 +31,7 @@ module Simplicity.Elements.FFI.Jets
+  , script_cmr
+  , transaction_id
+  , current_index
++ , current_bmm_parent_mtp
+  , current_pegin
+  , current_prev_outpoint
+  , current_asset
+@@ -151,6 +152,7 @@ foreign import ccall unsafe "" c_genesis_block_hash :: Ptr FrameItem -> Ptr Fram
+ foreign import ccall unsafe "" c_script_cmr :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
+ foreign import ccall unsafe "" c_transaction_id :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
+ foreign import ccall unsafe "" c_current_index :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
++foreign import ccall unsafe "" c_current_bmm_parent_mtp :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
+ foreign import ccall unsafe "" c_current_pegin :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
+ foreign import ccall unsafe "" c_current_prev_outpoint :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
+ foreign import ccall unsafe "" c_current_asset :: Ptr FrameItem -> Ptr FrameItem -> Ptr CTxEnv -> IO CBool
+@@ -282,6 +284,9 @@ input_script_sig_hash = unsafeLocalJet c_input_script_sig_hash
+ current_index :: PrimEnv -> () -> Maybe Word32
+ current_index = unsafeLocalJet c_current_index
+
++current_bmm_parent_mtp :: PrimEnv -> () -> Maybe (S Word64)
++current_bmm_parent_mtp = unsafeLocalJet c_current_bmm_parent_mtp
++
+ current_pegin :: PrimEnv -> () -> Maybe (S Word256)
+ current_pegin = unsafeLocalJet c_current_pegin
+
+diff --git a/Haskell/Simplicity/Elements/Jets.hs b/Haskell/Simplicity/Elements/Jets.hs
+index 355d544..3c4d5b6 100644
+--- a/Haskell/Simplicity/Elements/Jets.hs
++++ b/Haskell/Simplicity/Elements/Jets.hs
+@@ -153,6 +153,7 @@ data TransactionJet a b where
+   ScriptCMR :: TransactionJet () Word256
+   InternalKey :: TransactionJet () PubKey
+   CurrentIndex :: TransactionJet () Word32
++  CurrentBmmParentMtp :: TransactionJet () (S Word64)
+   NumInputs :: TransactionJet () Word32
+   NumOutputs :: TransactionJet () Word32
+   LockTime :: TransactionJet () Word32
+@@ -272,6 +273,7 @@ specificationTransaction :: (Assert term, Primitive term) => TransactionJet a b
+ specificationTransaction ScriptCMR = primitive Prim.ScriptCMR
+ specificationTransaction InternalKey = primitive Prim.InternalKey
+ specificationTransaction CurrentIndex = primitive Prim.CurrentIndex
++specificationTransaction CurrentBmmParentMtp = primitive Prim.CurrentBmmParentMtp
+ specificationTransaction NumInputs = Prog.numInputs
+ specificationTransaction NumOutputs = Prog.numOutputs
+ specificationTransaction LockTime = primitive Prim.LockTime
+@@ -623,6 +625,7 @@ transactionCatalogue = book
+  , SomeArrow Version
+  , SomeArrow GenesisBlockHash
+  , SomeArrow TransactionId
++ , SomeArrow CurrentBmmParentMtp
+  ]
+
+ putJetBitElements :: ElementsJet a b -> DList Bool
+@@ -741,6 +744,7 @@ putJetBitTransaction Tappath                    = putPositive 47
+ putJetBitTransaction Version                    = putPositive 48
+ putJetBitTransaction GenesisBlockHash           = putPositive 49
+ putJetBitTransaction TransactionId              = putPositive 50
++putJetBitTransaction CurrentBmmParentMtp         = putPositive 51
+
+ elementsJetMap :: Map.Map Hash256 (SomeArrow ElementsJet)
+ elementsJetMap = Map.fromList . fmap mkAssoc $ toList elementsCatalogue
+@@ -1317,6 +1321,7 @@ jetCostTransaction :: TransactionJet a b -> Weight
+ jetCostTransaction ScriptCMR = cost "ScriptCMR"
+ jetCostTransaction InternalKey = cost "InternalKey"
+ jetCostTransaction CurrentIndex = cost "CurrentIndex"
++jetCostTransaction CurrentBmmParentMtp = cost "CurrentBmmParentMtp"
+ jetCostTransaction NumInputs = cost "NumInputs"
+ jetCostTransaction NumOutputs = cost "NumOutputs"
+ jetCostTransaction LockTime = cost "LockTime"
+diff --git a/Haskell/Tests/Simplicity/Elements/Arbitrary.hs b/Haskell/Tests/Simplicity/Elements/Arbitrary.hs
+index 94b15ec..1313be3 100644
+--- a/Haskell/Tests/Simplicity/Elements/Arbitrary.hs
++++ b/Haskell/Tests/Simplicity/Elements/Arbitrary.hs
+@@ -146,8 +146,12 @@ genPrimEnv = do
+    tx <- arbitrary
+    tapenv <- arbitrary
+    gen <- arbitraryHash256
++   bmmParentMtp <- frequency
++     [ (1, pure Nothing)
++     , (3, Just <$> arbitraryBoundedIntegral)
++     ]
+    ix <- fromIntegral <$> choose (0, length (sigTxIn tx) - 1)
+-   return $ primEnv tx ix tapenv gen
++   return $ primEnvWithBmmParentMtp tx ix tapenv gen bmmParentMtp
+
+ forallPrimEnv :: Testable prop => (PrimEnv -> prop) -> Property
+ forallPrimEnv p = forAll genPrimEnv go
+diff --git a/Haskell/Tests/Simplicity/Elements/FFI/Tests.hs b/Haskell/Tests/Simplicity/Elements/FFI/Tests.hs
+index d1ba998..eb44d06 100644
+--- a/Haskell/Tests/Simplicity/Elements/FFI/Tests.hs
++++ b/Haskell/Tests/Simplicity/Elements/FFI/Tests.hs
+@@ -92,6 +92,7 @@ tests = testGroup "Elements"
+           [ testProperty "script_cmr" prop_script_cmr
+           , testProperty "internal_key" prop_internal_key
+           , testProperty "current_index" prop_current_index
++          , testProperty "current_bmm_parent_mtp" prop_current_bmm_parent_mtp
+           , testProperty "num_inputs" prop_num_inputs
+           , testProperty "num_outputs" prop_num_outputs
+           , testProperty "lock_time" prop_lock_time
+@@ -446,6 +447,12 @@ prop_current_index = forallPrimEnv $ \env -> fast_current_index env () == curren
+  where
+   fast_current_index = testEval (specification (ElementsJet (TransactionJet CurrentIndex)))
+
++prop_current_bmm_parent_mtp :: Property
++prop_current_bmm_parent_mtp = forallPrimEnv $ \env ->
++  fast_current_bmm_parent_mtp env () == current_bmm_parent_mtp env ()
++ where
++  fast_current_bmm_parent_mtp = testEval (specification (ElementsJet (TransactionJet CurrentBmmParentMtp)))
++
+ prop_num_inputs :: Property
+ prop_num_inputs = forallPrimEnv $ \env -> fast_num_inputs env () == num_inputs env ()
+  where
+diff --git a/Haskell/Tests/Simplicity/Elements/Regression.hs b/Haskell/Tests/Simplicity/Elements/Regression.hs
+index 3fd0231..f6b67fc 100644
+--- a/Haskell/Tests/Simplicity/Elements/Regression.hs
++++ b/Haskell/Tests/Simplicity/Elements/Regression.hs
+@@ -29,7 +29,7 @@ regularJets :: BinTree (SomeArrow JetType)
+ (Branch wordJets regularJets) = treeEvalBitStream Elements.getJetBit
+
+ assert_jet_count :: Assertion
+-assert_jet_count = length regularJets @?= 471
++assert_jet_count = length regularJets @?= 472
+
+ assert_jet_cmr :: (TyC a, TyC b) => JetType a b -> Assertion
+ assert_jet_cmr jt = commitmentRoot (asJet jt) @?= review (over be256) (expected_cmr jt)
+@@ -464,6 +464,7 @@ expected_cmr (ElementsJet (IssuanceJet LbtcAsset)) = 0x2af7f73ae3fbbfa2d23a8774e
+ expected_cmr (ElementsJet (TransactionJet ScriptCMR)) = 0xec15f59c524d941469811954654f635830ecd7de517662b25ca4e8d05c2cce89
+ expected_cmr (ElementsJet (TransactionJet InternalKey)) = 0x9b742e471b0e591a972b0d4421f9c9659397f5daba2c14dac62c4a339cc3e7ec
+ expected_cmr (ElementsJet (TransactionJet CurrentIndex)) = 0x15e1051ff23f851c19131f0de6edc4882376a25790dbd9102824aa22a889ae84
++expected_cmr (ElementsJet (TransactionJet CurrentBmmParentMtp)) = 0x12dc3d4f22466873daaf83b10e1cfa1ea551e23ae7d0fbd6d9da64ce7e89a3e2
+ expected_cmr (ElementsJet (TransactionJet NumInputs)) = 0xb2288ebaadcbcfce1c631964c86b127d6f91dc657c59a7fb453e9111d87481f5
+ expected_cmr (ElementsJet (TransactionJet NumOutputs)) = 0x267d41654493903e0257751ae6d42d9ce1bb92246d0ef767c337b0c32b1972fd
+ expected_cmr (ElementsJet (TransactionJet LockTime)) = 0xa16897c5db4927c6cb07b165bd2cc38b36a602686c74a19034aa3787ac582a0b
+diff --git a/Haskell/Tests/Simplicity/Elements/Tests.hs b/Haskell/Tests/Simplicity/Elements/Tests.hs
+index e2bc15b..1bd23a9 100644
+--- a/Haskell/Tests/Simplicity/Elements/Tests.hs
++++ b/Haskell/Tests/Simplicity/Elements/Tests.hs
+@@ -106,6 +106,7 @@ tests = testGroup "Elements"
+           , testProperty "script_cmr" prop_script_cmr
+           , testProperty "internal_key" prop_internal_key
+           , testProperty "current_index" prop_current_index
++          , testProperty "current_bmm_parent_mtp" prop_current_bmm_parent_mtp
+           , testProperty "num_inputs" prop_num_inputs
+           , testProperty "num_outputs" prop_num_outputs
+           , testProperty "lock_time" prop_lock_time
+@@ -444,6 +445,10 @@ prop_current_index :: Property
+ prop_current_index = checkJet (ElementsJet (TransactionJet CurrentIndex))
+                    $ \check -> forallPrimEnv $ \env -> check env ()
+
++prop_current_bmm_parent_mtp :: Property
++prop_current_bmm_parent_mtp = checkJet (ElementsJet (TransactionJet CurrentBmmParentMtp))
++                            $ \check -> forallPrimEnv $ \env -> check env ()
++
+ prop_num_inputs :: Property
+ prop_num_inputs = checkJet (ElementsJet (TransactionJet NumInputs))
+                 $ \check -> forallPrimEnv $ \env -> check env ()
+diff --git a/Haskell/cbits/elements/env.c b/Haskell/cbits/elements/env.c
+index 60a3be0..0028187 100644
+--- a/Haskell/cbits/elements/env.c
++++ b/Haskell/cbits/elements/env.c
+@@ -62,8 +62,11 @@ void c_set_rawElementsTapEnv(rawElementsTapEnv* result, const char* controlBlock
+   *result = (rawElementsTapEnv){ .controlBlock = controlBlock, .pathLen = pathLen, .scriptCMR = scriptCMR };
+ }
+
+-void c_set_txEnv(txEnv* result, const elementsTransaction* tx, const elementsTapEnv* taproot, const char* genesisHash, unsigned int ix) {
++void c_set_txEnv(txEnv* result, const elementsTransaction* tx, const elementsTapEnv* taproot,
++                 const char* genesisHash, unsigned int ix,
++                 unsigned char bmmParentMtpPresent, uint64_t bmmParentMtp) {
+   sha256_midstate genesis;
+   sha256_toMidstate(genesis.s, genesisHash);
+-  *result = simplicity_elements_build_txEnv(tx, taproot, &genesis, ix);
++  *result = simplicity_elements_build_txEnv(tx, taproot, &genesis, ix,
++                                            0 != bmmParentMtpPresent, bmmParentMtp);
+ }
+diff --git a/Haskell/cbits/elements/jets.c b/Haskell/cbits/elements/jets.c
+index 6d15bbf..4316a2a 100644
+--- a/Haskell/cbits/elements/jets.c
++++ b/Haskell/cbits/elements/jets.c
+@@ -31,6 +31,7 @@ WRAP_(genesis_block_hash)
+ WRAP_(script_cmr)
+ WRAP_(transaction_id)
+ WRAP_(current_index)
++WRAP_(current_bmm_parent_mtp)
+ WRAP_(current_pegin)
+ WRAP_(current_prev_outpoint)
+ WRAP_(current_asset)

@@ -343,6 +343,14 @@
 , .targetIx = ty_spbw256w256
 , .cost = 171 /* milli weight units */
 }
+,[CURRENT_BMM_PARENT_MTP] =
+{ .tag = JET
+, .jet = simplicity_current_bmm_parent_mtp
+, .cmr = {{0x12dc3d4fu, 0x22466873u, 0xdaaf83b1u, 0x0e1cfa1eu, 0xa551e23au, 0xe7d0fbd6u, 0xd9da64ceu, 0x7e89a3e2u}}
+, .sourceIx = ty_u
+, .targetIx = ty_mw64
+, .cost = 108 /* milli weight units */
+}
 ,[CURRENT_INDEX] =
 { .tag = JET
 , .jet = simplicity_current_index

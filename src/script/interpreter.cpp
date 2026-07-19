@@ -2703,6 +2703,7 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_output_spk_single_hashes = GetOutputScriptPubKeysSHA256(txTo);
 
         std::vector<rawElementsBuffer> simplicityRawAnnex(txTo.witness.vtxinwit.size());
+        std::vector<rawElementsBuffer> simplicityRawFullAnnex(txTo.witness.vtxinwit.size());
         std::vector<rawElementsInput> simplicityRawInput(txTo.vin.size());
         for (size_t i = 0; i < txTo.vin.size(); ++i) {
             simplicityRawInput[i].prevTxid = txTo.vin[i].prevout.hash.begin();
@@ -2717,12 +2718,16 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
             simplicityRawInput[i].issuance.amount = txTo.vin[i].assetIssuance.nAmount.vchCommitment.empty() ? NULL : txTo.vin[i].assetIssuance.nAmount.vchCommitment.data();
             simplicityRawInput[i].issuance.inflationKeys = txTo.vin[i].assetIssuance.nInflationKeys.vchCommitment.empty() ? NULL : txTo.vin[i].assetIssuance.nInflationKeys.vchCommitment.data();
             simplicityRawInput[i].annex = NULL;
+            simplicityRawInput[i].fullAnnex = NULL;
             if (i < txTo.witness.vtxinwit.size()) {
                 Span<const valtype> stack{txTo.witness.vtxinwit[i].scriptWitness.stack};
                 if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
                     simplicityRawAnnex[i].buf = stack.back().data()+1;
                     simplicityRawAnnex[i].len = stack.back().size()-1;
                     simplicityRawInput[i].annex = &simplicityRawAnnex[i];
+                    simplicityRawFullAnnex[i].buf = stack.back().data();
+                    simplicityRawFullAnnex[i].len = stack.back().size();
+                    simplicityRawInput[i].fullAnnex = &simplicityRawFullAnnex[i];
                 }
                 simplicityRawInput[i].issuance.amountRangePrf.buf = txTo.witness.vtxinwit[i].vchIssuanceAmountRangeproof.data();
                 simplicityRawInput[i].issuance.amountRangePrf.len = txTo.witness.vtxinwit[i].vchIssuanceAmountRangeproof.size();

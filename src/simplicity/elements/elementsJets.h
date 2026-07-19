@@ -35,6 +35,7 @@ bool simplicity_total_fee(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_genesis_block_hash(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_pegin(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_prev_outpoint(frameItem* dst, frameItem src, const txEnv* env);

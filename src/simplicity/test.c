@@ -21,7 +21,9 @@
 #include "simplicity_alloc.h"
 #include "typeInference.h"
 #include "elements/checkSigHashAllTx1.h"
+#include "elements/elementsJets.h"
 #include "elements/primitive.h"
+#include "elements/txEnv.h"
 
 _Static_assert(CHAR_BIT == 8, "Buffers passed to fmemopen presume 8 bit chars");
 
@@ -511,6 +513,223 @@ static void test_elements(void) {
   simplicity_elements_freeTapEnv(taproot);
 }
 
+static void test_elements_full_annex(void) {
+  unsigned char txid[32] = {0};
+  unsigned char prevTxid[32] = {0};
+  rawElementsInput input = (rawElementsInput)
+    { .prevTxid = prevTxid
+    , .sequence = 0xffffffff
+    };
+  rawElementsTransaction rawTx = (rawElementsTransaction)
+    { .txid = txid
+    , .input = &input
+    , .numInputs = 1
+    };
+
+  printf("Test Elements owned full annex\n");
+
+  /* The transaction must own its copy rather than borrow witness memory. */
+  {
+    unsigned char fullBytes[] = {0x50, 0xaa, 0xbb, 0xcc};
+    const unsigned char expected[] = {0x50, 0xaa, 0xbb, 0xcc};
+    rawElementsBuffer annex = { .buf = fullBytes + 1, .len = sizeof(fullBytes) - 1 };
+    rawElementsBuffer fullAnnex = { .buf = fullBytes, .len = sizeof(fullBytes) };
+    rawElementsBuffer owned = {0};
+    input.annex = &annex;
+    input.fullAnnex = &fullAnnex;
+
+    elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
+    input.fullAnnex = NULL;
+    elementsTransaction* legacyTx = simplicity_elements_mallocTransaction(&rawTx);
+    input.fullAnnex = &fullAnnex;
+    if (tx && legacyTx &&
+        0 == memcmp(&tx->input[0].annexHash, &legacyTx->input[0].annexHash, sizeof(tx->input[0].annexHash)) &&
+        0 == memcmp(&tx->inputAnnexesHash, &legacyTx->inputAnnexesHash, sizeof(tx->inputAnnexesHash)) &&
+        0 == memcmp(&tx->txHash, &legacyTx->txHash, sizeof(tx->txHash))) {
+      successes++;
+    } else {
+      failures++;
+      printf("Owning a full annex changed legacy transaction hashes\n");
+    }
+    simplicity_elements_freeTransaction(legacyTx);
+
+    memset(fullBytes, 0, sizeof(fullBytes));
+    if (tx && simplicity_elements_getInputFullAnnex(tx, 0, &owned) &&
+        owned.len == sizeof(expected) && 0 == memcmp(owned.buf, expected, sizeof(expected))) {
+      successes++;
+    } else {
+      failures++;
+      printf("Full annex was not retained as an owned exact copy\n");
+    }
+
+    owned = (rawElementsBuffer){ .buf = expected, .len = sizeof(expected) };
+    if (tx && !simplicity_elements_getInputFullAnnex(tx, 1, &owned) && !owned.buf && 0 == owned.len) {
+      successes++;
+    } else {
+      failures++;
+      printf("Out-of-range full annex lookup did not fail closed\n");
+    }
+    simplicity_elements_freeTransaction(tx);
+  }
+
+  /* A tag-only annex is exact and remains distinguishable from no annex. */
+  {
+    const unsigned char fullBytes[] = {0x50};
+    rawElementsBuffer annex = { .buf = NULL, .len = 0 };
+    rawElementsBuffer fullAnnex = { .buf = fullBytes, .len = sizeof(fullBytes) };
+    rawElementsBuffer owned = {0};
+    input.annex = &annex;
+    input.fullAnnex = &fullAnnex;
+
+    elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
+    if (tx && simplicity_elements_getInputFullAnnex(tx, 0, &owned) &&
+        1 == owned.len && 0x50 == owned.buf[0]) {
+      successes++;
+    } else {
+      failures++;
+      printf("Tag-only full annex was not retained\n");
+    }
+    simplicity_elements_freeTransaction(tx);
+  }
+
+  /* The exact 512 KiB limit is retained; one byte more is not. */
+  {
+    unsigned char* fullBytes = malloc(SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE + 1U);
+    if (!fullBytes) {
+      failures++;
+      printf("Unable to allocate full annex boundary test buffer\n");
+    } else {
+      memset(fullBytes, 0x5a, SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE + 1U);
+      fullBytes[0] = 0x50;
+      rawElementsBuffer annex =
+        { .buf = fullBytes + 1
+        , .len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE - 1U
+        };
+      rawElementsBuffer fullAnnex =
+        { .buf = fullBytes
+        , .len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE
+        };
+      rawElementsBuffer owned = {0};
+      input.annex = &annex;
+      input.fullAnnex = &fullAnnex;
+
+      elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
+      if (tx && simplicity_elements_getInputFullAnnex(tx, 0, &owned) &&
+          SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE == owned.len &&
+          0x50 == owned.buf[0] && 0x5a == owned.buf[owned.len - 1]) {
+        successes++;
+      } else {
+        failures++;
+        printf("Maximum-size full annex was not retained\n");
+      }
+      simplicity_elements_freeTransaction(tx);
+
+      annex.len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE;
+      fullAnnex.len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE + 1U;
+      owned = (rawElementsBuffer){ .buf = fullBytes, .len = 1 };
+      tx = simplicity_elements_mallocTransaction(&rawTx);
+      if (tx && !simplicity_elements_getInputFullAnnex(tx, 0, &owned) && !owned.buf && 0 == owned.len) {
+        successes++;
+      } else {
+        failures++;
+        printf("Oversized full annex was unexpectedly retained\n");
+      }
+      simplicity_elements_freeTransaction(tx);
+      free(fullBytes);
+    }
+  }
+
+  /* Inconsistent optional bytes are ignored without breaking legacy annexes. */
+  {
+    const unsigned char annexBytes[] = {0x11, 0x22};
+    const unsigned char fullBytes[] = {0x50, 0x11, 0x23};
+    rawElementsBuffer annex = { .buf = annexBytes, .len = sizeof(annexBytes) };
+    rawElementsBuffer fullAnnex = { .buf = fullBytes, .len = sizeof(fullBytes) };
+    rawElementsBuffer owned = {0};
+    input.annex = &annex;
+    input.fullAnnex = &fullAnnex;
+
+    elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
+    if (tx && !simplicity_elements_getInputFullAnnex(tx, 0, &owned) && !owned.buf && 0 == owned.len) {
+      successes++;
+    } else {
+      failures++;
+      printf("Inconsistent full annex was unexpectedly retained\n");
+    }
+    simplicity_elements_freeTransaction(tx);
+  }
+}
+
+static bool check_current_bmm_parent_mtp(bool present, uint_fast64_t value) {
+  txEnv env =
+    { .bmmParentMtp = value
+    , .bmmParentMtpPresent = present
+    };
+  UWORD output[ROUND_UWORD(65)] = {0};
+  frameItem dst = initWriteFrame(65, &output[ROUND_UWORD(65)]);
+  frameItem result;
+
+  if (!simplicity_current_bmm_parent_mtp(&dst, (frameItem){0}, &env) || 0 != dst.offset) {
+    return false;
+  }
+
+  result = initReadFrame(65, output);
+  if (present != readBit(&result)) {
+    return false;
+  }
+  return !present || value == simplicity_read64(&result);
+}
+
+static void test_current_bmm_parent_mtp(void) {
+  static const unsigned char encodedProgram[] = {0x7c, 0x38, 0xcc};
+  static const uint32_t expectedCmr[8] =
+    { 0x12dc3d4f, 0x22466873, 0xdaaf83b1, 0x0e1cfa1e
+    , 0xa551e23a, 0xe7d0fbd6, 0xd9da64ce, 0x7e89a3e2
+    };
+  printf("Test current_bmm_parent_mtp jet\n");
+
+  if (check_current_bmm_parent_mtp(false, UINT64_MAX)) {
+    successes++;
+  } else {
+    failures++;
+    printf("Absent BMM parent MTP did not produce None\n");
+  }
+
+  if (check_current_bmm_parent_mtp(true, 0)) {
+    successes++;
+  } else {
+    failures++;
+    printf("Zero BMM parent MTP did not round-trip through Some\n");
+  }
+
+  if (check_current_bmm_parent_mtp(true, UINT64_MAX)) {
+    successes++;
+  } else {
+    failures++;
+    printf("Maximum BMM parent MTP did not round-trip through Some\n");
+  }
+
+  {
+    bitstream stream = initializeBitstream(encodedProgram, sizeof(encodedProgram));
+    dag_node* dag = NULL;
+    int_fast32_t len = simplicity_decodeMallocDag(&dag, simplicity_elements_decodeJet, NULL, &stream);
+    simplicity_err closeError = dag ? simplicity_closeBitstream(&stream) : SIMPLICITY_ERR_BITSTREAM_EOF;
+    if (1 == len && dag && IS_OK(closeError) && JET == dag[0].tag &&
+        simplicity_current_bmm_parent_mtp == dag[0].jet && 108 == dag[0].cost &&
+        0 == memcmp(expectedCmr, dag[0].cmr.s, sizeof(expectedCmr))) {
+      successes++;
+    } else {
+      failures++;
+      printf("Canonical current_bmm_parent_mtp encoding did not decode to the generated jet node "
+             "(len=%jd, close=%d, tag=%d, jet=%d, cost=%ju, cmr=%d)\n",
+             (intmax_t)len, (int)closeError, dag ? (int)dag[0].tag : -1,
+             dag && simplicity_current_bmm_parent_mtp == dag[0].jet,
+             dag ? (uintmax_t)dag[0].cost : 0, dag ? memcmp(expectedCmr, dag[0].cmr.s, sizeof(expectedCmr)) : -1);
+    }
+    simplicity_free(dag);
+  }
+}
+
 static sha256_midstate hashint(uint_fast32_t n) {
   sha256_midstate result;
   sha256_context ctx = sha256_init(result.s);
@@ -765,6 +984,8 @@ int main(int argc, char **argv) {
   test_program("schnorr6", schnorr6, sizeof_schnorr6, schnorr6_witness, sizeof_schnorr6_witness, SIMPLICITY_ERR_EXEC_JET, schnorr6_cmr, schnorr6_ihr, schnorr6_amr, &schnorr0_cost);
   test_program("typeSkipTest", typeSkipTest, sizeof_typeSkipTest, typeSkipTest_witness, sizeof_typeSkipTest_witness, SIMPLICITY_NO_ERROR, NULL, NULL, NULL, NULL);
   test_elements();
+  test_elements_full_annex();
+  test_current_bmm_parent_mtp();
   exactBudget_test();
   regression_tests();
   iden8mebi_test();

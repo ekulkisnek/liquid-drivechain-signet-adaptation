@@ -18,7 +18,7 @@
  * Parsing this envelope does not verify the proof.  In particular, callers
  * must not interpret ParseUsddSp1ProofAnnex() success as authorization to mint
  * or release an asset.  Consensus code fails closed until a specific SP1
- * verifier and guest verification-key allowlist are implemented.
+ * verifier and guest-program-ID allowlist are implemented.
  *
  * All integer fields are unsigned big-endian:
  *
@@ -31,7 +31,8 @@
  *   13      2   flags (must be zero)
  *   15      4   public-values byte length
  *   19      4   proof byte length
- *   23     32   SHA-256 digest of the authorized guest verification key
+ *   23     32   SP1 HashableKey::hash_bytes program ID: eight canonical
+ *               KoalaBear field words in big-endian order (not SHA256(vkey))
  *   55      n   public values followed by opaque proof bytes
  */
 namespace usdd {
@@ -60,7 +61,7 @@ enum class Sp1AnnexError {
     EMPTY_PUBLIC_VALUES,
     PUBLIC_VALUES_TOO_LARGE,
     EMPTY_PROOF,
-    ZERO_GUEST_VKEY,
+    ZERO_GUEST_PROGRAM_ID,
     LENGTH_MISMATCH,
 };
 
@@ -74,7 +75,7 @@ enum class Sp1ConsensusGateResult {
 
 struct Sp1ProofAnnexView {
     Sp1StatementKind statement_kind{Sp1StatementKind::ETH_STATE_V1};
-    Span<const unsigned char> guest_vkey_hash{};
+    Span<const unsigned char> guest_program_id{};
     Span<const unsigned char> public_values{};
     Span<const unsigned char> proof{};
 };
@@ -119,16 +120,16 @@ inline Sp1AnnexError ParseUsddSp1ProofAnnex(Span<const unsigned char> annex, Sp1
     if (public_values_size > SP1_PUBLIC_VALUES_MAX_SIZE) return Sp1AnnexError::PUBLIC_VALUES_TOO_LARGE;
     if (proof_size == 0) return Sp1AnnexError::EMPTY_PROOF;
 
-    const Span<const unsigned char> guest_vkey_hash = annex.subspan(23, 32);
-    if (std::all_of(guest_vkey_hash.begin(), guest_vkey_hash.end(), [](unsigned char byte) { return byte == 0; })) {
-        return Sp1AnnexError::ZERO_GUEST_VKEY;
+    const Span<const unsigned char> guest_program_id = annex.subspan(23, 32);
+    if (std::all_of(guest_program_id.begin(), guest_program_id.end(), [](unsigned char byte) { return byte == 0; })) {
+        return Sp1AnnexError::ZERO_GUEST_PROGRAM_ID;
     }
 
     const uint64_t expected_size = uint64_t{SP1_ANNEX_HEADER_SIZE} + public_values_size + proof_size;
     if (expected_size != annex.size()) return Sp1AnnexError::LENGTH_MISMATCH;
 
     result.statement_kind = static_cast<Sp1StatementKind>(annex[11]);
-    result.guest_vkey_hash = guest_vkey_hash;
+    result.guest_program_id = guest_program_id;
     result.public_values = annex.subspan(SP1_ANNEX_HEADER_SIZE, public_values_size);
     result.proof = annex.subspan(SP1_ANNEX_HEADER_SIZE + public_values_size, proof_size);
     return Sp1AnnexError::OK;
@@ -150,7 +151,7 @@ inline const char* Sp1AnnexErrorString(Sp1AnnexError error)
     case Sp1AnnexError::EMPTY_PUBLIC_VALUES: return "empty public values";
     case Sp1AnnexError::PUBLIC_VALUES_TOO_LARGE: return "public values exceed 16 KiB";
     case Sp1AnnexError::EMPTY_PROOF: return "empty proof";
-    case Sp1AnnexError::ZERO_GUEST_VKEY: return "zero guest verification-key hash";
+    case Sp1AnnexError::ZERO_GUEST_PROGRAM_ID: return "zero SP1 guest program ID";
     case Sp1AnnexError::LENGTH_MISMATCH: return "declared lengths do not match annex";
     }
     return "unknown USDD annex error";

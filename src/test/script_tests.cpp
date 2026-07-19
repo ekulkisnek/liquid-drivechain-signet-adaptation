@@ -204,7 +204,7 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
     BOOST_CHECK(usdd::IsUsddSp1ProofAnnex(valid));
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(valid, view) == usdd::Sp1AnnexError::OK);
     BOOST_CHECK(view.statement_kind == usdd::Sp1StatementKind::ETH_STATE_V1);
-    BOOST_CHECK_EQUAL(view.guest_vkey_hash.size(), 32U);
+    BOOST_CHECK_EQUAL(view.guest_program_id.size(), 32U);
     BOOST_CHECK_EQUAL(view.public_values.size(), 3U);
     BOOST_CHECK_EQUAL(view.proof.size(), 4U);
     BOOST_CHECK_EQUAL(view.public_values[0], 0x17);
@@ -251,7 +251,7 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::EMPTY_PROOF);
     changed = valid;
     std::fill(changed.begin() + 23, changed.begin() + 55, 0);
-    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::ZERO_GUEST_VKEY);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::ZERO_GUEST_PROGRAM_ID);
     changed = valid;
     WriteUint32BE(changed, 19, 5);
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::LENGTH_MISMATCH);

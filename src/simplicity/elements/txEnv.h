@@ -181,13 +181,16 @@ typedef struct assetIssuance {
  */
 typedef struct sigInput {
   sha256_midstate annexHash;
+  const unsigned char* fullAnnex;
   sha256_midstate pegin;
   sha256_midstate scriptSigHash;
   outpoint prevOutpoint;
   utxo txo;
   uint_fast32_t sequence;
   assetIssuance issuance;
+  uint_fast32_t fullAnnexLen;
   bool hasAnnex;
+  bool hasFullAnnex;
   bool isPegin;
 } sigInput;
 
