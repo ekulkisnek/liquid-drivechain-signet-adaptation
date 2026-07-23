@@ -866,3 +866,19 @@ BOOST_AUTO_TEST_CASE(test_assumeutxo)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+struct ElementsTestingSetup : public TestingSetup {
+    ElementsTestingSetup() : TestingSetup{CBaseChainParams::ELEMENTS} {}
+};
+
+BOOST_FIXTURE_TEST_SUITE(elements_startup_validation_tests, ElementsTestingSetup)
+
+BOOST_AUTO_TEST_CASE(activates_genesis_from_empty_chain)
+{
+    const CBlockIndex* tip = m_node.chainman->ActiveChain().Tip();
+    BOOST_REQUIRE(tip != nullptr);
+    BOOST_CHECK_EQUAL(tip->nHeight, 0);
+    BOOST_CHECK_EQUAL(tip->GetBlockHash(), Params().HashGenesisBlock());
+}
+
+BOOST_AUTO_TEST_SUITE_END()

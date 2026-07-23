@@ -3776,7 +3776,8 @@ bool CChainState::ReconcileDrivechainAnchors(BlockValidationState& state, bool& 
         }
 
         if (chain_status == DrivechainAnchorStatus::ACTIVE) {
-            if (!setBlockIndexCandidates.value_comp()(candidate, m_chain.Tip())) {
+            if (m_chain.Tip() == nullptr ||
+                !setBlockIndexCandidates.value_comp()(candidate, m_chain.Tip())) {
                 setBlockIndexCandidates.insert(candidate);
                 m_drivechain_suppressed_candidates.erase(candidate);
             }
