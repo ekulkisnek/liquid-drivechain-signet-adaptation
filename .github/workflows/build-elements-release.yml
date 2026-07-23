@@ -1,0 +1,90 @@
+name: Build Elements release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit to build
+        required: true
+        default: bf8e9e1e5a6453b3a0573ff57cf9c92b2b3afe2b
+      release_tag:
+        description: Existing GitHub release tag to receive the archives
+        required: true
+        default: elements-bf8e9e1e
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            script: build_linux_bf8e9e1e.sh
+            package: liquid-signet-elements-bf8e9e1e-linux-x86_64.tar.gz
+            packages: ""
+          - name: Windows x86_64
+            script: build_windows_bf8e9e1e.sh
+            package: liquid-signet-elements-bf8e9e1e-windows-x86_64.zip
+            packages: g++-mingw-w64-x86-64-posix
+
+    steps:
+      - name: Check out release recipes
+        uses: actions/checkout@v4
+        with:
+          path: recipes
+
+      - name: Check out exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+
+      - name: Install build dependencies
+        env:
+          EXTRA_PACKAGES: ${{ matrix.packages }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake bison bsdmainutils build-essential cmake curl \
+            file git jq libtool patch pkg-config python3 python3-setuptools \
+            unzip zip $EXTRA_PACKAGES
+
+      - name: Build, test, and package
+        env:
+          REPO: ${{ github.workspace }}/source
+          ARTIFACT_DIR: ${{ github.workspace }}/artifacts
+          LOG_DIR: ${{ github.workspace }}/release-logs
+          JOBS: "2"
+        run: |
+          "${{ github.workspace }}/recipes/contrib/release/${{ matrix.script }}"
+
+      - name: Verify package checksum
+        run: |
+          sha256sum "artifacts/${{ matrix.package }}"
+          file "artifacts/${{ matrix.package }}"
+
+      - name: Preserve logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ matrix.script }}
+          path: |
+            artifacts/${{ matrix.package }}
+            release-logs/
+          if-no-files-found: warn
+
+      - name: Upload to draft release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ inputs.release_tag }}" \
+            "artifacts/${{ matrix.package }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
