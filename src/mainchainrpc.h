@@ -13,6 +13,7 @@
 #include <uint256.h>
 
 #include <consensus/amount.h>
+#include <fs.h>
 #include <serialize.h>
 
 #include <cstdint>
@@ -26,6 +27,11 @@
 
 class CBlock;
 struct DrivechainAnchor;
+
+/** Read one canonical Bitcoin Core cookie without following a final symlink. */
+bool ReadNativeDrivechainCookieFile(const fs::path& path,
+                                    std::string& cookie,
+                                    std::string* error = nullptr);
 
 /** True only when slot is the BIP300/301 slot configured for this network. */
 bool IsDrivechainSidechainSlot(int slot);
@@ -89,12 +95,73 @@ struct DrivechainPendingProposal {
     }
 };
 
+/** One chronologically ordered BIP300 M3 proposal and its M4 ACK score. */
+struct DrivechainPendingWithdrawal {
+    uint256 m6id;
+    uint32_t proposal_height{0};
+    uint16_t vote_count{1};
+
+    SERIALIZE_METHODS(DrivechainPendingWithdrawal, obj)
+    {
+        READWRITE(obj.m6id, obj.proposal_height, obj.vote_count);
+    }
+};
+
+/** Replay state needed for active slots other than this Elements slot. */
+struct DrivechainAuxiliarySlotState {
+    uint256 active_proposal_hash;
+    std::map<uint256, DrivechainPendingProposal> pending_proposals;
+    std::vector<DrivechainPendingWithdrawal> pending_withdrawals;
+    std::optional<Sidechain::Bitcoin::COutPoint> ctip;
+    CAmount ctip_value{0};
+
+    SERIALIZE_METHODS(DrivechainAuxiliarySlotState, obj)
+    {
+        READWRITE(obj.active_proposal_hash,
+                  obj.pending_proposals,
+                  obj.pending_withdrawals);
+        bool has_ctip = obj.ctip.has_value();
+        READWRITE(has_ctip);
+        SER_READ(obj, {
+            if (has_ctip) {
+                obj.ctip.emplace();
+            } else {
+                obj.ctip.reset();
+            }
+        });
+        if (has_ctip) READWRITE(obj.ctip.value());
+        READWRITE(obj.ctip_value);
+    }
+};
+
+enum class DrivechainM4ActionType : uint8_t {
+    UPVOTE = 1,
+    ALARM = 2,
+};
+
+/** Effective M4 action retained so version 0 (RepeatPrevious) is deterministic. */
+struct DrivechainPreviousM4Action {
+    DrivechainM4ActionType type{DrivechainM4ActionType::UPVOTE};
+    uint256 m6id;
+
+    SERIALIZE_METHODS(DrivechainPreviousM4Action, obj)
+    {
+        uint8_t type = static_cast<uint8_t>(obj.type);
+        READWRITE(type);
+        SER_READ(obj, obj.type = static_cast<DrivechainM4ActionType>(type));
+        READWRITE(obj.m6id);
+    }
+};
+
 struct DrivechainParentReplayState {
     uint256 active_proposal_hash;
     bool required_proposal_activated{false};
     uint32_t required_activation_height{0};
     uint256 required_activation_block_hash;
     std::map<uint256, DrivechainPendingProposal> pending_proposals;
+    std::vector<DrivechainPendingWithdrawal> pending_withdrawals;
+    std::map<uint8_t, DrivechainAuxiliarySlotState> auxiliary_slots;
+    std::map<uint8_t, DrivechainPreviousM4Action> previous_m4_actions;
     std::optional<Sidechain::Bitcoin::COutPoint> ctip;
     CAmount ctip_value{0};
 
@@ -104,7 +171,10 @@ struct DrivechainParentReplayState {
                   obj.required_proposal_activated,
                   obj.required_activation_height,
                   obj.required_activation_block_hash,
-                  obj.pending_proposals);
+                  obj.pending_proposals,
+                  obj.pending_withdrawals,
+                  obj.auxiliary_slots,
+                  obj.previous_m4_actions);
         bool has_ctip = obj.ctip.has_value();
         READWRITE(has_ctip);
         SER_READ(obj, {
@@ -329,6 +399,8 @@ bool ApplyDrivechainParentBlockState(
     uint16_t unused_slot_activation_threshold,
     uint16_t used_slot_proposal_max_age,
     uint16_t used_slot_activation_threshold,
+    uint16_t withdrawal_bundle_max_age,
+    uint16_t withdrawal_bundle_inclusion_threshold,
     DrivechainParentReplayState& state,
     std::vector<DrivechainMintableDeposit>* deposits = nullptr,
     std::string* error = nullptr);

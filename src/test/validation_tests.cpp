@@ -18,18 +18,85 @@
 #include <streams.h>
 #include <uint256.h>
 #include <util/strencodings.h>
+#include <util/system.h>
 #include <validation.h>
+#include <wallet/drivechain_withdrawal.h>
 
 #include <test/util/setup_common.h>
 
 #include <limits>
 #include <cstring>
+#include <fstream>
+
+#ifndef WIN32
+#include <sys/stat.h>
+#endif
 
 #include <boost/test/unit_test.hpp>
 
 namespace Bitcoin = Sidechain::Bitcoin;
 
 BOOST_FIXTURE_TEST_SUITE(validation_tests, TestingSetup)
+
+BOOST_AUTO_TEST_CASE(drivechain_withdrawal_bundle_wire_format)
+{
+    const CAmount amount{2'000'000};
+    const CAmount mainchain_fee{1'000};
+    const CScript payout_script = CScript() << OP_0 <<
+        std::vector<unsigned char>(20, 0x11);
+    const COutPoint withdrawal_outpoint(uint256::ONE, 7);
+
+    const wallet::DrivechainWithdrawalBundle bundle =
+        wallet::BuildDrivechainWithdrawalBundle(
+            amount, mainchain_fee, payout_script, withdrawal_outpoint, 42);
+    BOOST_CHECK_EQUAL(
+        HexStr(bundle.bytes),
+        "020000000001000300000000000000000a6a0800000000000003e8"
+        "0000000000000000226a20f62b45f18ab38ddcfbd04c0828e56db8"
+        "d872235fb4c4780840980aa0a8de0d5e98801e0000000000160014"
+        "111111111111111111111111111111111111111100000000");
+
+    BOOST_REQUIRE_GE(bundle.bytes.size(), 7U);
+    BOOST_CHECK_EQUAL(bundle.bytes[4], 0); // SegWit marker
+    BOOST_CHECK_EQUAL(bundle.bytes[5], 1); // SegWit flag
+    BOOST_CHECK_EQUAL(bundle.bytes[6], 0); // actual empty vin
+
+    // The enforcer uses rust-bitcoin's explicit inputless-transaction decoder.
+    // Core's generic decoder rejects this deliberately non-broadcastable
+    // blinded form, so decode its vector of outputs independently here.
+    CDataStream payload(
+        std::vector<unsigned char>(bundle.bytes.begin() + 7, bundle.bytes.end()),
+        SER_NETWORK, 0);
+    std::vector<Bitcoin::CTxOut> outputs;
+    uint32_t lock_time{0};
+    payload >> outputs >> lock_time;
+    BOOST_CHECK(payload.empty());
+    BOOST_CHECK_EQUAL(lock_time, 0);
+    BOOST_REQUIRE_EQUAL(outputs.size(), 3U);
+    BOOST_CHECK_EQUAL(outputs[0].nValue, 0);
+    BOOST_CHECK_EQUAL(outputs[1].nValue, 0);
+    BOOST_CHECK_EQUAL(outputs[2].nValue, amount - mainchain_fee);
+    BOOST_CHECK(outputs[2].scriptPubKey == payout_script);
+
+    std::vector<unsigned char> no_witness_bytes;
+    no_witness_bytes.insert(
+        no_witness_bytes.end(), bundle.bytes.begin(), bundle.bytes.begin() + 4);
+    no_witness_bytes.insert(
+        no_witness_bytes.end(), bundle.bytes.begin() + 6, bundle.bytes.end());
+    BOOST_CHECK_EQUAL(Hash(no_witness_bytes), bundle.m6id);
+    BOOST_CHECK_EQUAL(
+        bundle.m6id.GetHex(),
+        "ce1626e43b1d163acaf3fac8ab9f6fb78158d99c53e25bbffdde3c9ed75f0e4b");
+
+    std::vector<unsigned char> fee_bytes;
+    fee_bytes.reserve(8);
+    for (int byte = 7; byte >= 0; --byte) {
+        fee_bytes.push_back((static_cast<uint64_t>(mainchain_fee) >>
+                             (8 * byte)) & 0xff);
+    }
+    BOOST_CHECK(outputs[0].scriptPubKey ==
+                (CScript() << OP_RETURN << fee_bytes));
+}
 
 static void TestBlockSubsidyHalvings(const Consensus::Params& consensusParams)
 {
@@ -141,6 +208,185 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_rpc_host_is_loopback_only)
     // Ordinary Elements networks preserve their existing hostname support.
     BOOST_CHECK(IsMainchainRPCHostAllowed("localhost", false));
     BOOST_CHECK(IsMainchainRPCHostAllowed("parent.example", false));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_json_rpc_server_is_loopback_only)
+{
+    ArgsManager args;
+    std::string error;
+    BOOST_CHECK(ValidateNativeDrivechainRpcServerConfig(args, &error));
+    BOOST_CHECK(error.empty());
+
+    args.ForceSetArg("-rpcbind", "127.0.0.1");
+    BOOST_CHECK(ValidateNativeDrivechainRpcServerConfig(args, &error));
+    BOOST_CHECK(error.empty());
+    args.ForceSetArg("-rpcbind", "[::1]:7041");
+    BOOST_CHECK(ValidateNativeDrivechainRpcServerConfig(args, &error));
+    BOOST_CHECK(error.empty());
+
+    for (const std::string& unsafe : {
+             "0.0.0.0", "[::]:7041", "192.168.1.10", "localhost",
+             "rpc.example:7041"}) {
+        args.ForceSetArg("-rpcbind", unsafe);
+        BOOST_CHECK(!ValidateNativeDrivechainRpcServerConfig(args, &error));
+        BOOST_CHECK(error.find("numeric IPv4 127/8 or IPv6 ::1") !=
+                    std::string::npos);
+    }
+
+    // Existing authenticated local clients may retain explicit static auth or
+    // rpcauth; transport remains local even when rpcallowip is also present.
+    args.ForceSetArg("-rpcbind", "127.0.0.1");
+    args.ForceSetArg("-rpcallowip", "127.0.0.1");
+    args.ForceSetArg("-rpcuser", "bitwindow");
+    args.ForceSetArg("-rpcpassword", "local-only-test-secret");
+    BOOST_CHECK(ValidateNativeDrivechainRpcServerConfig(args, &error));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_parent_cookie_is_atomic_private_and_canonical)
+{
+    const fs::path directory = m_path_root / "drivechain-parent-cookie";
+    fs::create_directories(directory);
+    const fs::path cookie_path = directory / ".cookie";
+    const std::string expected = "__cookie__:" + std::string(64, 'a');
+    {
+        std::ofstream output(cookie_path, std::ios::binary);
+        output << expected << '\n';
+        BOOST_REQUIRE(output.good());
+    }
+#ifndef WIN32
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cookie_path).c_str(), 0600), 0);
+#endif
+
+    std::string cookie;
+    std::string error;
+    BOOST_CHECK(ReadNativeDrivechainCookieFile(cookie_path, cookie, &error));
+    BOOST_CHECK_EQUAL(cookie, expected);
+    BOOST_CHECK(error.empty());
+
+    {
+        std::ofstream output(cookie_path, std::ios::binary | std::ios::trunc);
+        output << "static-user:static-password\n";
+        BOOST_REQUIRE(output.good());
+    }
+    BOOST_CHECK(!ReadNativeDrivechainCookieFile(cookie_path, cookie, &error));
+    BOOST_CHECK(error.find("canonical rotating") != std::string::npos);
+
+#ifndef WIN32
+    {
+        std::ofstream output(cookie_path, std::ios::binary | std::ios::trunc);
+        output << expected << '\n';
+        BOOST_REQUIRE(output.good());
+    }
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cookie_path).c_str(), 0644), 0);
+    BOOST_CHECK(!ReadNativeDrivechainCookieFile(cookie_path, cookie, &error));
+    BOOST_CHECK(error.find("deny all group and other access") != std::string::npos);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cookie_path).c_str(), 0600), 0);
+
+    const fs::path cookie_link = directory / "linked-cookie";
+    fs::create_symlink(cookie_path, cookie_link);
+    BOOST_CHECK(!ReadNativeDrivechainCookieFile(cookie_link, cookie, &error));
+    BOOST_CHECK(error.find("securely open") != std::string::npos);
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_grpc_requires_authenticated_tls)
+{
+    const fs::path credentials = m_path_root / "drivechain-grpc-tls";
+    fs::create_directories(credentials);
+    const fs::path ca = credentials / "ca.pem";
+    const fs::path certificate = credentials / "elements-client.pem";
+    const fs::path key = credentials / "elements-client-key.pem";
+    for (const fs::path& path : {ca, certificate, key}) {
+        std::ofstream output(fs::PathToString(path));
+        output << "test credential\n";
+        BOOST_REQUIRE(output.good());
+    }
+
+#ifndef WIN32
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(ca).c_str(), 0644), 0);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(certificate).c_str(), 0644), 0);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(key).c_str(), 0600), 0);
+#endif
+
+    ArgsManager args;
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
+    args.ForceSetArg("-drivechainbmmgrpcca", fs::PathToString(ca));
+    args.ForceSetArg("-drivechainbmmgrpccert", fs::PathToString(certificate));
+    args.ForceSetArg("-drivechainbmmgrpckey", fs::PathToString(key));
+
+    std::string error;
+    BOOST_CHECK(ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.empty());
+
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "http://127.0.0.1:55051");
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("without a URL scheme") != std::string::npos);
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
+
+    args.ForceSetArg("-drivechainbmmgrpcauthority", "enforcer.local\nplaintext");
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("control characters") != std::string::npos);
+    args.ForceSetArg("-drivechainbmmgrpcauthority", "enforcer.local");
+
+    args.ForceSetArg("-drivechainbmmgrpcca",
+                     fs::PathToString(credentials / "missing-ca.pem"));
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("not a regular file") != std::string::npos);
+    args.ForceSetArg("-drivechainbmmgrpcca", fs::PathToString(ca));
+
+#ifndef WIN32
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(credentials).c_str(), 0770), 0);
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("credential directory") != std::string::npos);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(credentials).c_str(), 0700), 0);
+
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(key).c_str(), 0644), 0);
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("deny all group and other access") != std::string::npos);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(key).c_str(), 0600), 0);
+
+    const fs::path key_link = credentials / "linked-key.pem";
+    fs::create_symlink(key, key_link);
+    args.ForceSetArg("-drivechainbmmgrpckey", fs::PathToString(key_link));
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("non-symlink") != std::string::npos);
+    args.ForceSetArg("-drivechainbmmgrpckey", fs::PathToString(key));
+
+    const fs::path fake_grpcurl = credentials / "grpcurl";
+    {
+        std::ofstream output(fs::PathToString(fake_grpcurl));
+        output << "#!/bin/sh\nfor argument in \"$@\"; do printf '%s\\n' \"$argument\"; done\n";
+        BOOST_REQUIRE(output.good());
+    }
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(fake_grpcurl).c_str(), 0700), 0);
+    args.ForceSetArg("-drivechainbmmgrpcurl", fs::PathToString(fake_grpcurl));
+    const BoundedCommandResult invocation = RunAuthenticatedDrivechainGrpc(
+        args,
+        "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+        "{\"sidechainId\":24}", std::chrono::seconds{2}, 4096);
+    BOOST_CHECK(invocation.started);
+    BOOST_CHECK(invocation.exited);
+    BOOST_CHECK_EQUAL(invocation.exit_code, 0);
+    BOOST_CHECK(invocation.error.empty());
+    BOOST_CHECK(invocation.output.find("-cacert\n") != std::string::npos);
+    BOOST_CHECK(invocation.output.find("-cert\n") != std::string::npos);
+    BOOST_CHECK(invocation.output.find("-key\n") != std::string::npos);
+    BOOST_CHECK(invocation.output.find("-plaintext") == std::string::npos);
+    BOOST_CHECK(invocation.output.find("127.0.0.1:55051\n") != std::string::npos);
+#endif
+
+    const BoundedCommandResult unknown_method = RunAuthenticatedDrivechainGrpc(
+        args, "grpc.health.v1.Health/Check", "{}",
+        std::chrono::seconds{1}, 1024);
+    BOOST_CHECK(!unknown_method.started);
+    BOOST_CHECK(unknown_method.error.find("unrecognized") != std::string::npos);
+
+    const BoundedCommandResult non_object_payload = RunAuthenticatedDrivechainGrpc(
+        args,
+        "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+        "[]", std::chrono::seconds{1}, 1024);
+    BOOST_CHECK(!non_object_payload.started);
+    BOOST_CHECK(non_object_payload.error.find("JSON object") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_mempool_epoch_fences_native_pegins)
@@ -825,12 +1071,18 @@ BOOST_AUTO_TEST_CASE(drivechain_unknown_sibling_headers_are_not_indexed)
         original_index_size);
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_withdrawal_capability_is_fail_closed)
+BOOST_AUTO_TEST_CASE(drivechain_withdrawal_capability_requires_replay_or_explicit_flag)
 {
     Consensus::Params params;
     BOOST_CHECK(!params.DrivechainWithdrawalValidationEnabled());
 
     params.drivechain_slot = uint8_t{24};
+    BOOST_CHECK(!params.DrivechainWithdrawalValidationEnabled());
+
+    params.drivechain_parent_state_replay_version = 2;
+    BOOST_CHECK(params.DrivechainWithdrawalValidationEnabled());
+
+    params.drivechain_parent_state_replay_version = 0;
     BOOST_CHECK(!params.DrivechainWithdrawalValidationEnabled());
 
     params.drivechain_m6_withdrawal_validation = true;

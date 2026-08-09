@@ -144,7 +144,7 @@ std::string GetDefaultMainchainAuthCookieFile(const std::string& chain)
 }
 
 /** Get name mainchain RPC authentication cookie file */
-static fs::path GetMainchainAuthCookieFile()
+fs::path GetMainchainAuthCookieFile()
 {
     const std::string cookie_file =
         GetDefaultMainchainAuthCookieFile(gArgs.GetChainName());

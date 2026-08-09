@@ -51,7 +51,7 @@ enum class DrivechainReplayStoreReadStatus {
 class DrivechainParentReplayStore final
 {
 public:
-    static constexpr uint32_t SCHEMA_VERSION{1};
+    static constexpr uint32_t SCHEMA_VERSION{3};
 
     DrivechainParentReplayStore(fs::path path, size_t cache_bytes, bool wipe);
     ~DrivechainParentReplayStore();

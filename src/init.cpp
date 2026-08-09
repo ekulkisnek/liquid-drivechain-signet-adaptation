@@ -431,16 +431,16 @@ BoundedCommandResult RunBoundedCommand(
 #endif
 }
 
-static std::string ResolveDrivechainBmmGrpcurlPath()
+static std::string ResolveDrivechainBmmGrpcurlPath(const ArgsManager& args)
 {
-    const std::string configured_path = gArgs.GetArg("-drivechainbmmgrpcurl", "");
+    const std::string configured_path = args.GetArg("-drivechainbmmgrpcurl", "");
     if (!configured_path.empty()) {
         return configured_path;
     }
 
     const std::vector<fs::path> candidates{
-        gArgs.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
-        gArgs.GetDataDirBase().parent_path() / "bin" / "grpcurl",
+        args.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
+        args.GetDataDirBase().parent_path() / "bin" / "grpcurl",
         fs::PathFromString("/opt/homebrew/bin/grpcurl"),
         fs::PathFromString("/usr/local/bin/grpcurl"),
         fs::PathFromString("/usr/bin/grpcurl"),
@@ -452,6 +452,205 @@ static std::string ResolveDrivechainBmmGrpcurlPath()
     }
 
     return "grpcurl";
+}
+
+namespace {
+
+struct DrivechainGrpcTLSConfig {
+    std::string address;
+    fs::path ca_certificate;
+    fs::path client_certificate;
+    fs::path client_key;
+    std::string authority;
+};
+
+fs::path ResolveDrivechainGrpcCredentialPath(const ArgsManager& args,
+                                             const std::string& argument,
+                                             const std::string& fallback)
+{
+    fs::path path = fs::PathFromString(args.GetArg(argument, fallback));
+    if (path.is_absolute()) return path;
+    return fsbridge::AbsPathJoin(args.GetDataDirNet(), path);
+}
+
+DrivechainGrpcTLSConfig GetDrivechainGrpcTLSConfig(const ArgsManager& args)
+{
+    return {
+        args.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051"),
+        ResolveDrivechainGrpcCredentialPath(
+            args, "-drivechainbmmgrpcca", "enforcer-tls/ca.pem"),
+        ResolveDrivechainGrpcCredentialPath(
+            args, "-drivechainbmmgrpccert", "enforcer-tls/elements-client.pem"),
+        ResolveDrivechainGrpcCredentialPath(
+            args, "-drivechainbmmgrpckey", "enforcer-tls/elements-client-key.pem"),
+        args.GetArg("-drivechainbmmgrpcauthority", ""),
+    };
+}
+
+bool ValidateReadableRegularFile(const fs::path& path,
+                                 const bool private_key,
+                                 std::string* error)
+{
+    if (!fs::exists(path) || !fs::is_regular_file(path)) {
+        if (error) {
+            *error = strprintf("required %s is not a regular file: %s",
+                               private_key ? "mTLS client key" : "mTLS certificate",
+                               fs::PathToString(path));
+        }
+        return false;
+    }
+
+    std::ifstream input(path);
+    if (!input.good()) {
+        if (error) {
+            *error = strprintf("required mTLS credential is not readable: %s",
+                               fs::PathToString(path));
+        }
+        return false;
+    }
+
+#ifndef WIN32
+    struct stat metadata {};
+    const std::string native_path = fs::PathToString(path);
+    if (lstat(native_path.c_str(), &metadata) != 0 ||
+        !S_ISREG(metadata.st_mode)) {
+        if (error) {
+            *error = strprintf("mTLS credential must be a non-symlink regular file: %s",
+                               native_path);
+        }
+        return false;
+    }
+    if (metadata.st_uid != geteuid()) {
+        if (error) {
+            *error = strprintf("mTLS credential must be owned by the Elements process user: %s",
+                               native_path);
+        }
+        return false;
+    }
+    const fs::path parent_path = path.parent_path();
+    struct stat parent_metadata {};
+    const std::string native_parent = fs::PathToString(parent_path);
+    if (parent_path.empty() ||
+        lstat(native_parent.c_str(), &parent_metadata) != 0 ||
+        !S_ISDIR(parent_metadata.st_mode) ||
+        parent_metadata.st_uid != geteuid() ||
+        (parent_metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        if (error) {
+            *error = strprintf(
+                "mTLS credential directory must be owned by the Elements process user and deny group/other write access: %s",
+                native_parent);
+        }
+        return false;
+    }
+    const mode_t forbidden = private_key
+        ? (S_IRWXG | S_IRWXO)
+        : (S_IWGRP | S_IWOTH);
+    if ((metadata.st_mode & forbidden) != 0) {
+        if (error) {
+            *error = strprintf(
+                private_key
+                    ? "mTLS client key must deny all group and other access: %s"
+                    : "mTLS certificate must deny group and other write access: %s",
+                native_path);
+        }
+        return false;
+    }
+#endif
+    return true;
+}
+
+} // namespace
+
+bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error)
+{
+    if (error) error->clear();
+    const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
+    if (config.address.empty() || config.address.find("://") != std::string::npos) {
+        if (error) *error = "-drivechainbmmgrpcaddr must be a host:port endpoint without a URL scheme";
+        return false;
+    }
+    if (config.address.size() > 512 ||
+        std::any_of(config.address.begin(), config.address.end(),
+                    [](const unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
+        if (error) *error = "-drivechainbmmgrpcaddr contains whitespace, control characters, or excessive data";
+        return false;
+    }
+    uint16_t port{0};
+    std::string host;
+    SplitHostPort(config.address, port, host);
+    if (host.empty() || host.front() == '-' || port == 0) {
+        if (error) *error = "-drivechainbmmgrpcaddr must contain a non-empty host and nonzero port";
+        return false;
+    }
+    if (!config.authority.empty() &&
+        std::any_of(config.authority.begin(), config.authority.end(),
+                    [](const unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
+        if (error) *error = "-drivechainbmmgrpcauthority contains whitespace or control characters";
+        return false;
+    }
+    return ValidateReadableRegularFile(config.ca_certificate, false, error) &&
+           ValidateReadableRegularFile(config.client_certificate, false, error) &&
+           ValidateReadableRegularFile(config.client_key, true, error);
+}
+
+BoundedCommandResult RunAuthenticatedDrivechainGrpc(
+    const ArgsManager& args,
+    const std::string& method,
+    const std::string& json_payload,
+    const std::chrono::milliseconds timeout,
+    const size_t max_output,
+    const std::function<bool()>& should_cancel)
+{
+    BoundedCommandResult failure;
+    static const std::set<std::string> ALLOWED_METHODS{
+        "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
+        "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+    };
+    if (ALLOWED_METHODS.count(method) == 0) {
+        failure.error = "refusing an unrecognized enforcer gRPC method";
+        return failure;
+    }
+    if (json_payload.empty() || json_payload.size() > (1U << 20)) {
+        failure.error = "enforcer gRPC payload must contain 1..1048576 bytes";
+        return failure;
+    }
+
+    std::string config_error;
+    UniValue parsed_payload;
+    if (!parsed_payload.read(json_payload) || !parsed_payload.isObject()) {
+        failure.error = "enforcer gRPC payload must be one JSON object";
+        return failure;
+    }
+    if (!ValidateDrivechainGrpcTLSConfig(args, &config_error)) {
+        failure.error = config_error;
+        return failure;
+    }
+    const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
+    std::vector<std::string> argv{
+        ResolveDrivechainBmmGrpcurlPath(args),
+        "-cacert", fs::PathToString(config.ca_certificate),
+        "-cert", fs::PathToString(config.client_certificate),
+        "-key", fs::PathToString(config.client_key),
+    };
+    if (!config.authority.empty()) {
+        argv.push_back("-authority");
+        argv.push_back(config.authority);
+    }
+    argv.insert(argv.end(), {
+        "-d", json_payload, config.address, method,
+    });
+    return RunBoundedCommand(argv, timeout, max_output, should_cancel);
+}
+
+BoundedCommandResult RunAuthenticatedDrivechainGrpc(
+    const std::string& method,
+    const std::string& json_payload,
+    const std::chrono::milliseconds timeout,
+    const size_t max_output,
+    const std::function<bool()>& should_cancel)
+{
+    return RunAuthenticatedDrivechainGrpc(
+        gArgs, method, json_payload, timeout, max_output, should_cancel);
 }
 
 static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64_t mainchain_tip_height, const uint256& mainchain_tip_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
@@ -469,8 +668,6 @@ static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64
         throw std::runtime_error(bid_error);
     }
 
-    const std::string grpcurl_path = ResolveDrivechainBmmGrpcurlPath();
-    const std::string grpc_addr = gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051");
     const std::string request = strprintf(
         "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
         sidechain_slot,
@@ -481,13 +678,9 @@ static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64
 
     static constexpr size_t MAX_GRPCURL_OUTPUT{64 * 1024};
     static constexpr auto GRPCURL_TIMEOUT{std::chrono::seconds{10}};
-    const BoundedCommandResult child = RunBoundedCommand(
-        {grpcurl_path,
-         "-plaintext",
-         "-d",
-         request,
-         grpc_addr,
-         "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction"},
+    const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
+        "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
+        request,
         std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
         MAX_GRPCURL_OUTPUT,
         [] { return ShutdownRequested(); });
@@ -699,7 +892,7 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
 
 static void DrivechainL1BlockSyncTick(NodeContext& node)
 {
-    if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", true)) {
+    if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", false)) {
         return;
     }
     if (!Params().GetConsensus().drivechain_slot.has_value()) {
@@ -1306,16 +1499,20 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-validatepegin", "Validate legacy peg-in claims through a fully validating mainchain node. Native drivechain deposits and BMM anchors always require their authenticated mainchain checks regardless of this setting. (default: 1 if chain has a parent)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpchost=<host>", "Address of the operator's fully validating mainchain node. Native drivechain consensus must not use a third-party RPC service. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcport=<n>", strprintf("RPC port of the fully validating mainchain node. (default: %u)", defaultBaseParams->MainchainRPCPort()), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpcuser=<user>", "RPC username for the fully validating mainchain node. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpcpassword=<pwd>", "RPC password for the fully validating mainchain node. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpccookiefile=<file>", "The Bitcoin Signet cookie auth path used to connect to the fully validating parent node. Relative paths are resolved under Bitcoin's data directory. (Elements default: signet/.cookie)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpcuser=<user>", "RPC username for an ordinary network's parent node. Native drivechains reject static credentials and require a private rotating cookie.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpcpassword=<pwd>", "RPC password for an ordinary network's parent node. Native drivechains reject static credentials and require a private rotating cookie.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpccookiefile=<file>", "The Bitcoin Signet cookie auth path used over the native drivechain's numeric loopback-only RPC connection. The cookie must be owned by this process user and inaccessible to group/other users. Relative paths are resolved under Bitcoin's data directory. (Elements default: signet/.cookie)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. Native drivechain validation requires 1..2 seconds because these requests may run on consensus paths. (ordinary-network default: %d; drivechain default: 2)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Enabling this requires authenticated enforcer mTLS credentials. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the funded local enforcer wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used only to submit BIP301 requests; enforcer responses are not consensus evidence. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used only for BIP301 request submission. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer mTLS endpoint used to submit BIP301 requests and withdrawal bundles. URL schemes and plaintext connections are rejected. (default: 127.0.0.1:55051; the enforcer's plaintext loopback listener is normally proxied from 50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used for authenticated enforcer calls. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcca=<file>", "PEM CA certificate used to authenticate the enforcer TLS server. Relative paths are resolved under the Elements network data directory. (default: enforcer-tls/ca.pem)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpccert=<file>", "PEM client certificate presented to the enforcer for mutual TLS. (default: enforcer-tls/elements-client.pem)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpckey=<file>", "PEM client private key for enforcer mutual TLS. On POSIX it must be owned by the Elements process user, must not be a symlink, and must deny all group/other access. (default: enforcer-tls/elements-client-key.pem)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcauthority=<name>", "Optional TLS server name/authority override for an enforcer reached through a local mTLS proxy.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-peginconfirmationdepth=<n>", strprintf("Peg-in claims must be this deep to be considered valid. (default: %d)", DEFAULT_PEGIN_CONFIRMATION_DEPTH), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-parentpubkeyprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 pubkey address. (default: %d)", 111), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-parentscriptprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 script address. (default: %d)", 196), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
@@ -1581,6 +1778,35 @@ bool IsMainchainRPCHostAllowed(const std::string& host,
     return false;
 }
 
+bool ValidateNativeDrivechainRpcServerConfig(const ArgsManager& args,
+                                             std::string* error)
+{
+    if (error) error->clear();
+    const int64_t configured_port = args.GetIntArg(
+        "-rpcport", BaseParams().RPCPort());
+    if (configured_port <= 0 ||
+        configured_port > std::numeric_limits<uint16_t>::max()) {
+        if (error) *error = "-rpcport must be between 1 and 65535";
+        return false;
+    }
+
+    for (const std::string& binding : args.GetArgs("-rpcbind")) {
+        uint16_t port = static_cast<uint16_t>(configured_port);
+        std::string host;
+        SplitHostPort(binding, port, host);
+        if (port == 0 || host.empty() ||
+            !IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true)) {
+            if (error) {
+                *error = strprintf(
+                    "native drivechain JSON-RPC requires a numeric IPv4 127/8 or IPv6 ::1 binding, not %s",
+                    binding);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool AppInitParameterInteraction(ArgsManager& args)
 {
     const CChainParams& chainparams = Params();
@@ -1597,6 +1823,10 @@ bool AppInitParameterInteraction(ArgsManager& args)
     }
     const auto& drivechain_slot = chainparams.GetConsensus().drivechain_slot;
     if (drivechain_slot.has_value()) {
+        std::string local_rpc_error;
+        if (!ValidateNativeDrivechainRpcServerConfig(args, &local_rpc_error)) {
+            return InitError(Untranslated(local_rpc_error));
+        }
         if (args.GetIntArg("-drivechainbmmslot", *drivechain_slot) != *drivechain_slot) {
             return InitError(strprintf(Untranslated("-drivechainbmmslot is immutable for this chain and must be %d"),
                                        *drivechain_slot));
@@ -1643,6 +1873,26 @@ bool AppInitParameterInteraction(ArgsManager& args)
                                        /*native_drivechain=*/true)) {
             return InitError(Untranslated(
                 "-mainchainrpchost must be an IPv4 127/8 or IPv6 ::1 loopback address on a native drivechain network"));
+        }
+        const int64_t parent_rpc_port = args.GetIntArg(
+            "-mainchainrpcport", BaseParams().MainchainRPCPort());
+        if (parent_rpc_port <= 0 ||
+            parent_rpc_port > std::numeric_limits<uint16_t>::max()) {
+            return InitError(Untranslated(
+                "-mainchainrpcport must be between 1 and 65535"));
+        }
+        if (args.IsArgSet("-mainchainrpcuser") ||
+            args.IsArgSet("-mainchainrpcpassword")) {
+            return InitError(Untranslated(
+                "native drivechain parent RPC rejects static user/password credentials; use the private rotating -mainchainrpccookiefile over numeric loopback"));
+        }
+        if (args.GetBoolArg("-drivechainl1blocksync", false)) {
+            std::string tls_error;
+            if (!ValidateDrivechainGrpcTLSConfig(args, &tls_error)) {
+                return InitError(Untranslated(strprintf(
+                    "-drivechainl1blocksync requires authenticated enforcer mTLS: %s",
+                    tls_error)));
+            }
         }
     } else {
         if (args.IsArgSet("-drivechainbmmslot")) {
@@ -2867,7 +3117,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }, DUMP_BANS_INTERVAL);
 
     if (Params().GetConsensus().drivechain_slot.has_value() &&
-        args.GetBoolArg("-drivechainl1blocksync", true)) {
+        args.GetBoolArg("-drivechainl1blocksync", false)) {
         const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
         LogPrintf("Starting drivechain L1 block sync thread, interval %d seconds, mined BIP301 BMM enforcement, sidechain slot %d\n",
             interval_seconds,

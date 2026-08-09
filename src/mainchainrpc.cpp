@@ -8,6 +8,7 @@
 #include <drivechain_parent_replay.h>
 #include <elements_drivechain_identity.h>
 #include <hash.h>
+#include <init.h>
 #include <logging.h>
 #include <primitives/block.h>
 #include <primitives/bitcoin/block.h>
@@ -30,7 +31,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <cstring>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -38,10 +42,125 @@
 #include <set>
 #include <vector>
 
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace Bitcoin = Sidechain::Bitcoin;
 
 static constexpr size_t MAX_MAINCHAIN_RPC_RESPONSE_SIZE{16 * 1024 * 1024};
 static constexpr size_t MAX_MAINCHAIN_RPC_HEADER_SIZE{64 * 1024};
+
+bool ReadNativeDrivechainCookieFile(const fs::path& path,
+                                    std::string& cookie,
+                                    std::string* error)
+{
+    cookie.clear();
+    if (error) error->clear();
+    const std::string native_path = fs::PathToString(path);
+
+#ifndef WIN32
+    const int descriptor = open(
+        native_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        if (error) {
+            *error = strprintf("cannot securely open mainchain RPC cookie %s: %s",
+                               native_path, std::strerror(errno));
+        }
+        return false;
+    }
+
+    struct stat metadata {};
+    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+        if (error) {
+            *error = strprintf("mainchain RPC cookie is not a regular file: %s",
+                               native_path);
+        }
+        close(descriptor);
+        return false;
+    }
+    if (metadata.st_uid != geteuid()) {
+        if (error) {
+            *error = strprintf("mainchain RPC cookie must be owned by the Elements process user: %s",
+                               native_path);
+        }
+        close(descriptor);
+        return false;
+    }
+    if ((metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        if (error) {
+            *error = strprintf("mainchain RPC cookie permissions must deny all group and other access: %s",
+                               native_path);
+        }
+        close(descriptor);
+        return false;
+    }
+
+    static constexpr size_t MAX_COOKIE_FILE_SIZE{256};
+    std::array<char, MAX_COOKIE_FILE_SIZE + 1> contents{};
+    size_t used{0};
+    while (used < contents.size()) {
+        const ssize_t count = read(
+            descriptor, contents.data() + used, contents.size() - used);
+        if (count > 0) {
+            used += static_cast<size_t>(count);
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        if (error) {
+            *error = strprintf("cannot read mainchain RPC cookie %s: %s",
+                               native_path, std::strerror(errno));
+        }
+        close(descriptor);
+        return false;
+    }
+    close(descriptor);
+    if (used == contents.size()) {
+        if (error) *error = "mainchain RPC cookie file is unexpectedly large";
+        return false;
+    }
+    cookie.assign(contents.data(), used);
+#else
+    if (!fs::exists(path) || !fs::is_regular_file(path)) {
+        if (error) {
+            *error = strprintf("mainchain RPC cookie is not a regular file: %s",
+                               native_path);
+        }
+        return false;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) {
+        if (error) {
+            *error = strprintf("cannot read mainchain RPC cookie: %s", native_path);
+        }
+        return false;
+    }
+    cookie.assign(std::istreambuf_iterator<char>(input),
+                  std::istreambuf_iterator<char>());
+    if (cookie.size() > 256) {
+        if (error) *error = "mainchain RPC cookie file is unexpectedly large";
+        return false;
+    }
+#endif
+
+    if (!cookie.empty() && cookie.back() == '\n') cookie.pop_back();
+    if (!cookie.empty() && cookie.back() == '\r') cookie.pop_back();
+    static constexpr const char* COOKIE_PREFIX{"__cookie__:"};
+    static constexpr size_t COOKIE_PREFIX_SIZE{11};
+    if (cookie.rfind(COOKIE_PREFIX, 0) != 0 ||
+        cookie.size() != COOKIE_PREFIX_SIZE + 64 ||
+        !IsHex(cookie.substr(COOKIE_PREFIX_SIZE))) {
+        cookie.clear();
+        if (error) {
+            *error = "mainchain RPC cookie is not a canonical rotating Bitcoin Core cookie";
+        }
+        return false;
+    }
+    return true;
+}
 
 namespace {
 
@@ -132,6 +251,14 @@ std::string GetMainchainRPCCredentials()
 {
     const std::string configured_password =
         gArgs.GetArg("-mainchainrpcpassword", "");
+    const bool native_drivechain =
+        Params().GetConsensus().drivechain_slot.has_value();
+    if (native_drivechain &&
+        (gArgs.IsArgSet("-mainchainrpcuser") ||
+         gArgs.IsArgSet("-mainchainrpcpassword"))) {
+        throw std::runtime_error(
+            "native drivechain parent RPC requires rotating cookie authentication; static user/password credentials are forbidden");
+    }
     if (!configured_password.empty()) {
         return gArgs.GetArg("-mainchainrpcuser", "") + ":" +
                configured_password;
@@ -160,7 +287,15 @@ std::string GetMainchainRPCCredentials()
             "mainchain RPC cookie credentials are not warmed");
     }
     std::string loaded_cookie;
-    if (!GetMainchainAuthCookie(&loaded_cookie)) {
+    std::string cookie_error;
+    const bool loaded = native_drivechain
+        ? ReadNativeDrivechainCookieFile(
+              GetMainchainAuthCookieFile(), loaded_cookie, &cookie_error)
+        : GetMainchainAuthCookie(&loaded_cookie);
+    if (!loaded) {
+        if (native_drivechain && !cookie_error.empty()) {
+            throw std::runtime_error(cookie_error);
+        }
         throw std::runtime_error(strprintf(
             _("Could not locate mainchain RPC credentials. No authentication cookie could be found, and no mainchainrpcpassword is set in the configuration file (%s)").translated,
             gArgs.GetArg("-conf", BITCOIN_CONF_FILENAME).c_str()));
@@ -351,6 +486,15 @@ static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const Un
     CheckDrivechainParentDeadline();
     std::string host = gArgs.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT);
     int port = gArgs.GetIntArg("-mainchainrpcport", BaseParams().MainchainRPCPort());
+    const bool native_drivechain =
+        Params().GetConsensus().drivechain_slot.has_value();
+    if (port <= 0 || port > std::numeric_limits<uint16_t>::max()) {
+        throw CConnectionFailed("mainchain RPC port must be between 1 and 65535");
+    }
+    if (!IsMainchainRPCHostAllowed(host, native_drivechain)) {
+        throw CConnectionFailed(
+            "native drivechain parent RPC must use a numeric loopback address");
+    }
 
     // Obtain event base
     raii_event_base base = obtain_event_base();
@@ -414,7 +558,7 @@ static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const Un
     if (response.status == 0)
         throw CConnectionFailed(strprintf("couldn't connect to server: %s (code %d)\n(make sure server is running and you are connecting to the correct RPC port)", http_errorstring(response.error), response.error));
     else if (response.status == HTTP_UNAUTHORIZED)
-        throw MainchainRPCAuthFailure("incorrect mainchainrpcuser or mainchainrpcpassword (authorization failed)");
+        throw MainchainRPCAuthFailure("mainchain RPC cookie authorization failed");
     else if (response.status >= 400 && response.status != HTTP_BAD_REQUEST && response.status != HTTP_NOT_FOUND && response.status != HTTP_INTERNAL_SERVER_ERROR)
         throw std::runtime_error(strprintf("server returned HTTP error %d", response.status));
     else if (response.body_too_large)
@@ -808,18 +952,31 @@ enum class DrivechainParentMessageType {
     NONE,
     PROPOSAL,
     ACK,
+    WITHDRAWAL_PROPOSAL,
+    WITHDRAWAL_VOTE,
+};
+
+enum class DrivechainM4Encoding : uint8_t {
+    REPEAT_PREVIOUS = 0,
+    ONE_BYTE = 1,
+    TWO_BYTES = 2,
+    LEADING_BY_50 = 3,
 };
 
 struct DrivechainParentMessage {
     DrivechainParentMessageType type{DrivechainParentMessageType::NONE};
     uint8_t slot{0};
     uint256 proposal_hash;
+    DrivechainM4Encoding m4_encoding{DrivechainM4Encoding::ONE_BYTE};
+    std::vector<uint16_t> m4_votes;
 };
 
 DrivechainParentMessage ParseDrivechainParentMessage(const CScript& script)
 {
     static constexpr std::array<uint8_t, 4> M1_TAG{{0xd5, 0xe0, 0xc4, 0xaf}};
     static constexpr std::array<uint8_t, 4> M2_TAG{{0xd6, 0xe1, 0xc5, 0xdf}};
+    static constexpr std::array<uint8_t, 4> M3_TAG{{0xd4, 0x5a, 0xa9, 0x43}};
+    static constexpr std::array<uint8_t, 4> M4_TAG{{0xd7, 0x7d, 0x17, 0x76}};
 
     std::vector<unsigned char> payload;
     if (!ExtractSingleOpReturnPush(script, payload) || payload.size() < 5) return {};
@@ -832,6 +989,54 @@ DrivechainParentMessage ParseDrivechainParentMessage(const CScript& script)
         uint256 proposal_hash;
         std::copy(payload.begin() + 5, payload.end(), proposal_hash.begin());
         return {DrivechainParentMessageType::ACK, payload[4], proposal_hash};
+    }
+    if (payload.size() == M3_TAG.size() + 1 + uint256::size() &&
+        std::equal(M3_TAG.begin(), M3_TAG.end(), payload.begin())) {
+        uint256 m6id;
+        std::copy(payload.begin() + 5, payload.end(), m6id.begin());
+        DrivechainParentMessage message;
+        message.type = DrivechainParentMessageType::WITHDRAWAL_PROPOSAL;
+        message.slot = payload[4];
+        message.proposal_hash = m6id;
+        return message;
+    }
+    if (payload.size() >= M4_TAG.size() + 1 &&
+        std::equal(M4_TAG.begin(), M4_TAG.end(), payload.begin())) {
+        const uint8_t version = payload[4];
+        if (version > static_cast<uint8_t>(DrivechainM4Encoding::LEADING_BY_50)) {
+            return {};
+        }
+        if ((version == static_cast<uint8_t>(DrivechainM4Encoding::REPEAT_PREVIOUS) ||
+             version == static_cast<uint8_t>(DrivechainM4Encoding::LEADING_BY_50)) &&
+            payload.size() != M4_TAG.size() + 1) {
+            return {};
+        }
+        if (version == static_cast<uint8_t>(DrivechainM4Encoding::TWO_BYTES) &&
+            ((payload.size() - M4_TAG.size() - 1) % 2) != 0) {
+            return {};
+        }
+
+        DrivechainParentMessage message;
+        message.type = DrivechainParentMessageType::WITHDRAWAL_VOTE;
+        message.m4_encoding = static_cast<DrivechainM4Encoding>(version);
+        if (message.m4_encoding == DrivechainM4Encoding::ONE_BYTE) {
+            for (auto it = payload.begin() + 5; it != payload.end(); ++it) {
+                if (*it == 0xff) {
+                    message.m4_votes.push_back(0xffff);
+                } else if (*it == 0xfe) {
+                    message.m4_votes.push_back(0xfffe);
+                } else {
+                    message.m4_votes.push_back(*it);
+                }
+            }
+        } else if (message.m4_encoding == DrivechainM4Encoding::TWO_BYTES) {
+            for (size_t offset = 5; offset < payload.size(); offset += 2) {
+                message.m4_votes.push_back(
+                    static_cast<uint16_t>(payload[offset]) |
+                    (static_cast<uint16_t>(payload[offset + 1]) << 8));
+            }
+        }
+        return message;
     }
     return {};
 }
@@ -1033,6 +1238,8 @@ bool ApplyDrivechainParentBlockState(
     const uint16_t unused_slot_activation_threshold,
     const uint16_t used_slot_proposal_max_age,
     const uint16_t used_slot_activation_threshold,
+    const uint16_t withdrawal_bundle_max_age,
+    const uint16_t withdrawal_bundle_inclusion_threshold,
     DrivechainParentReplayState& state,
     std::vector<DrivechainMintableDeposit>* deposits,
     std::string* error)
@@ -1045,7 +1252,10 @@ bool ApplyDrivechainParentBlockState(
         unused_slot_activation_threshold == 0 ||
         unused_slot_activation_threshold >= unused_slot_proposal_max_age ||
         used_slot_proposal_max_age == 0 || used_slot_activation_threshold == 0 ||
-        used_slot_activation_threshold >= used_slot_proposal_max_age) {
+        used_slot_activation_threshold >= used_slot_proposal_max_age ||
+        withdrawal_bundle_max_age == 0 ||
+        withdrawal_bundle_inclusion_threshold == 0 ||
+        withdrawal_bundle_inclusion_threshold >= withdrawal_bundle_max_age) {
         return SetError(error, "invalid slot or proposal identity for parent-state replay");
     }
     if ((state.required_proposal_activated &&
@@ -1061,181 +1271,532 @@ bool ApplyDrivechainParentBlockState(
         return SetError(error, "parent-state replay began with malformed CTIP state");
     }
 
-    // Select the enforcer's unused-slot or used-slot thresholds from the live
-    // replay state. A proposal activates on votes > threshold, not >=.
-    std::set<uint256> proposals_created_in_block;
-    std::set<uint256> proposal_messages_in_block;
-    bool saw_slot_ack{false};
+    const uint8_t target_slot = static_cast<uint8_t>(sidechain_slot);
+    if (state.auxiliary_slots.count(target_slot) != 0) {
+        return SetError(error, "parent-state replay duplicates the configured slot in auxiliary state");
+    }
+
+    const auto active_proposal = [&](const uint8_t slot) -> uint256& {
+        if (slot == target_slot) return state.active_proposal_hash;
+        return state.auxiliary_slots[slot].active_proposal_hash;
+    };
+    const auto pending_proposals = [&](const uint8_t slot)
+        -> std::map<uint256, DrivechainPendingProposal>& {
+        if (slot == target_slot) return state.pending_proposals;
+        return state.auxiliary_slots[slot].pending_proposals;
+    };
+    const auto pending_withdrawals = [&](const uint8_t slot)
+        -> std::vector<DrivechainPendingWithdrawal>& {
+        if (slot == target_slot) return state.pending_withdrawals;
+        return state.auxiliary_slots[slot].pending_withdrawals;
+    };
+    const auto canonical_ctip = [&](const uint8_t slot)
+        -> std::optional<Bitcoin::COutPoint>& {
+        if (slot == target_slot) return state.ctip;
+        return state.auxiliary_slots[slot].ctip;
+    };
+    const auto canonical_ctip_value = [&](const uint8_t slot) -> CAmount& {
+        if (slot == target_slot) return state.ctip_value;
+        return state.auxiliary_slots[slot].ctip_value;
+    };
+    const auto active_slots = [&] {
+        std::vector<uint8_t> slots;
+        if (!state.active_proposal_hash.IsNull()) slots.push_back(target_slot);
+        for (const auto& [slot, slot_state] : state.auxiliary_slots) {
+            if (!slot_state.active_proposal_hash.IsNull()) slots.push_back(slot);
+        }
+        std::sort(slots.begin(), slots.end());
+        return slots;
+    };
+
+    for (const auto& withdrawal : state.pending_withdrawals) {
+        if (withdrawal.proposal_height > height) {
+            return SetError(error, "parent-state replay began with malformed pending withdrawal state");
+        }
+    }
+    for (const auto& [slot, slot_state] : state.auxiliary_slots) {
+        if (slot == target_slot) {
+            return SetError(error, "parent-state replay has an invalid auxiliary slot key");
+        }
+        if (slot_state.ctip.has_value() != (slot_state.ctip_value > 0) ||
+            (slot_state.ctip && slot_state.active_proposal_hash.IsNull()) ||
+            slot_state.ctip_value < 0 || !MoneyRange(slot_state.ctip_value)) {
+            return SetError(error, strprintf(
+                "parent-state replay began with malformed CTIP state for auxiliary slot %u",
+                slot));
+        }
+        for (const auto& withdrawal : slot_state.pending_withdrawals) {
+            if (withdrawal.proposal_height > height) {
+                return SetError(error, "parent-state replay began with malformed auxiliary withdrawal state");
+            }
+        }
+    }
+
+    // Apply M1/M2/M3/M4 in coinbase-vout order, exactly as the enforcer does.
+    // Tracking every active slot is necessary because M4 vectors index the
+    // sorted global active-slot list rather than this sidechain in isolation.
+    std::set<std::pair<uint8_t, uint256>> proposals_created_in_block;
+    std::set<std::pair<uint8_t, uint256>> proposal_messages_in_block;
+    std::set<uint8_t> ack_slots_in_block;
+    bool saw_m4{false};
+    std::map<uint8_t, DrivechainPreviousM4Action> effective_m4_actions;
+
+    const auto apply_upvote = [&](const uint8_t slot, const uint256& m6id) {
+        auto& pending = pending_withdrawals(slot);
+        const auto target = std::find_if(
+            pending.begin(), pending.end(),
+            [&](const DrivechainPendingWithdrawal& withdrawal) {
+                return withdrawal.m6id == m6id;
+            });
+        if (target == pending.end()) {
+            return SetError(error, strprintf(
+                "M4 upvote references missing bundle %s for slot %u",
+                m6id.GetHex(), slot));
+        }
+        if (target->vote_count == std::numeric_limits<uint16_t>::max()) {
+            return true;
+        }
+        ++target->vote_count;
+        for (auto& other : pending) {
+            if (other.m6id != m6id && other.vote_count > 0) --other.vote_count;
+        }
+        effective_m4_actions.emplace(
+            slot, DrivechainPreviousM4Action{DrivechainM4ActionType::UPVOTE, m6id});
+        return true;
+    };
+    const auto apply_alarm = [&](const uint8_t slot) {
+        auto& pending = pending_withdrawals(slot);
+        bool changed{false};
+        for (auto& withdrawal : pending) {
+            if (withdrawal.vote_count > 0) {
+                --withdrawal.vote_count;
+                changed = true;
+            }
+        }
+        if (changed) {
+            effective_m4_actions.emplace(
+                slot, DrivechainPreviousM4Action{DrivechainM4ActionType::ALARM, {}});
+        }
+        return true;
+    };
+
     size_t coinbase_output_index{0};
     for (const auto& output : block.vtx[0]->vout) {
         if ((coinbase_output_index++ & 0xffU) == 0) {
             CheckDrivechainParentDeadline();
         }
         const DrivechainParentMessage message = ParseDrivechainParentMessage(output.scriptPubKey);
-        if (message.type == DrivechainParentMessageType::NONE ||
-            message.slot != static_cast<uint8_t>(sidechain_slot)) {
-            continue;
-        }
+        if (message.type == DrivechainParentMessageType::NONE) continue;
+
         if (message.type == DrivechainParentMessageType::PROPOSAL) {
-            if (!proposal_messages_in_block.insert(message.proposal_hash).second) {
+            const auto id = std::make_pair(message.slot, message.proposal_hash);
+            if (!proposal_messages_in_block.insert(id).second) {
                 return SetError(error, "parent block contains a duplicate slot proposal message");
             }
-            if (state.pending_proposals.count(message.proposal_hash) == 0) {
-                state.pending_proposals.emplace(
+            auto& proposals = pending_proposals(message.slot);
+            if (proposals.count(message.proposal_hash) == 0) {
+                proposals.emplace(
                     message.proposal_hash, DrivechainPendingProposal{height, 0});
-                proposals_created_in_block.insert(message.proposal_hash);
+                proposals_created_in_block.insert(id);
             }
             continue;
         }
 
-        if (saw_slot_ack) {
-            return SetError(error, "parent block contains multiple slot ACK messages");
-        }
-        saw_slot_ack = true;
-        auto proposal = state.pending_proposals.find(message.proposal_hash);
-        if (proposal == state.pending_proposals.end() ||
-            proposals_created_in_block.count(message.proposal_hash) != 0) {
-            // Unknown ACKs and ACKs in the proposal's own block are ignored.
+        if (message.type == DrivechainParentMessageType::ACK) {
+            if (!ack_slots_in_block.insert(message.slot).second) {
+                return SetError(error, "parent block contains multiple ACK messages for one slot");
+            }
+            auto& proposals = pending_proposals(message.slot);
+            auto proposal = proposals.find(message.proposal_hash);
+            if (proposal == proposals.end() ||
+                proposals_created_in_block.count(
+                    std::make_pair(message.slot, message.proposal_hash)) != 0) {
+                // Unknown ACKs and ACKs in the proposal's own block are ignored.
+                continue;
+            }
+            ++proposal->second.votes;
+            const bool slot_is_used = !active_proposal(message.slot).IsNull();
+            const uint16_t activation_threshold = slot_is_used
+                ? used_slot_activation_threshold
+                : unused_slot_activation_threshold;
+            if (proposal->second.votes > activation_threshold) {
+                active_proposal(message.slot) = message.proposal_hash;
+                proposals.erase(proposal);
+                if (message.slot == target_slot) {
+                    if (state.required_proposal_activated &&
+                        state.active_proposal_hash != required_active_proposal) {
+                        return SetError(error, strprintf(
+                            "parent slot %d was replaced by proposal %s",
+                            sidechain_slot, state.active_proposal_hash.GetHex()));
+                    }
+                    if (!state.required_proposal_activated &&
+                        state.active_proposal_hash == required_active_proposal) {
+                        state.required_proposal_activated = true;
+                        state.required_activation_height = height;
+                        state.required_activation_block_hash = block.GetHash();
+                    }
+                }
+            }
             continue;
         }
-        ++proposal->second.votes;
-        const bool slot_is_used = !state.active_proposal_hash.IsNull();
+
+        if (message.type == DrivechainParentMessageType::WITHDRAWAL_PROPOSAL) {
+            if (active_proposal(message.slot).IsNull()) {
+                return SetError(error, strprintf(
+                    "M3 proposes a withdrawal for inactive slot %u", message.slot));
+            }
+            auto& pending = pending_withdrawals(message.slot);
+            if (std::any_of(
+                    pending.begin(), pending.end(),
+                    [&](const DrivechainPendingWithdrawal& withdrawal) {
+                        return withdrawal.m6id == message.proposal_hash;
+                    })) {
+                return SetError(error, strprintf(
+                    "M3 reproposes pending bundle %s for slot %u",
+                    message.proposal_hash.GetHex(), message.slot));
+            }
+            pending.push_back(DrivechainPendingWithdrawal{
+                message.proposal_hash, height, 1});
+            continue;
+        }
+
+        if (saw_m4) {
+            return SetError(error, "parent block contains multiple M4 messages");
+        }
+        saw_m4 = true;
+        const auto slots = active_slots();
+        if (message.m4_encoding == DrivechainM4Encoding::TWO_BYTES &&
+            std::all_of(message.m4_votes.begin(), message.m4_votes.end(),
+                        [](const uint16_t vote) { return vote <= 253; })) {
+            return SetError(error, "M4 two-byte encoding has no value outside the one-byte range");
+        }
+
+        if (message.m4_encoding == DrivechainM4Encoding::REPEAT_PREVIOUS) {
+            for (const auto& [slot, action] : state.previous_m4_actions) {
+                if (active_proposal(slot).IsNull()) {
+                    return SetError(error, "M4 RepeatPrevious references an inactive slot");
+                }
+                if (action.type == DrivechainM4ActionType::UPVOTE) {
+                    if (!apply_upvote(slot, action.m6id)) return false;
+                } else if (action.type == DrivechainM4ActionType::ALARM) {
+                    if (!apply_alarm(slot)) return false;
+                } else {
+                    return SetError(error, "M4 RepeatPrevious contains an unknown prior action");
+                }
+            }
+            continue;
+        }
+
+        if (message.m4_encoding == DrivechainM4Encoding::LEADING_BY_50) {
+            for (const uint8_t slot : slots) {
+                const auto& pending = pending_withdrawals(slot);
+                if (pending.empty()) continue;
+                size_t leader_index{0};
+                uint16_t leader_votes{pending.front().vote_count};
+                uint16_t second_votes{0};
+                for (size_t index = 1; index < pending.size(); ++index) {
+                    const uint16_t votes = pending[index].vote_count;
+                    if (votes > leader_votes) {
+                        second_votes = leader_votes;
+                        leader_votes = votes;
+                        leader_index = index;
+                    } else if (votes > second_votes) {
+                        second_votes = votes;
+                    }
+                }
+                if (leader_votes < std::numeric_limits<uint16_t>::max() &&
+                    leader_votes - second_votes >= 50 &&
+                    !apply_upvote(slot, pending[leader_index].m6id)) {
+                    return false;
+                }
+            }
+            continue;
+        }
+
+        if (message.m4_votes.size() != slots.size()) {
+            return SetError(error, strprintf(
+                "invalid M4 vote vector: expected %u entries, found %u",
+                slots.size(), message.m4_votes.size()));
+        }
+        for (size_t index = 0; index < slots.size(); ++index) {
+            const uint8_t slot = slots[index];
+            const uint16_t vote = message.m4_votes[index];
+            if (vote == 0xffff) continue;
+            if (vote == 0xfffe) {
+                if (!apply_alarm(slot)) return false;
+                continue;
+            }
+            const auto& pending = pending_withdrawals(slot);
+            if (vote >= pending.size()) {
+                return SetError(error, strprintf(
+                    "M4 vote index %u is absent for slot %u", vote, slot));
+            }
+            const uint256 m6id = pending[vote].m6id;
+            if (!apply_upvote(slot, m6id)) return false;
+        }
+    }
+
+    // An omitted M4 is an all-abstain vote, and therefore becomes the empty
+    // effective action for any following RepeatPrevious message.
+    state.previous_m4_actions = std::move(effective_m4_actions);
+
+    // The enforcer expires sidechain proposals and bundles after all coinbase
+    // messages have been applied, and before ordinary M5/M6 transactions.
+    const auto expire_proposals = [&](const uint8_t slot) {
+        auto& proposals = pending_proposals(slot);
+        const bool slot_is_used = !active_proposal(slot).IsNull();
+        const uint16_t proposal_max_age = slot_is_used
+            ? used_slot_proposal_max_age
+            : unused_slot_proposal_max_age;
         const uint16_t activation_threshold = slot_is_used
             ? used_slot_activation_threshold
             : unused_slot_activation_threshold;
-        if (proposal->second.votes > activation_threshold) {
-            state.active_proposal_hash = message.proposal_hash;
-            state.pending_proposals.erase(proposal);
-            if (state.required_proposal_activated &&
-                state.active_proposal_hash != required_active_proposal) {
-                return SetError(error, strprintf(
-                    "parent slot %d was replaced by proposal %s",
-                    sidechain_slot, state.active_proposal_hash.GetHex()));
+        for (auto proposal = proposals.begin(); proposal != proposals.end();) {
+            if (height < proposal->second.proposal_height) {
+                return SetError(error, "parent proposal height is ahead of replay height");
             }
-            if (!state.required_proposal_activated &&
-                state.active_proposal_hash == required_active_proposal) {
-                state.required_proposal_activated = true;
-                state.required_activation_height = height;
-                state.required_activation_block_hash = block.GetHash();
+            const uint32_t age = height - proposal->second.proposal_height;
+            if (proposal->second.votes > age) {
+                return SetError(error, "parent proposal has more votes than elapsed blocks");
+            }
+            const uint32_t misses = age - proposal->second.votes;
+            const uint32_t max_fails = proposal_max_age - activation_threshold;
+            if (age > proposal_max_age ||
+                (age > max_fails && misses >= max_fails)) {
+                proposal = proposals.erase(proposal);
+            } else {
+                ++proposal;
             }
         }
+        return true;
+    };
+    if (!expire_proposals(target_slot)) return false;
+    for (const auto& [slot, slot_state] : state.auxiliary_slots) {
+        (void)slot_state;
+        if (!expire_proposals(slot)) return false;
     }
 
-    // The enforcer expires proposals after applying all coinbase messages, so
-    // an activation in this block makes the used-slot pair apply here.
-    const bool slot_is_used = !state.active_proposal_hash.IsNull();
-    const uint16_t proposal_max_age = slot_is_used
-        ? used_slot_proposal_max_age
-        : unused_slot_proposal_max_age;
-    const uint16_t activation_threshold = slot_is_used
-        ? used_slot_activation_threshold
-        : unused_slot_activation_threshold;
-    for (auto proposal = state.pending_proposals.begin(); proposal != state.pending_proposals.end();) {
-        if (height < proposal->second.proposal_height) {
-            return SetError(error, "parent proposal height is ahead of replay height");
+    const auto expire_withdrawals = [&](const uint8_t slot) {
+        auto& pending = pending_withdrawals(slot);
+        for (const auto& withdrawal : pending) {
+            if (withdrawal.proposal_height > height) {
+                return SetError(error, "pending withdrawal height is ahead of replay height");
+            }
         }
-        const uint32_t age = height - proposal->second.proposal_height;
-        if (proposal->second.votes > age) {
-            return SetError(error, "parent proposal has more votes than elapsed blocks");
-        }
-        const uint32_t misses = age - proposal->second.votes;
-        const uint32_t max_fails = proposal_max_age - activation_threshold;
-        if (age > proposal_max_age ||
-            (age > max_fails && misses >= max_fails)) {
-            proposal = state.pending_proposals.erase(proposal);
-        } else {
-            ++proposal;
-        }
+        pending.erase(
+            std::remove_if(
+                pending.begin(), pending.end(),
+                [&](const DrivechainPendingWithdrawal& withdrawal) {
+                    return height - withdrawal.proposal_height > withdrawal_bundle_max_age;
+                }),
+            pending.end());
+        return true;
+    };
+    if (!expire_withdrawals(target_slot)) return false;
+    for (const auto& [slot, slot_state] : state.auxiliary_slots) {
+        (void)slot_state;
+        if (!expire_withdrawals(slot)) return false;
     }
+
     const bool required_proposal_active_for_transactions =
         state.required_proposal_activated &&
         state.active_proposal_hash == required_active_proposal;
 
     // OP_DRIVECHAIN is anyone-can-spend script syntax. The enforcer treats it
-    // as a treasury output only after this slot has an active sidechain.
-    if (state.active_proposal_hash.IsNull()) {
-        CheckDrivechainParentDeadline();
-        return true;
-    }
-
-    // Follow only the unique output chain descending from the pinned CTIP.
-    // Once it exists, the enforcer rejects parallel slot outputs and requires
-    // every spend to create exactly one replacement.  We conservatively halt
-    // on decreases because independently validating M6 votes is outside this
-    // mint-only replay; accepting an unproven withdrawal could break backing.
-    for (size_t transaction_index = 1; transaction_index < block.vtx.size(); ++transaction_index) {
+    // as a treasury output only for an active sidechain. Replay every active
+    // slot's unique CTIP chain so global M4 indices remain aligned after an
+    // auxiliary slot executes a withdrawal. One transaction may contain M5s
+    // for several slots, but an M6 cannot be mixed with another CTIP transition.
+    struct SlotTransition {
+        uint8_t slot;
+        uint32_t output_index;
+        CAmount old_value;
+    };
+    for (size_t transaction_index = 1;
+         transaction_index < block.vtx.size(); ++transaction_index) {
         CheckDrivechainParentDeadline();
         const Bitcoin::CTransaction& transaction = *block.vtx[transaction_index];
-        size_t current_ctip_inputs{0};
-        if (state.ctip) {
-            size_t input_index{0};
-            for (const auto& input : transaction.vin) {
-                if ((input_index++ & 0xffU) == 0) {
+        std::vector<SlotTransition> transitions;
+
+        for (const uint8_t slot : active_slots()) {
+            auto& slot_ctip = canonical_ctip(slot);
+            CAmount& slot_ctip_value = canonical_ctip_value(slot);
+            size_t current_ctip_inputs{0};
+            if (slot_ctip) {
+                size_t input_index{0};
+                for (const auto& input : transaction.vin) {
+                    if ((input_index++ & 0xffU) == 0) {
+                        CheckDrivechainParentDeadline();
+                    }
+                    if (input.prevout == *slot_ctip) ++current_ctip_inputs;
+                }
+                if (current_ctip_inputs > 1) {
+                    return SetError(error, strprintf(
+                        "parent transaction spends the canonical CTIP for slot %u more than once",
+                        slot));
+                }
+            }
+
+            std::vector<uint32_t> treasury_outputs;
+            for (uint32_t output_index = 0;
+                 output_index < transaction.vout.size(); ++output_index) {
+                if ((output_index & 0xffU) == 0) {
                     CheckDrivechainParentDeadline();
                 }
-                if (input.prevout == *state.ctip) ++current_ctip_inputs;
+                const Bitcoin::CTxOut& output = transaction.vout[output_index];
+                if (!IsDrivechainTreasuryScript(output.scriptPubKey, slot)) continue;
+                if (output.nValue < 0 || !MoneyRange(output.nValue)) {
+                    return SetError(error, strprintf(
+                        "parent transaction has an invalid treasury value for slot %u",
+                        slot));
+                }
+                treasury_outputs.push_back(output_index);
             }
-            if (current_ctip_inputs > 1) {
-                return SetError(error, "parent transaction spends the canonical CTIP more than once");
+            if (treasury_outputs.size() > 1) {
+                return SetError(error, strprintf(
+                    "canonical CTIP transition creates multiple treasury outputs for slot %u",
+                    slot));
+            }
+            if (slot_ctip && current_ctip_inputs == 0 && !treasury_outputs.empty()) {
+                return SetError(error, strprintf(
+                    "parent transaction creates a parallel output for slot %u without spending its canonical CTIP",
+                    slot));
+            }
+            if (slot_ctip && current_ctip_inputs == 1 && treasury_outputs.empty()) {
+                return SetError(error, strprintf(
+                    "parent transaction spends the canonical CTIP for slot %u without a replacement",
+                    slot));
+            }
+            if ((slot_ctip && current_ctip_inputs == 0) ||
+                (!slot_ctip && treasury_outputs.empty())) {
+                continue;
+            }
+
+            const uint32_t output_index = treasury_outputs.front();
+            const CAmount old_value = slot_ctip ? slot_ctip_value : 0;
+            if (transaction.vout[output_index].nValue == old_value) {
+                return SetError(error, strprintf(
+                    "canonical CTIP replacement for slot %u has zero value delta",
+                    slot));
+            }
+            transitions.push_back(SlotTransition{slot, output_index, old_value});
+        }
+
+        const size_t withdrawal_count = std::count_if(
+            transitions.begin(), transitions.end(),
+            [&](const SlotTransition& transition) {
+                return transaction.vout[transition.output_index].nValue <
+                    transition.old_value;
+            });
+        if (withdrawal_count != 0 && transitions.size() != 1) {
+            return SetError(error,
+                "parent transaction ambiguously mixes an M6 with another CTIP transition");
+        }
+
+        for (const SlotTransition& transition : transitions) {
+            auto& slot_ctip = canonical_ctip(transition.slot);
+            CAmount& slot_ctip_value = canonical_ctip_value(transition.slot);
+            const Bitcoin::CTxOut& treasury =
+                transaction.vout[transition.output_index];
+            if (treasury.nValue < transition.old_value) {
+                if (!slot_ctip || transaction.vin.size() != 1 ||
+                    transition.output_index != 0) {
+                    return SetError(error, strprintf(
+                        "M6 for slot %u must have one CTIP input and its replacement treasury at vout 0",
+                        transition.slot));
+                }
+
+                CAmount payout_total{0};
+                for (size_t payout_index = 1;
+                     payout_index < transaction.vout.size(); ++payout_index) {
+                    const CAmount payout = transaction.vout[payout_index].nValue;
+                    if (payout < 0 || !MoneyRange(payout) ||
+                        payout_total > MAX_MONEY - payout) {
+                        return SetError(error, "M6 payout total is outside the money range");
+                    }
+                    payout_total += payout;
+                }
+                const CAmount treasury_decrease =
+                    transition.old_value - treasury.nValue;
+                if (payout_total > treasury_decrease) {
+                    return SetError(error, "M6 payouts exceed the canonical treasury decrease");
+                }
+                const CAmount mainchain_fee = treasury_decrease - payout_total;
+                std::vector<unsigned char> fee_bytes;
+                fee_bytes.reserve(8);
+                const uint64_t unsigned_fee = static_cast<uint64_t>(mainchain_fee);
+                for (int byte = 7; byte >= 0; --byte) {
+                    fee_bytes.push_back((unsigned_fee >> (8 * byte)) & 0xff);
+                }
+
+                Bitcoin::CMutableTransaction blinded(transaction);
+                blinded.vin.clear();
+                blinded.vout[0] = Bitcoin::CTxOut(
+                    0, CScript() << OP_RETURN << fee_bytes);
+                const uint256 m6id = blinded.GetHash();
+                auto& pending_for_slot = pending_withdrawals(transition.slot);
+                const auto pending = std::find_if(
+                    pending_for_slot.begin(), pending_for_slot.end(),
+                    [&](const DrivechainPendingWithdrawal& withdrawal) {
+                        return withdrawal.m6id == m6id;
+                    });
+                if (pending == pending_for_slot.end()) {
+                    return SetError(error, strprintf(
+                        "M6 %s has no pending M3 proposal for slot %u",
+                        m6id.GetHex(), transition.slot));
+                }
+                if (pending->vote_count <= withdrawal_bundle_inclusion_threshold) {
+                    return SetError(error, strprintf(
+                        "M6 %s for slot %u has %u ACKs, requires more than %u",
+                        m6id.GetHex(), transition.slot, pending->vote_count,
+                        withdrawal_bundle_inclusion_threshold));
+                }
+
+                pending_for_slot.erase(pending);
+                slot_ctip = Bitcoin::COutPoint(
+                    transaction.GetHash(), transition.output_index);
+                slot_ctip_value = treasury.nValue;
+                continue;
+            }
+
+            std::vector<unsigned char> address;
+            if (transition.slot == target_slot &&
+                (transition.output_index + 1 >= transaction.vout.size() ||
+                 !ExtractSingleOpReturnPush(
+                     transaction.vout[transition.output_index + 1].scriptPubKey,
+                     address))) {
+                return SetError(error,
+                    "positive CTIP replacement has no exact following address commitment");
+            }
+            const CAmount delta = treasury.nValue - transition.old_value;
+            if (!MoneyRange(delta)) {
+                return SetError(error, "parent CTIP increase is outside the money range");
+            }
+            slot_ctip = Bitcoin::COutPoint(
+                transaction.GetHash(), transition.output_index);
+            slot_ctip_value = treasury.nValue;
+            // The enforcer applies coinbase M2 activation before ordinary
+            // transactions, so a later M5 in the activation block belongs to
+            // the newly active Elements Drivechain proposal.
+            if (transition.slot == target_slot && deposits &&
+                required_proposal_active_for_transactions &&
+                !address.empty() && address.size() <= 128) {
+                deposits->push_back(DrivechainMintableDeposit{
+                    *slot_ctip, block.GetHash(), height, delta, std::move(address)});
             }
         }
+    }
 
-        std::vector<uint32_t> treasury_outputs;
-        for (uint32_t output_index = 0; output_index < transaction.vout.size(); ++output_index) {
-            if ((output_index & 0xffU) == 0) {
-                CheckDrivechainParentDeadline();
-            }
-            const Bitcoin::CTxOut& output = transaction.vout[output_index];
-            if (!IsDrivechainTreasuryScript(output.scriptPubKey, sidechain_slot)) continue;
-            if (output.nValue < 0 || !MoneyRange(output.nValue)) {
-                return SetError(error, "parent transaction has an invalid slot treasury value");
-            }
-            treasury_outputs.push_back(output_index);
-        }
-
-        if (treasury_outputs.size() > 1) {
-            return SetError(error, "canonical CTIP transition creates multiple slot treasury outputs");
-        }
-
-        if (state.ctip && current_ctip_inputs == 0 && !treasury_outputs.empty()) {
-            return SetError(error, "parent transaction creates a parallel slot output without spending the canonical CTIP");
-        }
-        if (state.ctip && current_ctip_inputs == 1 && treasury_outputs.empty()) {
-            return SetError(error, "parent transaction spends the canonical CTIP without a replacement");
-        }
-        if ((state.ctip && current_ctip_inputs == 0) ||
-            (!state.ctip && treasury_outputs.empty())) {
-            continue;
-        }
-
-        const CAmount old_value = state.ctip ? state.ctip_value : 0;
-        const uint32_t output_index = treasury_outputs.front();
-        const Bitcoin::CTxOut& treasury = transaction.vout[output_index];
-        if (treasury.nValue == old_value) {
-            return SetError(error, "canonical CTIP replacement has zero value delta");
-        }
-        if (treasury.nValue < old_value) {
-            return SetError(error, "canonical CTIP decrease cannot be accepted without independent M6 vote validation");
-        }
-
-        std::vector<unsigned char> address;
-        if (output_index + 1 >= transaction.vout.size() ||
-            !ExtractSingleOpReturnPush(transaction.vout[output_index + 1].scriptPubKey, address)) {
-            return SetError(error, "positive CTIP replacement has no exact following address commitment");
-        }
-        const CAmount delta = treasury.nValue - old_value;
-        if (!MoneyRange(delta)) {
-            return SetError(error, "parent CTIP increase is outside the money range");
-        }
-        state.ctip = Bitcoin::COutPoint(transaction.GetHash(), output_index);
-        state.ctip_value = treasury.nValue;
-        // The enforcer applies coinbase M2 activation before ordinary
-        // transactions, so a later M5 in the activation block belongs to the
-        // newly active Elements Drivechain proposal.
-        if (deposits && required_proposal_active_for_transactions &&
-            !address.empty() && address.size() <= 128) {
-            deposits->push_back(DrivechainMintableDeposit{
-                *state.ctip, block.GetHash(), height, delta, std::move(address)});
+    for (auto slot = state.auxiliary_slots.begin();
+         slot != state.auxiliary_slots.end();) {
+        if (slot->second.active_proposal_hash.IsNull() &&
+            slot->second.pending_proposals.empty() &&
+            slot->second.pending_withdrawals.empty() &&
+            !slot->second.ctip &&
+            state.previous_m4_actions.count(slot->first) == 0) {
+            slot = state.auxiliary_slots.erase(slot);
+        } else {
+            ++slot;
         }
     }
 
@@ -1755,6 +2316,8 @@ bool InitializeDrivechainParentReplayCache(DrivechainParentReplayCache& cache,
             genesis_block, 0, cache.slot, cache.proposal_hash,
             cache.unused_proposal_max_age, cache.unused_activation_threshold,
             cache.used_proposal_max_age, cache.used_activation_threshold,
+            ElementsDrivechainIdentity::WITHDRAWAL_BUNDLE_MAX_AGE,
+            ElementsDrivechainIdentity::WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD,
             genesis_state, nullptr, error)) {
         cache = {};
         return false;
@@ -1894,6 +2457,8 @@ bool EnsurePinnedDrivechainParentStateThroughLocked(const uint32_t target_height
                     consensus.drivechain_unused_slot_activation_threshold,
                     consensus.drivechain_used_slot_proposal_max_age,
                     consensus.drivechain_used_slot_activation_threshold,
+                    ElementsDrivechainIdentity::WITHDRAWAL_BUNDLE_MAX_AGE,
+                    ElementsDrivechainIdentity::WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD,
                     next_state, &deposits, error)) {
                 // The raw active parent block is authenticated, so a pure
                 // state-transition rejection is a deterministic global halt

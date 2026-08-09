@@ -42,6 +42,10 @@ void InitParameterInteraction(ArgsManager& args);
 /** Native drivechains forbid DNS on synchronous consensus RPC paths. */
 bool IsMainchainRPCHostAllowed(const std::string& host, bool native_drivechain);
 
+/** Native drivechains expose their authenticated JSON-RPC server only on loopback. */
+bool ValidateNativeDrivechainRpcServerConfig(const ArgsManager& args,
+                                             std::string* error = nullptr);
+
 /** Result of running one direct-argv child with bounded time and output. */
 struct BoundedCommandResult {
     bool started{false};
@@ -64,6 +68,30 @@ BoundedCommandResult RunBoundedCommand(
     std::chrono::milliseconds timeout,
     size_t max_output,
     const std::function<bool()>& should_cancel = {});
+
+/**
+ * Call one CUSF enforcer method through grpcurl using mandatory mutual TLS.
+ * There is deliberately no plaintext or server-auth-only fallback.
+ */
+BoundedCommandResult RunAuthenticatedDrivechainGrpc(
+    const std::string& method,
+    const std::string& json_payload,
+    std::chrono::milliseconds timeout,
+    size_t max_output,
+    const std::function<bool()>& should_cancel = {});
+
+/** Testable/operator-independent overload using an explicit argument set. */
+BoundedCommandResult RunAuthenticatedDrivechainGrpc(
+    const ArgsManager& args,
+    const std::string& method,
+    const std::string& json_payload,
+    std::chrono::milliseconds timeout,
+    size_t max_output,
+    const std::function<bool()>& should_cancel = {});
+
+/** Validate the configured enforcer endpoint and mTLS credential files. */
+bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args,
+                                     std::string* error = nullptr);
 
 /** Validate and select max(configured bid, candidate transaction fees). */
 bool ComputeDrivechainBmmBid(CAmount configured_bid,

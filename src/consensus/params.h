@@ -211,15 +211,16 @@ struct Params {
     uint32_t drivechain_parent_state_replay_version{0};
     uint32_t drivechain_annex_feature_version{0};
     /**
-     * True only after parent replay fully validates BIP300 M3/M4/M6 voting and
-     * CTIP decreases. Keep false for Elements Drivechain V1: creating a
-     * withdrawal bundle would otherwise produce a parent transition this node
-     * must terminally reject.
+     * Frozen launch-manifest bit retained for network identity compatibility.
+     * Current software enables withdrawals when the authenticated parent replay
+     * version implements M3/M4/M6, without changing the existing genesis.
      */
     bool drivechain_m6_withdrawal_validation{false};
     bool DrivechainWithdrawalValidationEnabled() const
     {
-        return drivechain_slot.has_value() && drivechain_m6_withdrawal_validation;
+        return drivechain_slot.has_value() &&
+               (drivechain_m6_withdrawal_validation ||
+                drivechain_parent_state_replay_version >= 2);
     }
     /** Apply the fail-closed USDD SP1 annex envelope rules to Simplicity spends. */
     bool enable_usdd_sp1_annex = false;

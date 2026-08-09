@@ -715,6 +715,7 @@ RPCHelpMan issueasset();
 RPCHelpMan listissuances();
 RPCHelpMan reissueasset();
 RPCHelpMan sendtomainchain();
+RPCHelpMan submitdrivechainwithdrawal();
 RPCHelpMan signblock();
 RPCHelpMan unblindrawtransaction();
 
@@ -800,6 +801,7 @@ static const CRPCCommand commands[] =
     { "wallet",             &blindrawtransaction,            },
     { "wallet",             &unblindrawtransaction,          },
     { "wallet",             &sendtomainchain,                },
+    { "wallet",             &submitdrivechainwithdrawal,    },
     { "wallet",             &initpegoutwallet,               },
     { "wallet",             &getwalletpakinfo,               },
     { "wallet",             &importblindingkey,              },

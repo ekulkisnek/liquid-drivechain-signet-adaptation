@@ -67,8 +67,12 @@ this immutable V1 halts rather than following a different proposal.
 
 The parent must be a fully validating LayerTwo Labs Signet node with `txindex=1`
 on the same host. Native-drivechain consensus RPC accepts only IPv4 `127/8` or
-IPv6 `::1`: its HTTP Basic authentication is not safe over a LAN, and a remote
-endpoint could expose credentials or substitute the parent-chain view.
+IPv6 `::1`. Static `mainchainrpcuser`/`mainchainrpcpassword` credentials are
+rejected. The node accepts only Bitcoin Core's rotating `__cookie__` credential,
+and on POSIX the cookie must be a non-symlink file owned by the Elements process
+user with no group or other permissions. This local HTTP connection is never
+permitted over a LAN, where it could expose credentials or substitute the
+parent-chain view.
 The Elements node reads raw parent headers, blocks, and transactions from that
 node and independently checks their hashes, proof of work, transaction Merkle
 roots, frozen Signet challenge, active-chain positions, canonical slot-24 M7
@@ -96,9 +100,15 @@ reorganization unpublish the replay generation and rebuild the index from
 authenticated parent genesis. Consensus history is not expired; the rebuild
 is a safe liveness cost rather than a fallback to a trusted checkpoint.
 
-The BIP300/301 enforcer and `grpcurl` are used only to submit proposal and BMM
-requests. Their responses never authorize a deposit or sidechain block. A user
-can replace those liveness tools without changing consensus or custody.
+The BIP300/301 enforcer and `grpcurl` are used only to submit proposal, BMM, and
+withdrawal-bundle requests. Their responses never authorize a deposit,
+sidechain block, or withdrawal. A user can replace those liveness tools without
+changing consensus or custody. All enforcer calls require CA-verified mutual
+TLS; there is no plaintext or server-auth-only fallback. The default mTLS
+endpoint is `127.0.0.1:55051`, normally backed by a local proxy to an enforcer
+bound only to `127.0.0.1:50051`. See
+[`doc/drivechain-rpc-security.md`](doc/drivechain-rpc-security.md) for certificate,
+proxy, permission, health-check, and shutdown instructions.
 The automatic miner requires a funded enforcer wallet and submits
 `max(-drivechainbmmbid, candidate fees)` satoshis (default minimum: 1,000 sats)
 for each BMM request. This bid is operator-funded liveness policy, not a
@@ -118,12 +128,34 @@ can optionally sponsor an ordinary signed input instead.
 These M5 imports mint the BTC-denominated `pegged_asset` used as the base fee
 asset; they never mint the future USDT-backed USDD issued asset.
 
-Native BIP300 withdrawals are disabled in this version. The node deliberately
-rejects CTIP decreases until complete M3/M4/M6 vote validation exists. The
-reserved USDD SP1 annex also fails closed because the proof-verifier jet and
-the USDD mint/burn controller are not implemented in this repository yet.
-Consequently this node work fixes the Elements/Drivechain consensus base; it is
-not by itself a deployable Ethereum-USDT-to-USDD bridge.
+Native BIP300 withdrawals use a two-step wallet flow. `sendtomainchain` creates
+an explicit pegged-asset sidechain burn bound to the exact Bitcoin payout script,
+amount, and mainchain fee. After that burn confirms, `submitdrivechainwithdrawal`
+uses its actual sidechain block height to construct and submit the canonical
+zero-input blinded M6 over enforcer mTLS. The authenticated parent replay then
+applies M3 proposals and all four M4 encodings in parent coinbase order. A CTIP
+decrease is accepted only when its exact reconstructed M6id is still pending and
+has crossed the configured ACK threshold; malformed, unproposed, expired,
+under-voted, or over-paying M6 transactions halt validation.
+
+Example (amounts are BTC-denominated):
+
+```sh
+TXID=$(src/elements-cli -chain=elements -rpcwallet=withdrawals \
+  sendtomainchain tb1q... 0.02000000 false false 0.00001000)
+
+# Wait until gettransaction reports at least one active-sidechain confirmation.
+src/elements-cli -chain=elements -rpcwallet=withdrawals \
+  submitdrivechainwithdrawal "$TXID"
+```
+
+All slot-24 validators must upgrade and rebuild the parent replay schema before
+an M6 can be accepted. Older versions intentionally reject every CTIP decrease,
+so enabling withdrawals without a coordinated signet consensus upgrade will
+split old and new validators. The reserved USDD SP1 annex still fails closed
+because the proof-verifier jet and USDD mint/burn controller are not implemented.
+This remains experimental signet software, not a production bridge for real
+funds.
 
 The historical material under `drivechain-liquid-sidechain/` describes an
 older mutable slot-5 prototype. It is not the consensus or deployment guide for

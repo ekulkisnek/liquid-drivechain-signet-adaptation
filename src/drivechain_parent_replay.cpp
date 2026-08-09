@@ -6,6 +6,7 @@
 
 #include <consensus/amount.h>
 #include <dbwrapper.h>
+#include <elements_drivechain_identity.h>
 #include <tinyformat.h>
 
 #include <limits>
@@ -54,6 +55,45 @@ bool IsSaneTip(const DrivechainParentReplayTip& tip)
     for (const auto& proposal : tip.state.pending_proposals) {
         if (proposal.first.IsNull() ||
             proposal.second.proposal_height > tip.height) {
+            return false;
+        }
+    }
+    std::set<uint256> target_m6ids;
+    for (const auto& withdrawal : tip.state.pending_withdrawals) {
+        if (withdrawal.proposal_height > tip.height ||
+            !target_m6ids.insert(withdrawal.m6id).second) {
+            return false;
+        }
+    }
+    const uint8_t configured_slot = ElementsDrivechainIdentity::SIDECHAIN_SLOT;
+    if (tip.state.auxiliary_slots.count(configured_slot) != 0) return false;
+    for (const auto& [slot, slot_state] : tip.state.auxiliary_slots) {
+        (void)slot;
+        if (slot_state.ctip.has_value() != (slot_state.ctip_value > 0) ||
+            (slot_state.ctip && slot_state.active_proposal_hash.IsNull()) ||
+            slot_state.ctip_value < 0 || !MoneyRange(slot_state.ctip_value)) {
+            return false;
+        }
+        std::set<uint256> m6ids;
+        for (const auto& proposal : slot_state.pending_proposals) {
+            if (proposal.second.proposal_height > tip.height) return false;
+        }
+        for (const auto& withdrawal : slot_state.pending_withdrawals) {
+            if (withdrawal.proposal_height > tip.height ||
+                !m6ids.insert(withdrawal.m6id).second) {
+                return false;
+            }
+        }
+    }
+    for (const auto& [slot, action] : tip.state.previous_m4_actions) {
+        const bool slot_active = slot == configured_slot
+            ? !tip.state.active_proposal_hash.IsNull()
+            : tip.state.auxiliary_slots.count(slot) != 0 &&
+                  !tip.state.auxiliary_slots.at(slot).active_proposal_hash.IsNull();
+        if (!slot_active ||
+            (action.type != DrivechainM4ActionType::UPVOTE &&
+             action.type != DrivechainM4ActionType::ALARM) ||
+            (action.type == DrivechainM4ActionType::ALARM && !action.m6id.IsNull())) {
             return false;
         }
     }

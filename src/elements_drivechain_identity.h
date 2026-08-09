@@ -102,6 +102,9 @@ inline constexpr uint16_t UNUSED_PROPOSAL_MAX_AGE{10};
 inline constexpr uint16_t UNUSED_ACTIVATION_THRESHOLD{5};
 inline constexpr uint16_t USED_PROPOSAL_MAX_AGE{10};
 inline constexpr uint16_t USED_ACTIVATION_THRESHOLD{5};
+// The LayerTwoLabs Signet enforcer selects its non-mainnet SHORT thresholds.
+inline constexpr uint16_t WITHDRAWAL_BUNDLE_MAX_AGE{10};
+inline constexpr uint16_t WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD{5};
 inline constexpr uint32_t PARENT_REPLAY_VERSION{2};
 inline constexpr uint32_t ANNEX_FEATURE_VERSION{1};
 
