@@ -16,6 +16,7 @@
 #include <script/interpreter.h>
 #include <streams.h>
 #include <util/strencodings.h>
+#include <util/system.h>
 
 #include <algorithm>
 #include <array>
@@ -55,6 +56,32 @@ const BmmConsensus LAYER_TWO_LABS_CONSENSUS{
     BMM_SIDECHAIN_SLOT,
     MAX_BMM_PROOF_ENTRIES,
     MAX_BMM_PROOF_BYTES};
+
+/**
+ * Sidechain height from which strict BMM is mandatory on this deployment.
+ *
+ * Unset by default, which preserves the existing public-Signet behaviour. A
+ * newly activated chain must set it -- and every node must agree on the value,
+ * exactly as with any other consensus boundary -- so that the chain has a
+ * defined point at which BMM enforcement begins.
+ */
+std::optional<int> BmmActivationHeight()
+{
+    static const std::optional<int> cached = [] () -> std::optional<int> {
+        const int64_t height = gArgs.GetIntArg("-drivechainbmmactivationheight", -1);
+        if (height < 0) return std::nullopt;
+        if (height == 0) {
+            throw std::runtime_error(
+                "-drivechainbmmactivationheight must be greater than 0; the genesis block "
+                "cannot carry a BMM proof");
+        }
+        if (height > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("-drivechainbmmactivationheight is out of range");
+        }
+        return static_cast<int>(height);
+    }();
+    return cached;
+}
 
 const BmmL1State LAYER_TWO_LABS_INITIAL_STATE{
     uint256S("0000031bb69e844ed1ebd48cc0ab6cee90de29fb98ff7fb439d49b0b19747665"),
@@ -118,6 +145,32 @@ bool ValidState(const BmmL1State& state, const BmmConsensus& consensus, std::str
     }
     return true;
 }
+
+/**
+ * Parent-chain state anchoring the first BMM proof on a configured deployment.
+ *
+ * This is the equivalent of LAYER_TWO_LABS_INITIAL_STATE for a chain that is
+ * not a descendant of the hard-coded Signet checkpoint: the parent-chain state
+ * as of the agreed activation boundary, against which the first proof is
+ * checked.
+ */
+std::optional<BmmL1State> BmmAnchorState()
+{
+    static const std::optional<BmmL1State> cached = [] () -> std::optional<BmmL1State> {
+        const std::string hex = gArgs.GetArg("-drivechainbmmanchorstate", "");
+        if (hex.empty()) return std::nullopt;
+        if (!IsHex(hex)) {
+            throw std::runtime_error("-drivechainbmmanchorstate must be hex-encoded");
+        }
+        BmmL1State state;
+        if (!DeserializeExactly(ParseHex(hex), state)) {
+            throw std::runtime_error("-drivechainbmmanchorstate could not be decoded");
+        }
+        return state;
+    }();
+    return cached;
+}
+
 
 uint32_t MedianTimePast(const std::vector<uint32_t>& times)
 {
@@ -556,10 +609,28 @@ const uint256& LayerTwoLabsPublicSidechainBlock2()
 
 bool BmmProofRequiredAfter(const CBlockIndex* previous)
 {
-    return previous != nullptr &&
-        (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2 ||
-         (static_cast<uint32_t>(previous->nVersion) &
-          CBlockHeader::BMM_PROOF_HF_MASK) != 0);
+    if (previous == nullptr) return false;
+
+    // Historical public-Signet branch: activation is pinned to its checkpoint.
+    if (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2) return true;
+
+    // Once any ancestor has signalled, the rule stays on.
+    if ((static_cast<uint32_t>(previous->nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) {
+        return true;
+    }
+
+    // Configured activation boundary.
+    //
+    // Without this, strict BMM was unreachable on any chain that is not a
+    // descendant of the hard-coded Signet checkpoint: proofs were never
+    // required, and CheckBmmHeader rejected the first block that tried to
+    // signal, so there was no way in. The advertised rule -- accept a
+    // sidechain block only if its L1 BMM commitment was mined -- was therefore
+    // never enforced on a fresh deployment.
+    if (const std::optional<int> activation = BmmActivationHeight()) {
+        return previous->nHeight + 1 >= *activation;
+    }
+    return false;
 }
 
 bool CheckBmmHeader(
@@ -829,6 +900,25 @@ bool GetEffectiveBmmState(
     if (previous && previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2) {
         state = LAYER_TWO_LABS_INITIAL_STATE;
         return true;
+    }
+    // A chain activating at a configured boundary has no persisted state
+    // before its first proof; anchor that proof to the configured parent state.
+    if (previous) {
+        const std::optional<int> activation = BmmActivationHeight();
+        if (activation && previous->nHeight + 1 == *activation) {
+            const std::optional<BmmL1State> anchor = BmmAnchorState();
+            if (!anchor) {
+                error = "BMM activation height is configured but -drivechainbmmanchorstate is not set";
+                return false;
+            }
+            std::string anchor_error;
+            if (!ValidState(*anchor, LAYER_TWO_LABS_CONSENSUS, anchor_error)) {
+                error = "configured BMM anchor state is malformed: " + anchor_error;
+                return false;
+            }
+            state = *anchor;
+            return true;
+        }
     }
     error = "authenticated BMM parent-chain state is missing";
     return false;

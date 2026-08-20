@@ -9,7 +9,10 @@
 #include <coins.h>
 #include <consensus/merkle.h>
 #include <key_io.h>
+#include <mainchainrpc.h>
 #include <node/drivechain_withdrawal_bundle.h>
+#include <node/drivechain_withdrawal_journal.h>
+#include <rpc/request.h>
 #include <pegins.h>
 #include <primitives/bitcoin/block.h>
 #include <primitives/bitcoin/merkleblock.h>
@@ -18,11 +21,18 @@
 #include <test/util/setup_common.h>
 #include <tinyformat.h>
 #include <util/strencodings.h>
+#include <wallet/drivechain_withdrawal.h>
 #include <streams.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <chrono>
+#include <fstream>
 #include <map>
+
+#ifndef WIN32
+#include <sys/stat.h>
+#endif
 
 namespace {
 
@@ -403,6 +413,69 @@ BOOST_AUTO_TEST_CASE(normalizes_l1_lifecycle_and_deduplicates)
     BOOST_CHECK_EQUAL(events[2]["acknowledgement"].get_str(), "accepted");
 }
 
+BOOST_AUTO_TEST_CASE(withdrawal_status_prefers_terminal_event_independent_of_order)
+{
+    const uint256 m6id = uint256S(
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    UniValue reversed;
+    BOOST_REQUIRE(reversed.read(R"json({
+      "blocks": [
+        {
+          "blockHeaderInfo": {"blockHash":{"hex":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"height":11},
+          "blockInfo": {"events":[
+            {"withdrawalBundle":{"m6id":{"hex":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"event":{"succeeded":{}}}}
+          ]}
+        },
+        {
+          "blockHeaderInfo": {"blockHash":{"hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"height":10},
+          "blockInfo": {"events":[
+            {"withdrawalBundle":{"m6id":{"hex":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"event":{"submitted":{}}}}
+          ]}
+        }
+      ]
+    })json"));
+
+    BOOST_CHECK_EQUAL(
+        drivechain::GetWithdrawalBundleStatus(reversed, 24, m6id),
+        "succeeded");
+    BOOST_CHECK(
+        drivechain::GetWithdrawalBundleStatus(reversed, 24, uint256S("01")).empty());
+
+    UniValue uppercase;
+    BOOST_REQUIRE(uppercase.read(R"json({
+      "blocks": [{
+        "blockHeaderInfo": {"blockHash":{"hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"height":12},
+        "blockInfo": {"events":[
+          {"withdrawalBundle":{"m6id":{"hex":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"},"event":{"succeeded":{}}}}
+        ]}
+      }]
+    })json"));
+    BOOST_CHECK_EQUAL(
+        drivechain::GetWithdrawalBundleStatus(uppercase, 24, m6id),
+        "succeeded");
+
+    UniValue conflicting;
+    BOOST_REQUIRE(conflicting.read(R"json({
+      "blocks": [
+        {
+          "blockHeaderInfo": {"blockHash":{"hex":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"height":10},
+          "blockInfo": {"events":[
+            {"withdrawalBundle":{"m6id":{"hex":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"event":{"succeeded":{}}}}
+          ]}
+        },
+        {
+          "blockHeaderInfo": {"blockHash":{"hex":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},"height":11},
+          "blockInfo": {"events":[
+            {"withdrawalBundle":{"m6id":{"hex":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},"event":{"failed":{}}}}
+          ]}
+        }
+      ]
+    })json"));
+    BOOST_CHECK_THROW(
+        drivechain::GetWithdrawalBundleStatus(conflicting, 24, m6id),
+        std::runtime_error);
+}
+
 BOOST_AUTO_TEST_CASE(rejects_malformed_l1_contract)
 {
     UniValue missing_blocks;
@@ -510,6 +583,235 @@ BOOST_AUTO_TEST_CASE(authenticates_exact_deposit_and_transaction)
 
     const CTransaction tx(DepositTransaction(authenticated, authenticated.destination_script));
     BOOST_CHECK_MESSAGE(drivechain::VerifyDepositTransaction(tx, 0, authenticated, error), error);
+}
+
+BOOST_AUTO_TEST_CASE(authenticates_nonzero_deposit_vout)
+{
+    drivechain::AuthenticatedDeposit authenticated;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        Authenticate(
+            authenticated,
+            error,
+            MainchainInfo(),
+            EnforcerChainInfo(),
+            EnforcerTip(),
+            Sidechains(),
+            TwoWayPegData(DEPOSIT_TXID, 7),
+            Ctip(DEPOSIT_TXID, 14'402'000, 8, 7),
+            Params().NetworkIDString(),
+            Identity(),
+            COutPoint(uint256S(DEPOSIT_TXID), 7),
+            2000),
+        error);
+    BOOST_CHECK(authenticated.outpoint == COutPoint(uint256S(DEPOSIT_TXID), 7));
+    BOOST_CHECK(authenticated.current_ctip == authenticated.outpoint);
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_bundle_is_confirmation_bound)
+{
+    const CScript payout_script = CScript() << OP_TRUE;
+    const COutPoint withdrawal_outpoint(uint256S("11"), 3);
+    const uint256 genesis = uint256S("22");
+    const uint256 previous = uint256S("33");
+    const uint256 exchange_root = uint256S("44");
+
+    const wallet::DrivechainWithdrawalBundle first =
+        wallet::BuildDrivechainWithdrawalBundle(
+            100'000, 1'000, payout_script, withdrawal_outpoint,
+            50, genesis, previous, exchange_root);
+    const wallet::DrivechainWithdrawalBundle same =
+        wallet::BuildDrivechainWithdrawalBundle(
+            100'000, 1'000, payout_script, withdrawal_outpoint,
+            50, genesis, previous, exchange_root);
+    const wallet::DrivechainWithdrawalBundle moved_height =
+        wallet::BuildDrivechainWithdrawalBundle(
+            100'000, 1'000, payout_script, withdrawal_outpoint,
+            51, genesis, previous, exchange_root);
+
+    BOOST_CHECK(!first.bytes.empty());
+    BOOST_CHECK(!first.m6id.IsNull());
+    BOOST_CHECK(first.bytes == same.bytes);
+    BOOST_CHECK(first.m6id == same.m6id);
+    BOOST_CHECK(first.bytes != moved_height.bytes);
+    BOOST_CHECK(first.m6id != moved_height.m6id);
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_journal_distinguishes_missing_and_corrupt)
+{
+    const fs::path journal_dir = m_path_root / "withdrawal-journal";
+    fs::create_directories(journal_dir);
+
+    node::WithdrawalJournalEntry read_entry;
+    std::string error;
+    BOOST_CHECK(
+        node::ReadWithdrawalJournal(journal_dir, read_entry, &error) ==
+        node::WithdrawalJournalReadResult::MISSING);
+
+    node::WithdrawalJournalEntry entry;
+    entry.sidechain_txid = uint256S("66");
+    entry.sidechain_vout = 4;
+    entry.sidechain_height = 72;
+    entry.amount = 100'000;
+    entry.mainchain_fee = 1'000;
+    entry.destination = "test-destination";
+    entry.payout_script = CScript() << OP_TRUE;
+    entry.sidechain_slot = 24;
+    entry.created_time = 1;
+    const wallet::DrivechainWithdrawalBundle bundle =
+        wallet::BuildDrivechainWithdrawalBundle(
+            entry.amount, entry.mainchain_fee, entry.payout_script,
+            entry.Outpoint(), entry.sidechain_height, uint256S("77"),
+            uint256S("88"), uint256S("99"));
+    entry.m6id = bundle.m6id;
+    entry.bundle_bytes = bundle.bytes;
+    BOOST_REQUIRE(node::WriteWithdrawalJournal(journal_dir, entry));
+    BOOST_REQUIRE(
+        node::ReadWithdrawalJournal(journal_dir, read_entry, &error) ==
+        node::WithdrawalJournalReadResult::OK);
+    BOOST_CHECK(read_entry.m6id == entry.m6id);
+    BOOST_CHECK(read_entry.Outpoint() == entry.Outpoint());
+    BOOST_CHECK(read_entry.bundle_bytes == entry.bundle_bytes);
+
+    node::WithdrawalJournalEntry mismatched = entry;
+    mismatched.bundle_bytes.back() ^= 1;
+    BOOST_CHECK(!node::WriteWithdrawalJournal(journal_dir, mismatched));
+
+    {
+        std::ofstream corrupt(
+            node::WithdrawalJournalPath(journal_dir),
+            std::ios::binary | std::ios::trunc);
+        BOOST_REQUIRE(corrupt.is_open());
+        corrupt << "not-a-valid-withdrawal-journal";
+    }
+    BOOST_CHECK(
+        node::ReadWithdrawalJournal(journal_dir, read_entry, &error) ==
+        node::WithdrawalJournalReadResult::CORRUPT);
+    BOOST_CHECK(!error.empty());
+    BOOST_REQUIRE(node::ClearWithdrawalJournal(journal_dir));
+}
+
+BOOST_AUTO_TEST_CASE(authenticated_enforcer_configuration_fails_closed)
+{
+    const fs::path tls_dir = m_path_root / "enforcer-tls";
+    fs::create_directories(tls_dir);
+    const fs::path ca = tls_dir / "ca.pem";
+    const fs::path cert = tls_dir / "client.pem";
+    const fs::path key = tls_dir / "client-key.pem";
+    for (const fs::path& path : {ca, cert, key}) {
+        std::ofstream file(path);
+        BOOST_REQUIRE(file.is_open());
+        file << "test credential\n";
+    }
+#ifndef WIN32
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(tls_dir).c_str(), 0700), 0);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(ca).c_str(), 0600), 0);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cert).c_str(), 0600), 0);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(key).c_str(), 0600), 0);
+#endif
+
+    ArgsManager args;
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
+    args.ForceSetArg("-drivechainbmmgrpcca", fs::PathToString(ca));
+    args.ForceSetArg("-drivechainbmmgrpccert", fs::PathToString(cert));
+    args.ForceSetArg("-drivechainbmmgrpckey", fs::PathToString(key));
+    std::string error;
+    BOOST_CHECK_MESSAGE(ValidateDrivechainGrpcTLSConfig(args, &error), error);
+
+    args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55052");
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("same authenticated endpoint") != std::string::npos);
+
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051 injected");
+    args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55051 injected");
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("whitespace") != std::string::npos);
+
+#ifndef WIN32
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
+    args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55051");
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(key).c_str(), 0644), 0);
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    BOOST_CHECK(error.find("deny all group and other access") != std::string::npos);
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(mainchain_cookie_is_private_and_canonical)
+{
+    const fs::path directory = m_path_root / "mainchain-cookie";
+    fs::create_directories(directory);
+    const fs::path cookie_path = directory / ".cookie";
+    const std::string expected = "__cookie__:" + std::string(64, 'a');
+    {
+        std::ofstream output(cookie_path, std::ios::binary);
+        output << expected << '\n';
+        BOOST_REQUIRE(output.good());
+    }
+#ifndef WIN32
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cookie_path).c_str(), 0600), 0);
+#endif
+
+    std::string cookie;
+    std::string error;
+    BOOST_CHECK(ReadMainchainAuthCookieFile(cookie_path, cookie, &error));
+    BOOST_CHECK_EQUAL(cookie, expected);
+    BOOST_CHECK(error.empty());
+
+    {
+        std::ofstream output(cookie_path, std::ios::binary | std::ios::trunc);
+        output << "static-user:static-password\n";
+        BOOST_REQUIRE(output.good());
+    }
+    BOOST_CHECK(!ReadMainchainAuthCookieFile(cookie_path, cookie, &error));
+    BOOST_CHECK(error.find("canonical rotating") != std::string::npos);
+
+#ifndef WIN32
+    {
+        std::ofstream output(cookie_path, std::ios::binary | std::ios::trunc);
+        output << expected << '\n';
+        BOOST_REQUIRE(output.good());
+    }
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cookie_path).c_str(), 0644), 0);
+    BOOST_CHECK(!ReadMainchainAuthCookieFile(cookie_path, cookie, &error));
+    BOOST_CHECK(error.find("deny all group and other access") != std::string::npos);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(cookie_path).c_str(), 0600), 0);
+
+    const fs::path cookie_link = directory / "linked-cookie";
+    fs::create_symlink(cookie_path, cookie_link);
+    BOOST_CHECK(!ReadMainchainAuthCookieFile(cookie_link, cookie, &error));
+    BOOST_CHECK(error.find("securely open") != std::string::npos);
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(bounded_child_process_enforces_limits)
+{
+#ifndef WIN32
+    const BoundedCommandResult success = RunBoundedCommand(
+        {"/usr/bin/printf", "direct-argv"},
+        std::chrono::seconds{1},
+        128);
+    BOOST_CHECK(success.started);
+    BOOST_CHECK(success.exited);
+    BOOST_CHECK_EQUAL(success.exit_code, 0);
+    BOOST_CHECK_EQUAL(success.output, "direct-argv");
+
+    const BoundedCommandResult timeout = RunBoundedCommand(
+        {"/bin/sleep", "2"},
+        std::chrono::milliseconds{25},
+        128);
+    BOOST_CHECK(timeout.started);
+    BOOST_CHECK(timeout.exited);
+    BOOST_CHECK(timeout.timed_out);
+
+    const BoundedCommandResult bounded_output = RunBoundedCommand(
+        {"/usr/bin/yes", "x"},
+        std::chrono::seconds{1},
+        64);
+    BOOST_CHECK(bounded_output.started);
+    BOOST_CHECK(bounded_output.exited);
+    BOOST_CHECK(bounded_output.output_truncated);
+    BOOST_CHECK_EQUAL(bounded_output.output.size(), 64U);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(rejects_mismatched_txid_vout_address_and_value)

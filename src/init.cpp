@@ -40,7 +40,9 @@
 #include <node/caches.h>
 #include <node/chainstate.h>
 #include <node/context.h>
+#include <drivechain_settings.h>
 #include <node/drivechain_withdrawal_bundle.h>
+#include <node/drivechain_withdrawal_journal.h>
 #include <node/miner.h>
 #include <node/ui_interface.h>
 #include <policy/feerate.h>
@@ -154,36 +156,8 @@ static uint256 GetMainchainBlockHash(const int64_t height)
     return uint256S(CallMainChainRPCChecked("getblockhash", params).get_str());
 }
 
-static std::string ResolveDrivechainBmmGrpcurlPath()
-{
-    const std::string configured_path = gArgs.GetArg("-drivechainbmmgrpcurl", "");
-    if (!configured_path.empty()) {
-        return configured_path;
-    }
-
-    const std::vector<fs::path> candidates{
-        gArgs.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
-        gArgs.GetDataDirBase().parent_path() / "bin" / "grpcurl",
-        fs::PathFromString("/opt/homebrew/bin/grpcurl"),
-        fs::PathFromString("/usr/local/bin/grpcurl"),
-        fs::PathFromString("/usr/bin/grpcurl"),
-    };
-    for (const fs::path& candidate : candidates) {
-        if (fs::exists(candidate)) {
-            return fs::PathToString(candidate);
-        }
-    }
-
-    return "grpcurl";
-}
-
 static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64_t mainchain_tip_height, const uint256& mainchain_tip_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
 {
-#ifdef WIN32
-    throw std::runtime_error("BIP301 gRPC request is not supported on Windows builds");
-#else
-    const std::string grpcurl_path = ResolveDrivechainBmmGrpcurlPath();
-    const std::string grpc_addr = gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051");
     const std::string request = strprintf(
         "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
         sidechain_slot,
@@ -191,33 +165,29 @@ static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64
         mainchain_tip_height,
         sidechain_block_hash.GetHex(),
         mainchain_tip_hash.GetHex());
-    const std::string command = strprintf("%s -plaintext -d %s %s cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction 2>&1",
-        ShellEscape(grpcurl_path),
-        ShellEscape(request),
-        ShellEscape(grpc_addr));
-
-    std::array<char, 512> buffer;
-    std::string output;
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        throw std::runtime_error("failed to launch grpcurl");
-    }
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        output += buffer.data();
-    }
-    const int exit_code = pclose(pipe);
-    if (exit_code != 0) {
-        if (output.find("AlreadyExists") != std::string::npos ||
-            output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
+    const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
+        "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
+        request,
+        std::chrono::seconds{10},
+        64U * 1024U,
+        [] { return ShutdownRequested(); });
+    if (!child.started || !child.exited || child.exit_code != 0 ||
+        child.timed_out || child.cancelled || child.output_truncated ||
+        !child.error.empty()) {
+        if (child.output.find("AlreadyExists") != std::string::npos ||
+            child.output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
             LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
                 sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
             return;
         }
-        throw std::runtime_error(strprintf("grpcurl exited with status %d: %s", exit_code, output));
+        throw std::runtime_error(strprintf(
+            "authenticated BIP301 request failed: %s%s",
+            child.error,
+            child.output.empty() ? "" : strprintf(" (%s)", child.output)));
     }
     LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, sidechain block %s, fees %s, response %s\n",
-        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height, sidechain_block_hash.GetHex(), FormatMoney(sidechain_fees), output);
-#endif
+        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height,
+        sidechain_block_hash.GetHex(), FormatMoney(sidechain_fees), child.output);
 }
 
 static bool SubmitDrivechainBmm(const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
@@ -1011,7 +981,7 @@ void SetupServerArgs(ArgsManager& argsman)
 
     argsman.AddArg("-initialfreecoins", strprintf("The amount of OP_TRUE coins created in the genesis block. Primarily for testing. (default: %d)", 0), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatepegin", "Validate peg-in claims. An RPC connection will be attempted to the trusted mainchain daemon using the `mainchain*` settings below. All functionaries must run this enabled. (default: 1 if chain has federated peg)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpchost=<host>", "The address which the daemon will try to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpchost=<host>", "Loopback endpoint used to connect to the trusted parent-chain daemon. Remote nodes must be exposed through a local authenticated TLS tunnel because parent JSON-RPC uses HTTP Basic credentials. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcport=<n>", strprintf("The port which the daemon will try to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: %u)", defaultBaseParams->MainchainRPCPort()), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcuser=<user>", "The rpc username that the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcpassword=<pwd>", "The rpc password which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
@@ -1020,8 +990,18 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used for mined BMM commitment enforcement. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used for BIP301 requests and mined commitment verification. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used for BIP301 requests and mined commitment verification. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "Mutually authenticated TLS endpoint used for every CUSF enforcer request. Point this at the local TLS proxy, not the enforcer plaintext port. (default: 127.0.0.1:55051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used for authenticated BIP300/301 requests. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcca=<file>", "PEM CA certificate used to authenticate the enforcer TLS server. Relative paths are resolved under the network data directory. (default: enforcer-tls/ca.pem)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpccert=<file>", "PEM client certificate presented to the enforcer TLS endpoint. (default: enforcer-tls/elements-client.pem)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpckey=<file>", "PEM client private key for enforcer mutual TLS. It must be owner-only and may not be a symlink on POSIX. (default: enforcer-tls/elements-client-key.pem)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcauthority=<name>", "Optional TLS server name sent by grpcurl when the proxy certificate name differs from its address.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmactivationheight=<n>", "Sidechain height from which strict BMM enforcement is mandatory. Required on a chain that is not a descendant of the historical public-Signet checkpoint; every node must agree on the value. (default: unset)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmanchorstate=<hex>", "Hex-encoded parent-chain state anchoring the first BMM proof at -drivechainbmmactivationheight. (default: unset)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechaingenesisctip=<txid:vout:value_sats:sequence>", "Consensus bootstrap CTIP established by this sidechain's M1/M2 activation on the parent chain. Required before the first deposit on a newly activated chain; every node must be configured identically. (default: unset)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainsidechainslot=<n>", strprintf("BIP300 sidechain slot this node's peg-out path is bound to. (default: %d)", DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Compatibility alias for -drivechainbmmgrpcaddr. If both are set they must identify the same mutually authenticated TLS endpoint.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainpegoutmainfee=<sats>", strprintf("Satoshi reserved from each withdrawal to pay the M6 bundle's parent-chain fee. Must be positive; a bundle with no fee may never be mined. (default: %d)", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainsidechainnetwork=<name>", "Sidechain network required for authenticated drivechain deposits. (default: liquid-signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainmainchainnetwork=<name>", "Mainchain network required for authenticated drivechain deposits. (default: signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainmainchainsignetchallenge=<hex>", "Signet challenge required for authenticated drivechain deposits. (default: LayerTwoLabs public signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -2424,12 +2404,55 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         client->start(*node.scheduler);
     }
 
+    node::WithdrawalJournalEntry withdrawal_journal;
+    std::string withdrawal_journal_error;
+    const node::WithdrawalJournalReadResult withdrawal_journal_result =
+        node::ReadWithdrawalJournal(
+            args.GetDataDirNet(), withdrawal_journal, &withdrawal_journal_error);
     {
         LOCK(cs_main);
         const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
-        const uint256 bundle_hash = tip == nullptr ? uint256::ZERO : tip->hashWithdrawalBundle;
-        node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle_hash);
+        uint256 bundle_hash = tip == nullptr ? uint256::ZERO : tip->hashWithdrawalBundle;
         LogPrintf("Restored drivechain withdrawal bundle state from sidechain tip: %s\n", bundle_hash.GetHex());
+
+        if (withdrawal_journal_result == node::WithdrawalJournalReadResult::CORRUPT) {
+            LogPrintf("ERROR: drivechain withdrawal journal is corrupt: %s. "
+                      "All withdrawal submission and recovery RPCs will fail closed until it is repaired.\n",
+                      withdrawal_journal_error);
+        } else if (withdrawal_journal_result == node::WithdrawalJournalReadResult::OK) {
+            const node::WithdrawalJournalState state = withdrawal_journal.GetState();
+            if (state == node::WithdrawalJournalState::BUNDLE_SUBMITTED) {
+                if (bundle_hash.IsNull() || bundle_hash == withdrawal_journal.m6id) {
+                    bundle_hash = withdrawal_journal.m6id;
+                    LogPrintf("Recovered in-flight drivechain withdrawal from journal: m6id=%s "
+                              "sidechain_txid=%s state=%d. Run `drivechainrecoverwithdrawal` to "
+                              "inspect or resubmit it.\n",
+                              withdrawal_journal.m6id.GetHex(),
+                              withdrawal_journal.sidechain_txid.GetHex(),
+                              int{withdrawal_journal.state});
+                } else {
+                    LogPrintf("WARNING: drivechain withdrawal journal (m6id=%s) disagrees with the "
+                              "sidechain tip (m6id=%s). Withdrawals will stay blocked until this is "
+                              "resolved with `drivechainrecoverwithdrawal`.\n",
+                              withdrawal_journal.m6id.GetHex(), bundle_hash.GetHex());
+                }
+            } else {
+                // The durable journal is authoritative across the window where
+                // the chain tip can still carry the previous bundle. RESERVED
+                // has not been accepted by the enforcer, FAILED needs an
+                // explicit retry, and SETTLED is terminal. None may resurrect
+                // or continue stamping any tip bundle after restart.
+                if (!bundle_hash.IsNull()) {
+                    LogPrintf("Drivechain withdrawal journal state %d is not active; "
+                              "cleared sidechain-tip m6id %s from block production "
+                              "(journal m6id=%s).\n",
+                              int{withdrawal_journal.state}, bundle_hash.GetHex(),
+                              withdrawal_journal.m6id.GetHex());
+                }
+                bundle_hash.SetNull();
+            }
+        }
+        node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle_hash);
     }
 
     BanMan* banman = node.banman.get();

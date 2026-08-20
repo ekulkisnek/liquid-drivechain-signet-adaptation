@@ -9,6 +9,7 @@
 #include <any>
 #include <string>
 
+#include <fs.h>
 #include <univalue.h>
 
 UniValue JSONRPCRequestObj(const std::string& strMethod, const UniValue& params, const UniValue& id);
@@ -41,6 +42,13 @@ public:
 };
 
 // ELEMENTS:
+/** Return the resolved parent-node cookie path. */
+fs::path GetMainchainAuthCookieFile();
+/** Read one private, canonical Bitcoin Core rotating cookie. */
+bool ReadMainchainAuthCookieFile(
+    const fs::path& path,
+    std::string& cookie,
+    std::string* error = nullptr);
 /** Needs to know cookiedir path info -cli doesn't require */
 bool GetMainchainAuthCookie(std::string *cookie_out);
 

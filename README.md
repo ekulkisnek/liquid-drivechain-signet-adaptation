@@ -33,7 +33,13 @@ See `drivechain-liquid-sidechain/README.md` (especially the section "Setting Up 
 - Full Blind Merged Mining (BIP 301 BMM) setup, both manual and automated (participant scripts + adapter).
 - Deposits, withdrawals, and end-to-end flows.
 
-The same pattern works for any new signet or new sidechain number.
+The source lineage can be adapted to another signet or sidechain number, but
+this production branch is consensus-bound to the LayerTwoLabs slot-24
+deployment. Changing one runtime setting does not create a compatible network.
+
+The production slot-24 deposit and withdrawal procedure, including the
+required authenticated transports and crash-recovery workflow, is documented
+in [`doc/drivechain-peg-operations.md`](doc/drivechain-peg-operations.md).
 
 This branch adapts the Liquid/Elements wallet peg-out path to use a BIP300
 drivechain withdrawal bundle instead of the legacy federated/PAK
@@ -94,29 +100,23 @@ For a production-style deployment, use explicit config files and separate data
 directories for the Bitcoin signet node, the enforcer, and every Elements
 sidechain node.
 
-### Choose an unused sidechain number
+### Confirm the sidechain identity
 
-Every BIP300 sidechain on the same signet must use a unique sidechain number.
-Before launching a new Liquid sidechain:
+Every BIP300 sidechain on the same signet has a unique sidechain number. Before
+launching this node:
 
 1. Check the enforcer/signet state and list the sidechain numbers already
    registered by other sidechains.
-2. Pick a sidechain number that is not already registered or reserved on that
-   signet.
-3. Register/propose that same number with the BIP300/301 enforcer.
-4. Start this Elements node with the same number in its drivechain environment.
+2. Confirm that slot 24 is the activated LayerTwoLabs Elements sidechain with
+   the expected title and hash identities.
+3. Confirm the BIP300/301 enforcer and BMM producer are both using slot 24.
+4. Start Elements with both drivechain slot settings equal to 24.
 
-This branch defaults to sidechain ID `5` for the drivechain peg-out broadcaster.
-Override it for a new deployment:
-
-```sh
-export ELEMENTS_DRIVECHAIN_SIDECHAIN_ID=<unused-sidechain-number>
-```
-
-The sidechain ID used by `ELEMENTS_DRIVECHAIN_SIDECHAIN_ID`, the enforcer
-sidechain registration, the BMM miner, wallet tooling, and any mobile clients
-must all match. If they do not, peg-outs can be broadcast to the wrong
-sidechain slot or fail to be recognized by the mainchain.
+This production build is consensus-bound to sidechain slot `24`. Configure both
+`drivechainbmmslot=24` and `drivechainsidechainslot=24`; the enforcer, BMM
+producer, wallet tooling, and clients must use that same slot. A deployment in
+another slot requires a separately coordinated consensus configuration, not an
+environment-variable override.
 
 ### Configure BIP301 blind merge mining
 
@@ -158,45 +158,19 @@ bitcoin-cli -signet generatetoaddress 1 "$ADDR"
 For private signets that require explicit signing, use the miner command/script
 that has access to the signing key matching `signetchallenge`.
 
-### Configure drivechain peg-out RPC
+### Configure drivechain peg RPCs
 
-The adapted `sendtomainchain` RPC broadcasts a BIP300 withdrawal bundle through
-the enforcer gRPC API. Configure the enforcer endpoint before starting
-`elementsd`:
+Parent JSON-RPC is restricted to loopback because its credentials travel via
+HTTP Basic authentication. Enforcer RPC uses mutual TLS, normally through a
+local TLS proxy at `127.0.0.1:55051`. See
+[`doc/drivechain-peg-operations.md`](doc/drivechain-peg-operations.md) for the
+required certificate permissions and complete configuration.
 
-```sh
-export ELEMENTS_DRIVECHAIN_SIDECHAIN_ID=<unused-sidechain-number>
-export ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER=127.0.0.1:50051
-export ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS=500
-```
-
-`ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS` is subtracted from the withdrawal
-amount and encoded as the mainchain fee output in the withdrawal bundle. It
-must be non-negative and less than the peg-out amount.
-
-Then start the node from the same environment:
-
-```sh
-src/elementsd \
-  -chain=<elements-chain-name> \
-  -daemon \
-  -validatepegin=1 \
-  -mainchainrpchost=127.0.0.1 \
-  -mainchainrpcport=38332 \
-  -mainchainrpccookiefile=/path/to/bitcoin/signet/.cookie
-```
-
-Peg out with:
-
-```sh
-src/elements-cli -chain=<elements-chain-name> sendtomainchain "<bitcoin-signet-address>" 0.01 false true
-```
-
-With `verbose=true`, the result includes a `drivechain_pegout` object with the
-sidechain ID, enforcer endpoint, withdrawal bundle hex, broadcaster response,
-and sidechain peg-out transaction hex. Save this output when testing a new
-signet because it is the easiest way to confirm the wallet used the intended
-sidechain number.
+`sendtomainchain` now creates only the sidechain withdrawal transaction. After
+that transaction confirms in an active ECX sidechain block, call
+`submitdrivechainwithdrawal <txid>` to build and submit the confirmation-bound
+M6. Use `drivechainrecoverwithdrawal` to inspect or safely retry its exact
+durable bytes after a restart.
 
 ### Validation checklist
 
@@ -209,12 +183,14 @@ Before considering a new signet deployment ready:
 * The BMM miner is producing BIP301 commitments for that sidechain number.
 * `elementsd` is connected to the same mainchain RPC and has a fresh data
   directory.
-* `getpeginaddress`, mainchain funding, and `claimpegin` work on the new
-  signet.
-* `sendtomainchain` returns a `drivechain_pegout` object with the expected
-  `sidechain_id` and enforcer endpoint.
+* `importdrivechaindeposit` authenticates the exact L1 txid/vout and the
+  resulting sidechain UTXO remains spendable after restart.
+* `sendtomainchain` confirms on the sidechain before
+  `submitdrivechainwithdrawal` submits its M6.
 * After enough BIP300 acknowledgement/confirmation blocks, the mainchain
-  enforcer reports the withdrawal bundle as accepted/confirmed.
+  enforcer reports that exact M6 as succeeded and
+  `drivechainrecoverwithdrawal` marks it settled, releases the active bundle,
+  and retains a restart-safe terminal record until the next withdrawal.
 
 Confidential Assets
 ----------------

@@ -71,6 +71,19 @@ UniValue ExtractSidechainPegEvents(const CBlock& block, int height, const uint25
 UniValue NormalizeL1PegEvents(const UniValue& two_way_peg_data, int sidechain_id);
 
 /**
+ * Return the canonical lifecycle state for one withdrawal bundle.
+ *
+ * A bundle can have an earlier `submitted` event followed by a terminal
+ * `succeeded` or `failed` event. The input order is not trusted, terminal
+ * outcomes take precedence, and conflicting terminal outcomes fail closed.
+ * Returns an empty string when the bundle is absent.
+ */
+std::string GetWithdrawalBundleStatus(
+    const UniValue& two_way_peg_data,
+    int sidechain_id,
+    const uint256& m6id);
+
+/**
  * Authenticate one deposit against canonical L1/enforcer evidence.
  *
  * This function is side-effect free so the exact fail-closed contract can be

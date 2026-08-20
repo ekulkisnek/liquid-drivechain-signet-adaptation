@@ -12,11 +12,16 @@
 
 #include <string>
 #include <stdexcept>
+#include <chrono>
+#include <cstddef>
+#include <functional>
+#include <vector>
 
 #include <univalue.h>
 
 class CBlock;
 class CTransaction;
+class ArgsManager;
 struct DrivechainDepositEvidence;
 namespace drivechain {
 struct AuthenticatedDeposit;
@@ -41,6 +46,47 @@ public:
     {}
 
 };
+
+/** Result of running one direct-argv child with bounded time and output. */
+struct BoundedCommandResult {
+    bool started{false};
+    bool exited{false};
+    bool timed_out{false};
+    bool cancelled{false};
+    bool output_truncated{false};
+    int exit_code{-1};
+    std::string output;
+    std::string error;
+};
+
+/** Execute argv directly, never through a shell, and always reap the child. */
+BoundedCommandResult RunBoundedCommand(
+    const std::vector<std::string>& argv,
+    std::chrono::milliseconds timeout,
+    size_t max_output,
+    const std::function<bool()>& should_cancel = {});
+
+/** Validate the mandatory CA, client certificate, and client key. */
+bool ValidateDrivechainGrpcTLSConfig(
+    const ArgsManager& args,
+    std::string* error = nullptr);
+
+/** Call an allowlisted enforcer method using mutual TLS and direct argv. */
+BoundedCommandResult RunAuthenticatedDrivechainGrpc(
+    const ArgsManager& args,
+    const std::string& method,
+    const std::string& json_payload,
+    std::chrono::milliseconds timeout,
+    size_t max_output,
+    const std::function<bool()>& should_cancel = {});
+BoundedCommandResult RunAuthenticatedDrivechainGrpc(
+    const std::string& method,
+    const std::string& json_payload,
+    std::chrono::milliseconds timeout,
+    size_t max_output,
+    const std::function<bool()>& should_cancel = {});
+
+std::string GetDrivechainGrpcAddress(const ArgsManager& args);
 
 UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
 bool GetDrivechainTwoWayPegData(int sidechain_slot, UniValue& response, std::string* error = nullptr);

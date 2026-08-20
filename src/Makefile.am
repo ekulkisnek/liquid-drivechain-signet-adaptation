@@ -201,6 +201,8 @@ BITCOIN_CORE_H = \
   node/coinstats.h \
   node/context.h \
   node/drivechain_withdrawal_bundle.h \
+  node/drivechain_withdrawal_journal.h \
+  drivechain_settings.h \
   node/miner.h \
   node/minisketchwrapper.h \
   node/psbt.h \
@@ -306,6 +308,7 @@ BITCOIN_CORE_H = \
   wallet/context.h \
   wallet/crypter.h \
   wallet/db.h \
+  wallet/drivechain_withdrawal.h \
   wallet/dump.h \
   wallet/external_signer_scriptpubkeyman.h \
   wallet/feebumper.h \
@@ -383,6 +386,7 @@ libbitcoin_node_a_SOURCES = \
   node/coinstats.cpp \
   node/context.cpp \
   node/interfaces.cpp \
+  node/drivechain_withdrawal_journal.cpp \
   node/miner.cpp \
   node/minisketchwrapper.cpp \
   node/psbt.cpp \

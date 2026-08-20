@@ -12,10 +12,20 @@
 #include <util/system.h>
 #include <util/strencodings.h>
 
+#include <array>
+#include <cerrno>
+#include <cstring>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifndef WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 /**
  * JSON-RPC protocol.  Bitcoin speaks version 1.0 for maximum compatibility,
@@ -135,9 +145,12 @@ bool GetAuthCookie(std::string *cookie_out)
 /** Default name for mainchain auth cookie file */
 static const std::string MAINCHAIN_COOKIEAUTH_FILE = "regtest/.cookie";
 /** Get name mainchain RPC authentication cookie file */
-static fs::path GetMainchainAuthCookieFile()
+fs::path GetMainchainAuthCookieFile()
 {
     std::string cookie_file = MAINCHAIN_COOKIEAUTH_FILE;
+    if (gArgs.GetChainName() == "liquid-signet") {
+        cookie_file = "signet/.cookie";
+    }
     // Bitcoin mainnet exception
     if (gArgs.GetChainName() == "liquidv1") {
         cookie_file = ".cookie";
@@ -148,17 +161,120 @@ static fs::path GetMainchainAuthCookieFile()
     return fsbridge::AbsPathJoin(GetMainchainDefaultDataDir(), cookie_path);
 }
 
+bool ReadMainchainAuthCookieFile(
+    const fs::path& path,
+    std::string& cookie,
+    std::string* error)
+{
+    cookie.clear();
+    if (error) error->clear();
+    const std::string native_path = fs::PathToString(path);
+
+#ifndef WIN32
+    const int descriptor = open(
+        native_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        if (error) {
+            *error = strprintf(
+                "cannot securely open mainchain RPC cookie %s: %s",
+                native_path, std::strerror(errno));
+        }
+        return false;
+    }
+
+    struct stat metadata {};
+    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
+        if (error) *error = "mainchain RPC cookie is not a regular file: " + native_path;
+        close(descriptor);
+        return false;
+    }
+    if (metadata.st_uid != geteuid()) {
+        if (error) {
+            *error = "mainchain RPC cookie must be owned by the Elements process user: " +
+                native_path;
+        }
+        close(descriptor);
+        return false;
+    }
+    if ((metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        if (error) {
+            *error = "mainchain RPC cookie permissions must deny all group and other access: " +
+                native_path;
+        }
+        close(descriptor);
+        return false;
+    }
+
+    static constexpr size_t MAX_COOKIE_FILE_SIZE{256};
+    std::array<char, MAX_COOKIE_FILE_SIZE + 1> contents{};
+    size_t used{0};
+    while (used < contents.size()) {
+        const ssize_t count = read(
+            descriptor, contents.data() + used, contents.size() - used);
+        if (count > 0) {
+            used += static_cast<size_t>(count);
+            continue;
+        }
+        if (count == 0) break;
+        if (errno == EINTR) continue;
+        if (error) {
+            *error = strprintf(
+                "cannot read mainchain RPC cookie %s: %s",
+                native_path, std::strerror(errno));
+        }
+        close(descriptor);
+        return false;
+    }
+    close(descriptor);
+    if (used == contents.size()) {
+        if (error) *error = "mainchain RPC cookie file is unexpectedly large";
+        return false;
+    }
+    cookie.assign(contents.data(), used);
+#else
+    if (!fs::exists(path) || !fs::is_regular_file(path)) {
+        if (error) *error = "mainchain RPC cookie is not a regular file: " + native_path;
+        return false;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) {
+        if (error) *error = "cannot read mainchain RPC cookie: " + native_path;
+        return false;
+    }
+    cookie.assign(
+        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    if (cookie.size() > 256) {
+        cookie.clear();
+        if (error) *error = "mainchain RPC cookie file is unexpectedly large";
+        return false;
+    }
+#endif
+
+    if (!cookie.empty() && cookie.back() == '\n') cookie.pop_back();
+    if (!cookie.empty() && cookie.back() == '\r') cookie.pop_back();
+    static constexpr const char* COOKIE_PREFIX{"__cookie__:"};
+    static constexpr size_t COOKIE_PREFIX_SIZE{11};
+    if (cookie.rfind(COOKIE_PREFIX, 0) != 0 ||
+        cookie.size() != COOKIE_PREFIX_SIZE + 64 ||
+        !IsHex(cookie.substr(COOKIE_PREFIX_SIZE))) {
+        cookie.clear();
+        if (error) {
+            *error = "mainchain RPC cookie is not a canonical rotating Bitcoin Core cookie";
+        }
+        return false;
+    }
+    return true;
+}
+
 bool GetMainchainAuthCookie(std::string *cookie_out)
 {
-    std::ifstream file;
     std::string cookie;
-
-    std::filesystem::path filepath = GetMainchainAuthCookieFile();
-    file.open(filepath);
-    if (!file.is_open())
+    std::string error;
+    if (!ReadMainchainAuthCookieFile(
+            GetMainchainAuthCookieFile(), cookie, &error)) {
+        LogPrintf("Unable to read mainchain RPC authentication cookie: %s\n", error);
         return false;
-    std::getline(file, cookie);
-    file.close();
+    }
 
     if (cookie_out)
         *cookie_out = cookie;
