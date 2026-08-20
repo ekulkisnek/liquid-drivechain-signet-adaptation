@@ -89,7 +89,10 @@ std::ostream& operator<<(std::ostream& os, const uint256& num)
 }
 
 BasicTestingSetup::BasicTestingSetup(const std::string& chainName, const std::string& fedpegscript, const std::vector<const char*>& extra_args)
-    : m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString()},
+    : m_previous_con_elementsmode{g_con_elementsmode},
+      m_previous_con_blockheightinheader{g_con_blockheightinheader},
+      m_previous_signed_blocks{g_signed_blocks},
+      m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString()},
       m_args{}
 {
     // Hack to allow testing of fedpeg args
@@ -168,6 +171,12 @@ BasicTestingSetup::~BasicTestingSetup()
     LogInstance().DisconnectTestLogger();
     fs::remove_all(m_path_root);
     gArgs.ClearArgs();
+    gArgs.LockSettings([](util::Settings& settings) {
+        settings.forced_settings.clear();
+    });
+    g_con_elementsmode = m_previous_con_elementsmode;
+    g_con_blockheightinheader = m_previous_con_blockheightinheader;
+    g_signed_blocks = m_previous_signed_blocks;
     ECC_Stop();
 }
 
@@ -263,7 +272,10 @@ TestingSetup::TestingSetup(const std::string& chainName, const std::string& fedp
 }
 
 TestChain100Setup::TestChain100Setup(const std::vector<const char*>& extra_args)
-    : TestingSetup{CBaseChainParams::REGTEST, "", extra_args} // ELEMENTS: added empty fedpegscript here
+    : TestingSetup{
+          CBaseChainParams::REGTEST,
+          "",
+          Cat(std::vector<const char*>{"-con_elementsmode=0"}, extra_args)}
 {
     SetMockTime(1598887952);
     constexpr std::array<unsigned char, 32> vchKey = {
@@ -275,9 +287,13 @@ TestChain100Setup::TestChain100Setup(const std::vector<const char*>& extra_args)
 
     {
         LOCK(::cs_main);
-        assert(
-            m_node.chainman->ActiveChain().Tip()->GetBlockHash().ToString() ==
-            "571d80a9967ae599cec0448b0b0ba1cfb606f584d8069bd7166b86854ba7a191");
+        const std::string tip_hash =
+            m_node.chainman->ActiveChain().Tip()->GetBlockHash().ToString();
+        if (tip_hash !=
+            "571d80a9967ae599cec0448b0b0ba1cfb606f584d8069bd7166b86854ba7a191") {
+            throw std::runtime_error(strprintf(
+                "unexpected deterministic 100-block regtest tip: %s", tip_hash));
+        }
     }
 }
 

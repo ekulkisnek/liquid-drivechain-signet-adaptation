@@ -665,7 +665,7 @@ public:
         // produces Elements transaction serialization. Keep local regtest on
         // Elements semantics by default so real LWK transactions can be
         // decoded, validated, mined, and indexed during device E2E runs.
-        g_con_elementsmode = gArgs.GetBoolArg("-con_elementsmode", true);
+        g_con_elementsmode = args.GetBoolArg("-con_elementsmode", true);
         consensus.elements_mode = g_con_elementsmode;
         g_con_blockheightinheader = false;
         consensus.total_valid_epochs = 0;

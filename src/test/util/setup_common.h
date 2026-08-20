@@ -87,6 +87,9 @@ struct BasicTestingSetup {
     explicit BasicTestingSetup(const std::string& chainName = CBaseChainParams::MAIN, const std::string& fedpegscript = "", const std::vector<const char*>& extra_args = {});
     ~BasicTestingSetup();
 
+    const bool m_previous_con_elementsmode;
+    const bool m_previous_con_blockheightinheader;
+    const bool m_previous_signed_blocks;
     const fs::path m_path_root;
     ArgsManager m_args;
 };

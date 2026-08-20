@@ -22,7 +22,10 @@
 using node::BlockAssembler;
 
 namespace validation_block_tests {
-struct MinerTestingSetup : public RegTestingSetup {
+struct MinerTestingSetup : public TestingSetup {
+    MinerTestingSetup()
+        : TestingSetup{CBaseChainParams::REGTEST, "", {"-con_elementsmode=0"}} {}
+
     std::shared_ptr<CBlock> Block(const uint256& prev_hash);
     std::shared_ptr<const CBlock> GoodBlock(const uint256& prev_hash);
     std::shared_ptr<const CBlock> BadBlock(const uint256& prev_hash);

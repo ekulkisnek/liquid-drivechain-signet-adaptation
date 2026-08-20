@@ -14,7 +14,15 @@
 
 std::vector<std::pair<uint256, CTransactionRef>> extra_txn;
 
-BOOST_FIXTURE_TEST_SUITE(blockencodings_tests, RegTestingSetup)
+// These inherited Bitcoin compact-block vectors intentionally construct
+// transactions without Elements asset fields. Keep their internal regtest
+// fixture explicit instead of depending on the application's default chain.
+struct BitcoinBlockEncodingsSetup : public TestingSetup {
+    BitcoinBlockEncodingsSetup()
+        : TestingSetup{CBaseChainParams::REGTEST, "", {"-con_elementsmode=0"}} {}
+};
+
+BOOST_FIXTURE_TEST_SUITE(blockencodings_tests, BitcoinBlockEncodingsSetup)
 
 static CBlock BuildBlockTestCase() {
     CBlock block;
