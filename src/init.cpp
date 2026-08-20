@@ -17,6 +17,7 @@
 #include <compat/sanity.h>
 #include <consensus/amount.h>
 #include <deploymentstatus.h>
+#include <drivechain_bmm.h>
 #include <fs.h>
 #include <core_io.h>
 #include <hash.h>
@@ -39,6 +40,7 @@
 #include <node/caches.h>
 #include <node/chainstate.h>
 #include <node/context.h>
+#include <node/drivechain_withdrawal_bundle.h>
 #include <node/miner.h>
 #include <node/ui_interface.h>
 #include <policy/feerate.h>
@@ -82,6 +84,7 @@
 #include <cstdio>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <set>
 #include <string>
 #include <thread>
@@ -236,32 +239,48 @@ static bool SubmitDrivechainBmm(const int sidechain_slot, const int64_t parent_h
     }
 }
 
-static bool WaitForDrivechainBmmCommitment(const uint256& sidechain_block_hash, const uint256& parent_hash, const int sidechain_slot)
+static bool WaitForDrivechainBmmProof(
+    const drivechain::BmmL1State& previous_state,
+    const int64_t parent_height,
+    const uint256& parent_hash,
+    const uint256& critical_hash,
+    drivechain::BmmProof& proof)
 {
     int attempts = 0;
     int definitive_failures = 0;
     while (!ShutdownRequested()) {
-        std::string bmm_error;
-        if (IsDrivechainBmmCommitmentMined(sidechain_block_hash, parent_hash, sidechain_slot, &bmm_error)) {
-            LogPrintf("drivechain L1 block sync: confirmed mined BIP301 BMM commitment for sidechain block %s and parent %s\n",
-                sidechain_block_hash.GetHex(), parent_hash.GetHex());
-            return true;
-        }
-
-        if (bmm_error.rfind("L1 successor of parent", 0) == 0) {
-            ++definitive_failures;
-            if (definitive_failures >= 3) {
-                LogPrintf("drivechain L1 block sync: abandoning sidechain block %s for parent %s because the mined L1 successor does not contain its BMM commitment: %s\n",
-                    sidechain_block_hash.GetHex(), parent_hash.GetHex(), bmm_error);
-                return false;
+        try {
+            if (GetMainchainBlockHeight() > parent_height) {
+                std::string proof_error;
+                if (BuildDrivechainBmmProof(
+                        previous_state,
+                        parent_height,
+                        parent_hash,
+                        critical_hash,
+                        proof,
+                        &proof_error)) {
+                    LogPrintf("drivechain L1 block sync: constructed and verified BIP301 successor proof for critical hash %s and parent %s\n",
+                        critical_hash.GetHex(), parent_hash.GetHex());
+                    return true;
+                }
+                ++definitive_failures;
+                if (definitive_failures >= 3) {
+                    LogPrintf("drivechain L1 block sync: abandoning critical hash %s for parent %s because its fixed successor proof is invalid: %s\n",
+                        critical_hash.GetHex(), parent_hash.GetHex(), proof_error);
+                    return false;
+                }
+            } else {
+                definitive_failures = 0;
             }
-        } else {
-            definitive_failures = 0;
-        }
 
-        if (attempts % 4 == 0) {
-            LogPrintf("drivechain L1 block sync: waiting for mined BIP301 BMM commitment for sidechain block %s and parent %s: %s\n",
-                sidechain_block_hash.GetHex(), parent_hash.GetHex(), bmm_error);
+            if (attempts % 4 == 0) {
+                LogPrintf("drivechain L1 block sync: waiting for L1 successor proof for critical hash %s and parent %s\n",
+                    critical_hash.GetHex(), parent_hash.GetHex());
+            }
+        } catch (const std::exception& exception) {
+            if (attempts % 4 == 0) {
+                LogPrintf("drivechain L1 block sync: waiting for L1 proof data: %s\n", exception.what());
+            }
         }
         ++attempts;
         if (!g_drivechain_l1_block_sync_interrupt.sleep_for(std::chrono::seconds{30})) {
@@ -325,6 +344,7 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
     }
 
     int side_height = 0;
+    drivechain::BmmL1State bmm_state;
     {
         LOCK(cs_main);
         const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
@@ -333,14 +353,32 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
             return false;
         }
         side_height = tip->nHeight + 1;
+        std::string state_error;
+        if (!drivechain::GetEffectiveBmmState(
+                node.chainman->ActiveChainstate().CoinsTip(),
+                tip,
+                bmm_state,
+                state_error)) {
+            LogPrintf("drivechain L1 block sync: cannot obtain deterministic BMM state: %s\n", state_error);
+            return false;
+        }
     }
 
     const std::vector<unsigned char> parent_hash_bytes(parent_hash.begin(), parent_hash.end());
     const CScript parent_commitment = CScript() << OP_RETURN << parent_hash_bytes;
     const std::vector<CScript> commitments{parent_commitment};
 
+    if (parent_height < 0 ||
+        static_cast<uint64_t>(parent_height) >=
+            std::numeric_limits<uint32_t>::max()) {
+        LogPrintf("drivechain L1 block sync: parent successor height is outside the ECX committed range\n");
+        return false;
+    }
+    const uint64_t approving_parent_height{
+        static_cast<uint64_t>(parent_height) + 1};
+
     CScript coinbase_script(OP_TRUE);
-    std::unique_ptr<CBlockTemplate> block_template(BlockAssembler(node.chainman->ActiveChainstate(), *node.mempool, Params()).CreateNewBlock(coinbase_script, std::chrono::seconds(0), nullptr, &commitments));
+    std::unique_ptr<CBlockTemplate> block_template(BlockAssembler(node.chainman->ActiveChainstate(), *node.mempool, Params()).CreateNewBlock(coinbase_script, std::chrono::seconds(0), nullptr, &commitments, approving_parent_height));
     if (!block_template) {
         LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n", parent_height);
         return false;
@@ -348,28 +386,48 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
 
     const CAmount sidechain_fees = -block_template->vTxFees[0];
     const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
+    if (sidechain_slot != drivechain::BMM_SIDECHAIN_SLOT) {
+        LogPrintf("drivechain L1 block sync: deterministic BMM consensus is fixed to sidechain slot 24\n");
+        return false;
+    }
 
     if (!PrepareDrivechainBlock(*node.chainman, block_template->block)) {
         return false;
     }
 
-    const uint256 sidechain_block_hash = block_template->block.GetHash();
-    if (!SubmitDrivechainBmm(sidechain_slot, parent_height, parent_hash, sidechain_block_hash, sidechain_fees)) {
+    if (!block_template->block.HasBmmProof()) {
+        LogPrintf("drivechain L1 block sync: refusing to produce a block outside the strict public-signet BMM branch\n");
+        return false;
+    }
+    const uint256 critical_hash = block_template->block.GetBmmCriticalHash();
+    if (!SubmitDrivechainBmm(sidechain_slot, parent_height, parent_hash, critical_hash, sidechain_fees)) {
         LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
             side_height, parent_height);
         return false;
     }
 
-    if (!WaitForDrivechainBmmCommitment(sidechain_block_hash, parent_hash, sidechain_slot)) {
+    drivechain::BmmProof bmm_proof;
+    if (!WaitForDrivechainBmmProof(
+            bmm_state,
+            parent_height,
+            parent_hash,
+            critical_hash,
+            bmm_proof)) {
+        return false;
+    }
+    std::string proof_error;
+    if (!drivechain::AttachBmmProof(block_template->block, bmm_proof, proof_error)) {
+        LogPrintf("drivechain L1 block sync: failed to attach deterministic BMM proof: %s\n", proof_error);
         return false;
     }
 
+    const uint256 sidechain_block_hash = block_template->block.GetHash();
     if (!AcceptPreparedDrivechainBlock(*node.chainman, block_template->block)) {
         return false;
     }
 
-    LogPrintf("drivechain L1 block sync: mined sidechain block %s at height %d for L1 block %s at height %d, fees %s\n",
-        sidechain_block_hash.ToString(), side_height, parent_hash.GetHex(), parent_height, FormatMoney(sidechain_fees));
+    LogPrintf("drivechain L1 block sync: accepted sidechain block %s (BMM critical hash %s) at height %d for L1 block %s at height %d, fees %s\n",
+        sidechain_block_hash.ToString(), critical_hash.GetHex(), side_height, parent_hash.GetHex(), parent_height, FormatMoney(sidechain_fees));
     return true;
 }
 
@@ -756,6 +814,14 @@ void SetupServerArgs(ArgsManager& argsman)
             "(default: 0 = disable pruning blocks, 1 = allow manual pruning via RPC, >=%u = automatically prune block files to stay under the specified target size in MiB)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex", "Rebuild chain state and block index from the blk*.dat files on disk", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex-chainstate", "Rebuild chain state from the currently indexed blocks. When in pruning mode or if blocks on disk might be corrupted, use full -reindex instead.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-ecxactivationheight=<n>", "Activate the complete ECX state and source-inbox header rules at height n (regtest only; requires every ECX deployment argument)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxgenesisstateoutpoint=<txid:vout>", "Frozen pre-activation ECX singleton outpoint (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxgenesisstateroot=<hex>", "Frozen ECX singleton root matching the configured outpoint (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxchainid=<hex>", "Frozen ECX 32-byte protocol chain id, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxforcedactiondomain=<hex>", "Frozen nonzero forced-action inbox domain, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxdepositinboxdomain=<hex>", "Frozen distinct nonzero deposit inbox domain, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxcollateralvaultscript=<hex>", "Frozen raw collateral-vault script bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxcollateralvaultscripthash=<hex>", "SHA256 of the frozen raw collateral-vault script bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-settings=<file>", strprintf("Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and not meant to be edited by users (use %s instead for custom settings). Relative paths will be prefixed by datadir location. (default: %s)", BITCOIN_CONF_FILENAME, BITCOIN_SETTINGS_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #if HAVE_SYSTEM
     argsman.AddArg("-startupnotify=<cmd>", "Execute command on startup.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -956,6 +1022,13 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used for mined BMM commitment enforcement. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer gRPC address used for BIP301 requests and mined commitment verification. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used for BIP301 requests and mined commitment verification. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainsidechainnetwork=<name>", "Sidechain network required for authenticated drivechain deposits. (default: liquid-signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainmainchainnetwork=<name>", "Mainchain network required for authenticated drivechain deposits. (default: signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainmainchainsignetchallenge=<hex>", "Signet challenge required for authenticated drivechain deposits. (default: LayerTwoLabs public signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainenforcernetwork=<name>", "Enforcer network identity required for authenticated drivechain deposits. (default: NETWORK_SIGNET)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainsidechaintitle=<title>", "Activated sidechain title required for authenticated drivechain deposits. (default: Elements)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainsidechainhashid1=<hex>", "Activated sidechain hashId1 required for authenticated drivechain deposits. (default: LayerTwoLabs slot-24 Elements)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainsidechainhashid2=<hex>", "Activated sidechain hashId2 required for authenticated drivechain deposits. (default: LayerTwoLabs slot-24 Elements)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-peginconfirmationdepth=<n>", strprintf("Peg-in claims must be this deep to be considered valid. (default: %d)", DEFAULT_PEGIN_CONFIRMATION_DEPTH), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-parentpubkeyprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 pubkey address. (default: %d)", 111), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-parentscriptprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 script address. (default: %d)", 196), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
@@ -2349,6 +2422,14 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     for (const auto& client : node.chain_clients) {
         client->start(*node.scheduler);
+    }
+
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
+        const uint256 bundle_hash = tip == nullptr ? uint256::ZERO : tip->hashWithdrawalBundle;
+        node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle_hash);
+        LogPrintf("Restored drivechain withdrawal bundle state from sidechain tip: %s\n", bundle_hash.GetHex());
     }
 
     BanMan* banman = node.banman.get();

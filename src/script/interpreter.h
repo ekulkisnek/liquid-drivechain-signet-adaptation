@@ -192,6 +192,13 @@ using SimplicityTransactionUniquePtr = std::unique_ptr<elementsTransaction, Simp
 struct PrecomputedTransactionData
 {
     SimplicityTransactionUniquePtr m_simplicity_tx_data;
+    /** Consensus context for ECX Simplicity execution; null before activation. */
+    std::optional<uint256> m_prior_active_exchange_state_root;
+    std::optional<uint256> m_prior_active_forced_inbox_root;
+    std::optional<uint256> m_prior_active_deposit_inbox_root;
+    std::optional<uint256> m_current_bmm_parent_block_hash;
+    std::optional<uint64_t> m_current_bmm_parent_height;
+    std::optional<uint64_t> m_current_bmm_parent_mtp;
     // BIP341 precomputed data.
     // These are single-SHA256, see https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-15.
     uint256 m_prevouts_single_hash;

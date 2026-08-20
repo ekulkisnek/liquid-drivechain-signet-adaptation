@@ -214,6 +214,11 @@ public:
     uint256 hashPrevBlock;
     uint256 hashMerkleRoot;
     uint256 hashWithdrawalBundle;
+    uint256 hashBmmProof;
+    uint256 hashExchangeStateRoot;
+    uint256 hashForcedInboxRoot;
+    uint256 hashDepositInboxRoot;
+    uint32_t ecxParentHeight;
     uint32_t nTime;
     // Height in header as well as in coinbase for easier hsm validation
     // Is set for serialization with `-con_blockheightinheader=1`
@@ -238,11 +243,25 @@ public:
     static const uint32_t DYNAFED_HF_MASK = 1 << 31;
     // HF bit to detect block headers that commit to a withdrawal bundle hash.
     static const uint32_t WITHDRAWAL_BUNDLE_HF_MASK = 1 << 30;
+    // Header/body extension for deterministic L1 successor and BMM evidence.
+    static const uint32_t BMM_PROOF_HF_MASK = 1 << 20;
+    // Append-only ECX state-root header extension. Bit 19 is distinct from
+    // every deployed version bit and from the existing drivechain fields.
+    static const uint32_t EXCHANGE_STATE_HF_MASK = 1 << 19;
+    // Append-only forced-action inbox commitment. This extension follows the
+    // ECX singleton root and never replaces any previously deployed field.
+    static const uint32_t FORCED_INBOX_HF_MASK = 1 << 18;
+    // Append-only authenticated deposit inbox commitment.
+    static const uint32_t DEPOSIT_INBOX_HF_MASK = 1 << 17;
 
     template <typename Stream>
     inline void Serialize(Stream& s) const {
         const bool fAllowWitness = !(s.GetVersion() & SERIALIZE_TRANSACTION_NO_WITNESS);
         const bool has_withdrawal_bundle_hash = !hashWithdrawalBundle.IsNull();
+        const bool has_bmm_proof = (static_cast<uint32_t>(this->nVersion) & BMM_PROOF_HF_MASK) != 0;
+        const bool has_exchange_state = (static_cast<uint32_t>(this->nVersion) & EXCHANGE_STATE_HF_MASK) != 0;
+        const bool has_forced_inbox = (static_cast<uint32_t>(this->nVersion) & FORCED_INBOX_HF_MASK) != 0;
+        const bool has_deposit_inbox = (static_cast<uint32_t>(this->nVersion) & DEPOSIT_INBOX_HF_MASK) != 0;
 
         // Detect dynamic federation block serialization using "HF bit",
         // or the signed bit which is invalid in Bitcoin
@@ -263,9 +282,24 @@ public:
             if (has_withdrawal_bundle_hash) {
                 s << hashWithdrawalBundle;
             }
+            if (has_bmm_proof) {
+                s << hashBmmProof;
+            }
             s << nTime;
             s << block_height;
             s << m_dynafed_params;
+            if (has_exchange_state) {
+                s << hashExchangeStateRoot;
+            }
+            if (has_forced_inbox) {
+                s << hashForcedInboxRoot;
+            }
+            if (has_deposit_inbox) {
+                s << hashDepositInboxRoot;
+            }
+            if (has_forced_inbox && has_deposit_inbox) {
+                s << ecxParentHeight;
+            }
             // We do not serialize witness for hashes, or weight calculation
             if (!(s.GetType() & SER_GETHASH) && fAllowWitness) {
                 s << m_signblock_witness.stack;
@@ -276,6 +310,9 @@ public:
             if (has_withdrawal_bundle_hash) {
                 s << hashWithdrawalBundle;
             }
+            if (has_bmm_proof) {
+                s << hashBmmProof;
+            }
             s << nTime;
             if (g_con_blockheightinheader) {
                 s << block_height;
@@ -285,6 +322,18 @@ public:
             } else {
                 s << nBits;
                 s << nNonce;
+            }
+            if (has_exchange_state) {
+                s << hashExchangeStateRoot;
+            }
+            if (has_forced_inbox) {
+                s << hashForcedInboxRoot;
+            }
+            if (has_deposit_inbox) {
+                s << hashDepositInboxRoot;
+            }
+            if (has_forced_inbox && has_deposit_inbox) {
+                s << ecxParentHeight;
             }
         }
     }
@@ -300,6 +349,10 @@ public:
         s >> nVersion;
         is_dyna = nVersion < 0;
         const bool has_withdrawal_bundle_hash = (static_cast<uint32_t>(nVersion) & WITHDRAWAL_BUNDLE_HF_MASK) != 0;
+        const bool has_bmm_proof = (static_cast<uint32_t>(nVersion) & BMM_PROOF_HF_MASK) != 0;
+        const bool has_exchange_state = (static_cast<uint32_t>(nVersion) & EXCHANGE_STATE_HF_MASK) != 0;
+        const bool has_forced_inbox = (static_cast<uint32_t>(nVersion) & FORCED_INBOX_HF_MASK) != 0;
+        const bool has_deposit_inbox = (static_cast<uint32_t>(nVersion) & DEPOSIT_INBOX_HF_MASK) != 0;
         this->nVersion = static_cast<int32_t>(~(DYNAFED_HF_MASK | WITHDRAWAL_BUNDLE_HF_MASK) & static_cast<uint32_t>(nVersion));
 
         if (is_dyna) {
@@ -310,9 +363,34 @@ public:
             } else {
                 hashWithdrawalBundle.SetNull();
             }
+            if (has_bmm_proof) {
+                s >> hashBmmProof;
+            } else {
+                hashBmmProof.SetNull();
+            }
             s >> nTime;
             s >> block_height;
             s >> m_dynafed_params;
+            if (has_exchange_state) {
+                s >> hashExchangeStateRoot;
+            } else {
+                hashExchangeStateRoot.SetNull();
+            }
+            if (has_forced_inbox) {
+                s >> hashForcedInboxRoot;
+            } else {
+                hashForcedInboxRoot.SetNull();
+            }
+            if (has_deposit_inbox) {
+                s >> hashDepositInboxRoot;
+            } else {
+                hashDepositInboxRoot.SetNull();
+            }
+            if (has_forced_inbox && has_deposit_inbox) {
+                s >> ecxParentHeight;
+            } else {
+                ecxParentHeight = 0;
+            }
             // We do not serialize witness for hashes, or weight calculation
             if (!(s.GetType() & SER_GETHASH) && fAllowWitness) {
                 s >> m_signblock_witness.stack;
@@ -325,6 +403,11 @@ public:
             } else {
                 hashWithdrawalBundle.SetNull();
             }
+            if (has_bmm_proof) {
+                s >> hashBmmProof;
+            } else {
+                hashBmmProof.SetNull();
+            }
             s >> nTime;
             if (g_con_blockheightinheader) {
                 s >> block_height;
@@ -335,6 +418,26 @@ public:
                 s >> nBits;
                 s >> nNonce;
             }
+            if (has_exchange_state) {
+                s >> hashExchangeStateRoot;
+            } else {
+                hashExchangeStateRoot.SetNull();
+            }
+            if (has_forced_inbox) {
+                s >> hashForcedInboxRoot;
+            } else {
+                hashForcedInboxRoot.SetNull();
+            }
+            if (has_deposit_inbox) {
+                s >> hashDepositInboxRoot;
+            } else {
+                hashDepositInboxRoot.SetNull();
+            }
+            if (has_forced_inbox && has_deposit_inbox) {
+                s >> ecxParentHeight;
+            } else {
+                ecxParentHeight = 0;
+            }
         }
     }
 
@@ -344,6 +447,11 @@ public:
         hashPrevBlock.SetNull();
         hashMerkleRoot.SetNull();
         hashWithdrawalBundle.SetNull();
+        hashBmmProof.SetNull();
+        hashExchangeStateRoot.SetNull();
+        hashForcedInboxRoot.SetNull();
+        hashDepositInboxRoot.SetNull();
+        ecxParentHeight = 0;
         nTime = 0;
         block_height = 0;
         nBits = 0;
@@ -361,6 +469,24 @@ public:
     }
 
     uint256 GetHash() const;
+    uint256 GetBmmCriticalHash() const;
+
+    bool HasBmmProof() const
+    {
+        return (static_cast<uint32_t>(nVersion) & BMM_PROOF_HF_MASK) != 0;
+    }
+    bool HasExchangeState() const
+    {
+        return (static_cast<uint32_t>(nVersion) & EXCHANGE_STATE_HF_MASK) != 0;
+    }
+    bool HasForcedInbox() const
+    {
+        return (static_cast<uint32_t>(nVersion) & FORCED_INBOX_HF_MASK) != 0;
+    }
+    bool HasDepositInbox() const
+    {
+        return (static_cast<uint32_t>(nVersion) & DEPOSIT_INBOX_HF_MASK) != 0;
+    }
 
     int64_t GetBlockTime() const
     {
@@ -374,6 +500,7 @@ class CBlock : public CBlockHeader
 public:
     // network and disk
     std::vector<CTransactionRef> vtx;
+    std::vector<unsigned char> m_bmm_proof;
 
     // memory only
     mutable bool fChecked;
@@ -393,12 +520,18 @@ public:
     {
         READWRITEAS(CBlockHeader, obj);
         READWRITE(obj.vtx);
+        if (obj.HasBmmProof()) {
+            READWRITE(obj.m_bmm_proof);
+        } else {
+            SER_READ(obj, obj.m_bmm_proof.clear());
+        }
     }
 
     void SetNull()
     {
         CBlockHeader::SetNull();
         vtx.clear();
+        m_bmm_proof.clear();
         fChecked = false;
     }
 
@@ -409,6 +542,11 @@ public:
         block.hashPrevBlock  = hashPrevBlock;
         block.hashMerkleRoot = hashMerkleRoot;
         block.hashWithdrawalBundle = hashWithdrawalBundle;
+        block.hashBmmProof   = hashBmmProof;
+        block.hashExchangeStateRoot = hashExchangeStateRoot;
+        block.hashForcedInboxRoot = hashForcedInboxRoot;
+        block.hashDepositInboxRoot = hashDepositInboxRoot;
+        block.ecxParentHeight = ecxParentHeight;
         block.nTime          = nTime;
         block.block_height   = block_height;
         block.nBits          = nBits;

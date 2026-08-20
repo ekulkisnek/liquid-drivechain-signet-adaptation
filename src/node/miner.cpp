@@ -14,6 +14,8 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
+#include <drivechain_bmm.h>
+#include <ecx_exchange_state.h>
 #include <node/drivechain_withdrawal_bundle.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
@@ -42,6 +44,13 @@ uint256 GetCurrentDrivechainWithdrawalBundleHash()
 {
     LOCK(g_current_drivechain_withdrawal_bundle_mutex);
     return g_current_drivechain_withdrawal_bundle_hash;
+}
+
+void RestoreCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
+    g_drivechain_withdrawal_bundle_creation_in_progress = false;
 }
 
 bool TryBeginDrivechainWithdrawalBundleCreation(uint256& current_bundle_hash, bool& creation_in_progress)
@@ -167,7 +176,7 @@ void BlockAssembler::resetBlock()
     nFees = 0;
 }
 
-std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, std::chrono::seconds min_tx_age, DynaFedParamEntry* proposed_entry, const std::vector<CScript>* commit_scripts)
+std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, std::chrono::seconds min_tx_age, DynaFedParamEntry* proposed_entry, const std::vector<CScript>* commit_scripts, std::optional<uint64_t> authenticated_parent_height)
 {
     assert(min_tx_age >= std::chrono::seconds(0));
     int64_t nTimeStart = GetTimeMicros();
@@ -197,6 +206,9 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // -blockversion=N to test forking scenarios
     if (chainparams.MineBlocksOnDemand()) {
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
+    }
+    if (drivechain::BmmProofRequiredAfter(pindexPrev)) {
+        pblock->nVersion |= CBlockHeader::BMM_PROOF_HF_MASK;
     }
 
     pblock->nTime = GetAdjustedTime();
@@ -273,6 +285,17 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     pblock->hashWithdrawalBundle = GetCurrentDrivechainWithdrawalBundleHash();
+    std::string exchange_error;
+    if (!ecx::PrepareExchangeStateHeader(
+            *pblock,
+            pindexPrev,
+            m_chainstate.CoinsTip(),
+            nHeight,
+            exchange_error,
+            ecx::LayerTwoLabsExchangeConsensus(),
+            authenticated_parent_height)) {
+        throw std::runtime_error("CreateNewBlock(): " + exchange_error);
+    }
     UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     pblock->nBits          = g_signed_blocks ? 0 : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     if (g_con_blockheightinheader) {

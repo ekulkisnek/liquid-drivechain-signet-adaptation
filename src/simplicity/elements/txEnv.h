@@ -6,6 +6,7 @@
 #define SIMPLICITY_ELEMENTS_TXENV_H
 
 #include <stdbool.h>
+#include <simplicity/elements/env.h>
 #include "../sha256.h"
 
 /* An Elements 'outpoint' consists of a transaction id and output index within that transaction.
@@ -258,6 +259,16 @@ typedef struct txEnv {
   const elementsTapEnv* taproot;
   sha256_midstate genesisHash;
   sha256_midstate sigAllHash;
+  sha256_midstate priorActiveExchangeStateRoot;
+  bool priorActiveExchangeStateRootPresent;
+  sha256_midstate priorActiveForcedInboxRoot;
+  bool priorActiveForcedInboxRootPresent;
+  sha256_midstate priorActiveDepositInboxRoot;
+  bool priorActiveDepositInboxRootPresent;
+  sha256_midstate currentBmmParentBlockHash;
+  uint_fast64_t currentBmmParentHeight;
+  uint_fast64_t currentBmmParentMtp;
+  bool currentBmmParentPresent;
   uint_fast32_t ix;
 } txEnv;
 
@@ -269,6 +280,6 @@ typedef struct txEnv {
  *               NULL != genesisHash
  *               ix < tx->numInputs
  */
-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, uint_fast32_t ix);
+txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, const ecx_prior_active_root_env* ecxRoot, uint_fast32_t ix);
 
 #endif

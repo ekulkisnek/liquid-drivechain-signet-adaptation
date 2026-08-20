@@ -23,15 +23,28 @@ uint256 CBlockHeader::GetHash() const
     return SerializeHash(*this);
 }
 
+uint256 CBlockHeader::GetBmmCriticalHash() const
+{
+    CBlockHeader critical_header{*this};
+    critical_header.hashBmmProof.SetNull();
+    return critical_header.GetHash();
+}
+
 std::string CBlock::ToString() const
 {
     std::stringstream s;
-    s << strprintf("CBlock(hash=%s, ver=0x%08x, hashPrevBlock=%s, hashMerkleRoot=%s, hashWithdrawalBundle=%s, nTime=%u, nBits=%08x, nNonce=%u, proof=%u, vtx=%u)\n",
+    s << strprintf("CBlock(hash=%s, critical=%s, ver=0x%08x, hashPrevBlock=%s, hashMerkleRoot=%s, hashWithdrawalBundle=%s, hashBmmProof=%s, hashExchangeStateRoot=%s, hashForcedInboxRoot=%s, hashDepositInboxRoot=%s, ecxParentHeight=%u, nTime=%u, nBits=%08x, nNonce=%u, proof=%u, vtx=%u)\n",
         GetHash().ToString(),
+        GetBmmCriticalHash().ToString(),
         nVersion,
         hashPrevBlock.ToString(),
         hashMerkleRoot.ToString(),
         hashWithdrawalBundle.ToString(),
+        hashBmmProof.ToString(),
+        hashExchangeStateRoot.ToString(),
+        hashForcedInboxRoot.ToString(),
+        hashDepositInboxRoot.ToString(),
+        ecxParentHeight,
         nTime, nBits, nNonce, proof.ToString(),
         vtx.size());
     for (const auto& tx : vtx) {

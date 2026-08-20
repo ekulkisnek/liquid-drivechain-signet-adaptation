@@ -81,7 +81,15 @@ protected:
      * recursive function that traverses tree nodes, consuming the bits and hashes produced by TraverseAndBuild.
      * it returns the hash of the respective node and its respective index.
      */
-    uint256 TraverseAndExtract(int height, unsigned int pos, unsigned int &nBitsUsed, unsigned int &nHashUsed, std::vector<uint256> &vMatch, std::vector<unsigned int> &vnIndex);
+    uint256 TraverseAndExtract(
+        int height,
+        unsigned int pos,
+        unsigned int& nBitsUsed,
+        unsigned int& nHashUsed,
+        std::vector<uint256>& vMatch,
+        std::vector<unsigned int>& vnIndex,
+        const unsigned int* replacement_index = nullptr,
+        const uint256* replacement_hash = nullptr);
 
 public:
 
@@ -106,6 +114,13 @@ public:
      * returns the merkle root, or 0 in case of failure
      */
     uint256 ExtractMatches(std::vector<uint256> &vMatch, std::vector<unsigned int> &vnIndex);
+
+    /** Extract matches while substituting one matched leaf when calculating the root. */
+    uint256 ExtractMatchesWithReplacement(
+        std::vector<uint256>& vMatch,
+        std::vector<unsigned int>& vnIndex,
+        unsigned int replacement_index,
+        const uint256& replacement_hash);
 
     /** Get number of transactions the merkle proof is indicating for cross-reference with
      * local blockchain knowledge.
@@ -159,4 +174,3 @@ private:
 } // namespace Sidechain
 
 #endif // BITCOIN_PRIMITIVES_BITCOIN_MERKLEBLOCK_H
-

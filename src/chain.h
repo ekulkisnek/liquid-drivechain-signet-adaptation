@@ -207,6 +207,11 @@ public:
     int32_t nVersion{0};
     uint256 hashMerkleRoot{};
     uint256 hashWithdrawalBundle{};
+    uint256 hashBmmProof{};
+    uint256 hashExchangeStateRoot{};
+    uint256 hashForcedInboxRoot{};
+    uint256 hashDepositInboxRoot{};
+    uint32_t ecxParentHeight{0};
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
@@ -294,6 +299,11 @@ public:
         : nVersion{block.nVersion},
           hashMerkleRoot{block.hashMerkleRoot},
           hashWithdrawalBundle{block.hashWithdrawalBundle},
+          hashBmmProof{block.hashBmmProof},
+          hashExchangeStateRoot{block.hashExchangeStateRoot},
+          hashForcedInboxRoot{block.hashForcedInboxRoot},
+          hashDepositInboxRoot{block.hashDepositInboxRoot},
+          ecxParentHeight{block.ecxParentHeight},
           nTime{block.nTime},
           nBits{block.nBits},
           nNonce{block.nNonce},
@@ -334,6 +344,11 @@ public:
             block.hashPrevBlock = pprev->GetBlockHash();
         block.hashMerkleRoot = hashMerkleRoot;
         block.hashWithdrawalBundle = hashWithdrawalBundle;
+        block.hashBmmProof = hashBmmProof;
+        block.hashExchangeStateRoot = hashExchangeStateRoot;
+        block.hashForcedInboxRoot = hashForcedInboxRoot;
+        block.hashDepositInboxRoot = hashDepositInboxRoot;
+        block.ecxParentHeight = ecxParentHeight;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;
@@ -537,6 +552,32 @@ public:
         } else {
             SER_READ(obj, obj.hashWithdrawalBundle.SetNull());
         }
+        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) {
+            READWRITE(obj.hashBmmProof);
+        } else {
+            SER_READ(obj, obj.hashBmmProof.SetNull());
+        }
+        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::EXCHANGE_STATE_HF_MASK) != 0) {
+            READWRITE(obj.hashExchangeStateRoot);
+        } else {
+            SER_READ(obj, obj.hashExchangeStateRoot.SetNull());
+        }
+        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0) {
+            READWRITE(obj.hashForcedInboxRoot);
+        } else {
+            SER_READ(obj, obj.hashForcedInboxRoot.SetNull());
+        }
+        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
+            READWRITE(obj.hashDepositInboxRoot);
+        } else {
+            SER_READ(obj, obj.hashDepositInboxRoot.SetNull());
+        }
+        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0 &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
+            READWRITE(obj.ecxParentHeight);
+        } else {
+            SER_READ(obj, obj.ecxParentHeight = 0);
+        }
         READWRITE(obj.nTime);
 
         // Allocate objects in the optional<> fields when reading, since READWRITE will not do this
@@ -559,6 +600,9 @@ public:
             READWRITE(obj.nBits);
             READWRITE(obj.nNonce);
         }
+        // Disk order need not match wire order; this branch is intentionally
+        // empty because the root was already serialized above with the other
+        // fixed header commitments.
     }
 
     uint256 GetBlockHash() const
@@ -569,6 +613,11 @@ public:
         block.hashPrevBlock = hashPrev;
         block.hashMerkleRoot = hashMerkleRoot;
         block.hashWithdrawalBundle = hashWithdrawalBundle;
+        block.hashBmmProof = hashBmmProof;
+        block.hashExchangeStateRoot = hashExchangeStateRoot;
+        block.hashForcedInboxRoot = hashForcedInboxRoot;
+        block.hashDepositInboxRoot = hashDepositInboxRoot;
+        block.ecxParentHeight = ecxParentHeight;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;

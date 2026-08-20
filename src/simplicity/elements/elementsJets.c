@@ -23,6 +23,63 @@ static void writeHash(frameItem* dst, const sha256_midstate* h) {
   write32s(dst, h->s, 8);
 }
 
+/* prior_active_exchange_state_root_required : ONE |- TWO^256
+ *
+ * The generated catalogue entry is intentionally separate from this runtime
+ * implementation. Once assigned its reviewed CMR/encoding/cost, the decoder
+ * points at this function. Absence is a Simplicity jet failure, not a zero
+ * value or witness-controlled fallback.
+ */
+bool simplicity_prior_active_exchange_state_root_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env->priorActiveExchangeStateRootPresent) return false;
+  writeHash(dst, &env->priorActiveExchangeStateRoot);
+  return true;
+}
+
+bool simplicity_prior_active_forced_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env->priorActiveForcedInboxRootPresent) return false;
+  writeHash(dst, &env->priorActiveForcedInboxRoot);
+  return true;
+}
+
+bool simplicity_prior_active_deposit_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env->priorActiveDepositInboxRootPresent) return false;
+  writeHash(dst, &env->priorActiveDepositInboxRoot);
+  return true;
+}
+
+/* current_bmm_parent_block_hash_required : ONE |- TWO^256
+ * current_bmm_parent_height_required     : ONE |- TWO^64
+ * current_bmm_parent_mtp_required        : ONE |- TWO^64
+ *
+ * "Current" is the BMM state already authenticated at the prior active
+ * sidechain tip. It is therefore known while constructing this transaction;
+ * the candidate block's future BMM successor is intentionally not exposed.
+ */
+bool simplicity_current_bmm_parent_block_hash_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env->currentBmmParentPresent) return false;
+  writeHash(dst, &env->currentBmmParentBlockHash);
+  return true;
+}
+
+bool simplicity_current_bmm_parent_height_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env->currentBmmParentPresent) return false;
+  simplicity_write64(dst, env->currentBmmParentHeight);
+  return true;
+}
+
+bool simplicity_current_bmm_parent_mtp_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env->currentBmmParentPresent) return false;
+  simplicity_write64(dst, env->currentBmmParentMtp);
+  return true;
+}
+
 /* Write an outpoint value to the 'dst' frame, advancing the cursor 288 cells.
  *
  * Precondition: '*dst' is a valid write frame for 288 more cells;

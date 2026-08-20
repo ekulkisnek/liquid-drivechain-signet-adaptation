@@ -17,6 +17,9 @@
 #include <consensus/validation.h>
 #include <cuckoocache.h>
 #include <deploymentstatus.h>
+#include <drivechain_bmm.h>
+#include <ecx_exchange_state.h>
+#include <drivechain_peg.h>
 #include <flatfile.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
@@ -62,6 +65,7 @@
 #include <dynafed.h>
 
 #include <algorithm>
+#include <array>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -157,6 +161,55 @@ uint256 hashAssumeValid;
 arith_uint256 nMinimumChainWork;
 
 CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
+
+static void BindPriorActiveExchangeStateRoot(
+    PrecomputedTransactionData& txdata,
+    const CBlockIndex* previous,
+    const drivechain::BmmL1State* prior_bmm_state)
+{
+    uint256 exchange_root;
+    uint256 forced_root;
+    uint256 deposit_root;
+    std::string error;
+    if (ecx::GetPriorActiveExchangeStateRoot(previous, exchange_root, error) &&
+        ecx::GetPriorActiveForcedInboxRoot(previous, forced_root, error) &&
+        ecx::GetPriorActiveDepositInboxRoot(previous, deposit_root, error)) {
+        txdata.m_prior_active_exchange_state_root = exchange_root;
+        txdata.m_prior_active_forced_inbox_root = forced_root;
+        txdata.m_prior_active_deposit_inbox_root = deposit_root;
+    } else {
+        txdata.m_prior_active_exchange_state_root.reset();
+        txdata.m_prior_active_forced_inbox_root.reset();
+        txdata.m_prior_active_deposit_inbox_root.reset();
+    }
+
+    drivechain::BmmParentContext parent;
+    if (prior_bmm_state &&
+        drivechain::GetBmmParentContext(*prior_bmm_state, parent, error)) {
+        txdata.m_current_bmm_parent_block_hash = parent.block_hash;
+        txdata.m_current_bmm_parent_height = parent.height;
+        txdata.m_current_bmm_parent_mtp = parent.median_time_past;
+    } else {
+        txdata.m_current_bmm_parent_block_hash.reset();
+        txdata.m_current_bmm_parent_height.reset();
+        txdata.m_current_bmm_parent_mtp.reset();
+    }
+}
+
+static void BindPriorActiveExchangeStateRootFromView(
+    PrecomputedTransactionData& txdata,
+    const CBlockIndex* previous,
+    const CCoinsViewCache& view)
+{
+    drivechain::BmmL1State prior_bmm_state;
+    std::string error;
+    const bool have_bmm_state{drivechain::GetEffectiveBmmState(
+        view, previous, prior_bmm_state, error)};
+    BindPriorActiveExchangeStateRoot(
+        txdata,
+        previous,
+        have_bmm_state ? &prior_bmm_state : nullptr);
+}
 
 CBlockIndex* CChainState::FindForkInGlobalIndex(const CBlockLocator& locator) const
 {
@@ -1211,6 +1264,10 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     TxValidationState& state = ws.m_state;
 
     unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    BindPriorActiveExchangeStateRootFromView(
+        ws.m_precomputed_txdata,
+        m_active_chainstate.m_chain.Tip(),
+        m_active_chainstate.CoinsTip());
 
     // Temporarily add additional script flags based on the activation of
     // Dynamic Federations. This can be included in the
@@ -1246,6 +1303,10 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const uint256& hash = ws.m_hash;
     TxValidationState& state = ws.m_state;
     const CChainParams& chainparams = args.m_chainparams;
+    BindPriorActiveExchangeStateRootFromView(
+        ws.m_precomputed_txdata,
+        m_active_chainstate.m_chain.Tip(),
+        m_active_chainstate.CoinsTip());
 
     // Check again against the current block tip's script verification
     // flags to cache our script execution flags. This is, of course,
@@ -1901,7 +1962,68 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // transaction).
     uint256 hashCacheEntry;
     CSHA256 hasher = g_scriptExecutionCacheHasher;
-    hasher.Write(tx.GetWitnessHash().begin(), 32).Write((unsigned char*)&flags, sizeof(flags)).Finalize(hashCacheEntry.begin());
+    static const uint256 ecx_cache_domain = [] {
+        static constexpr unsigned char tag[]{
+            'E','C','X','/','S','i','m','p','l','i','c','i','t','y','-','c','a','c','h','e','/','v','3'};
+        uint256 digest;
+        CSHA256().Write(tag, sizeof(tag)).Finalize(digest.begin());
+        return digest;
+    }();
+    const std::array<unsigned char, 2> revision{{
+        static_cast<unsigned char>(ecx::EXCHANGE_SCRIPT_CACHE_REVISION >> 8),
+        static_cast<unsigned char>(ecx::EXCHANGE_SCRIPT_CACHE_REVISION)}};
+    const unsigned char present = txdata.m_prior_active_exchange_state_root.has_value() ? 1 : 0;
+    const unsigned char forced_present = txdata.m_prior_active_forced_inbox_root.has_value() ? 1 : 0;
+    const unsigned char deposit_present = txdata.m_prior_active_deposit_inbox_root.has_value() ? 1 : 0;
+    const bool bmm_hash_present{
+        txdata.m_current_bmm_parent_block_hash.has_value()};
+    const bool bmm_height_present{txdata.m_current_bmm_parent_height.has_value()};
+    const bool bmm_mtp_present{txdata.m_current_bmm_parent_mtp.has_value()};
+    const unsigned char bmm_present =
+        bmm_hash_present == bmm_height_present &&
+        bmm_hash_present == bmm_mtp_present
+        ? (bmm_hash_present ? 1 : 0)
+        : 2;
+    const auto encode_u64_be = [](uint64_t value) {
+        std::array<unsigned char, 8> bytes{};
+        for (int index = 7; index >= 0; --index) {
+            bytes[index] = value & 0xff;
+            value >>= 8;
+        }
+        return bytes;
+    };
+    const std::array<unsigned char, 8> bmm_height{encode_u64_be(
+        txdata.m_current_bmm_parent_height.value_or(0))};
+    const std::array<unsigned char, 8> bmm_mtp{encode_u64_be(
+        txdata.m_current_bmm_parent_mtp.value_or(0))};
+    const std::array<unsigned char, 32> absent{};
+    const unsigned char* root = present
+        ? txdata.m_prior_active_exchange_state_root->begin()
+        : absent.data();
+    const unsigned char* forced_root = forced_present
+        ? txdata.m_prior_active_forced_inbox_root->begin()
+        : absent.data();
+    const unsigned char* deposit_root = deposit_present
+        ? txdata.m_prior_active_deposit_inbox_root->begin()
+        : absent.data();
+    const unsigned char* bmm_block_hash = bmm_hash_present
+        ? txdata.m_current_bmm_parent_block_hash->begin()
+        : absent.data();
+    hasher.Write(tx.GetWitnessHash().begin(), 32)
+        .Write((unsigned char*)&flags, sizeof(flags))
+        .Write(ecx_cache_domain.begin(), 32)
+        .Write(revision.data(), revision.size())
+        .Write(&present, 1)
+        .Write(root, 32)
+        .Write(&forced_present, 1)
+        .Write(forced_root, 32)
+        .Write(&deposit_present, 1)
+        .Write(deposit_root, 32)
+        .Write(&bmm_present, 1)
+        .Write(bmm_block_hash, 32)
+        .Write(bmm_height.data(), bmm_height.size())
+        .Write(bmm_mtp.data(), bmm_mtp.size())
+        .Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (g_scriptExecutionCache.contains(hashCacheEntry, !cacheFullScriptStore)) {
         return true;
@@ -2097,12 +2219,43 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
                 --j;
                 const COutPoint& out = tx.vin[j].prevout;
                 const CScriptWitness& pegin_wit = tx.witness.vtxinwit.size() > j ? tx.witness.vtxinwit[j].m_pegin_witness : CScriptWitness();
+                if (tx.vin[j].m_is_pegin &&
+                    IsDrivechainDepositPeginWitness(pegin_wit, out)) {
+                    std::string state_error;
+                    if (!drivechain::DisconnectDepositState(tx, j, view, pindex->nHeight, state_error)) {
+                        error("DisconnectBlock(): cannot restore drivechain CTIP state: %s", state_error);
+                        return DISCONNECT_FAILED;
+                    }
+                }
                 int res = ApplyTxInUndo(std::move(txundo.vprevout[j]), view, out, tx.vin[j], pegin_wit, fedpegscripts);
                 if (res == DISCONNECT_FAILED) return DISCONNECT_FAILED;
                 fClean = fClean && res != DISCONNECT_UNCLEAN;
             }
             // At this point, all of txundo.vprevout should have been moved out.
         }
+    }
+    std::string exchange_error;
+    if (!ecx::DisconnectExchangeState(
+            block,
+            pindex->pprev,
+            view,
+            pindex->nHeight,
+            exchange_error)) {
+        error(
+            "DisconnectBlock(): cannot restore ECX exchange state: %s",
+            exchange_error);
+        return DISCONNECT_FAILED;
+    }
+
+    std::string bmm_error;
+    if (!drivechain::DisconnectBmmState(
+            block,
+            pindex->pprev,
+            view,
+            pindex->nHeight,
+            bmm_error)) {
+        error("DisconnectBlock(): cannot restore deterministic BMM state: %s", bmm_error);
+        return DISCONNECT_FAILED;
     }
 
     // move best block pointer to prevout block
@@ -2273,15 +2426,6 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
         return true;
     }
 
-    {
-        const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
-        std::string bmm_error;
-        if (!IsDrivechainBmmCommitmentMined(block, sidechain_slot, &bmm_error)) {
-            return state.Error(strprintf("missing mined BIP301 BMM commitment for sidechain block %s: %s",
-                block_hash.GetHex(), bmm_error));
-        }
-    }
-
     // Check it again in case a previous version let a bad block in
     // NOTE: We don't currently (re-)invoke ContextualCheckBlock() or
     // ContextualCheckBlockHeader() here. This means that if we add a new
@@ -2303,6 +2447,50 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
             return AbortNode(state, "Corrupt block found indicating potential hardware failure; shutting down");
         }
         return error("%s: Consensus::CheckBlock: %s", __func__, state.ToString());
+    }
+
+    // Capture the already-authenticated parent context before this block's
+    // BMM proof advances chainstate. Simplicity deliberately receives this
+    // known prior context, never the future successor that approved the block.
+    std::optional<drivechain::BmmL1State> prior_bmm_state;
+    drivechain::BmmL1State prior_bmm_candidate;
+    std::string prior_bmm_error;
+    if (drivechain::GetEffectiveBmmState(
+            view,
+            pindex->pprev,
+            prior_bmm_candidate,
+            prior_bmm_error)) {
+        prior_bmm_state = std::move(prior_bmm_candidate);
+    }
+
+    std::string bmm_error;
+    if (!drivechain::CheckBmmHeader(block, pindex->pprev, bmm_error) ||
+        !drivechain::ConnectBmmState(
+            block,
+            pindex->pprev,
+            view,
+            pindex->nHeight,
+            fJustCheck,
+            bmm_error)) {
+        return state.Invalid(
+            BlockValidationResult::BLOCK_CONSENSUS,
+            "bad-drivechain-bmm-proof",
+            bmm_error);
+    }
+    std::string exchange_error;
+    if (!ecx::ConnectExchangeState(
+            block,
+            pindex->pprev,
+            view,
+            pindex->nHeight,
+            exchange_error,
+            ecx::LayerTwoLabsExchangeConsensus(),
+            std::nullopt,
+            fJustCheck)) {
+        return state.Invalid(
+            BlockValidationResult::BLOCK_CONSENSUS,
+            "bad-ecx-exchange-state",
+            exchange_error);
     }
 
     nBlocksTotal++;
@@ -2464,6 +2652,10 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
     std::vector<PrecomputedTransactionData> txsdata;
     for (unsigned int i = 0; i< block.vtx.size(); i++ ){
         txsdata.push_back(PrecomputedTransactionData(m_params.HashGenesisBlock()));
+        BindPriorActiveExchangeStateRoot(
+            txsdata.back(),
+            pindex->pprev,
+            prior_bmm_state ? &*prior_bmm_state : nullptr);
     }
 
     std::vector<int> prevheights;
@@ -2500,6 +2692,29 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
 
         if (!tx.IsCoinBase())
         {
+            for (size_t input_index = 0; input_index < tx.vin.size(); ++input_index) {
+                if (!tx.vin[input_index].m_is_pegin ||
+                    input_index >= tx.witness.vtxinwit.size() ||
+                    !IsDrivechainDepositPeginWitness(
+                        tx.witness.vtxinwit[input_index].m_pegin_witness,
+                        tx.vin[input_index].prevout)) {
+                    continue;
+                }
+                uint256 expected_parent;
+                std::string evidence_error;
+                if (!ExtractDrivechainParentHashFromBlock(block, expected_parent, &evidence_error) ||
+                    !drivechain::VerifyDepositEvidenceAnchor(
+                        tx,
+                        input_index,
+                        expected_parent,
+                        evidence_error)) {
+                    return state.Invalid(
+                        BlockValidationResult::BLOCK_CONSENSUS,
+                        "bad-drivechain-deposit-anchor",
+                        evidence_error);
+                }
+            }
+
             std::vector<CCheck*> vChecks;
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             TxValidationState tx_state;
@@ -2564,6 +2779,29 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
         CTxUndo undoDummy;
         if (i > 0) {
             blockundo.vtxundo.push_back(CTxUndo());
+        }
+        if (!tx.IsCoinBase()) {
+            for (size_t input_index = 0; input_index < tx.vin.size(); ++input_index) {
+                if (!tx.vin[input_index].m_is_pegin ||
+                    input_index >= tx.witness.vtxinwit.size() ||
+                    !IsDrivechainDepositPeginWitness(
+                        tx.witness.vtxinwit[input_index].m_pegin_witness,
+                        tx.vin[input_index].prevout)) {
+                    continue;
+                }
+                std::string state_error;
+                if (!drivechain::ConnectDepositState(
+                        tx,
+                        input_index,
+                        view,
+                        pindex->nHeight,
+                        state_error)) {
+                    return state.Invalid(
+                        BlockValidationResult::BLOCK_CONSENSUS,
+                        "bad-drivechain-deposit-state",
+                        state_error);
+                }
+            }
         }
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(), pindex->nHeight);
 
@@ -4001,6 +4239,14 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         return false;
     }
 
+    std::string bmm_error;
+    if (!drivechain::CheckBmmHeader(block, pindexPrev, bmm_error)) {
+        return state.Invalid(
+            BlockValidationResult::BLOCK_INVALID_HEADER,
+            "bad-drivechain-bmm-header",
+            bmm_error);
+    }
+
     return true;
 }
 
@@ -4294,16 +4540,6 @@ bool CChainState::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, Block
             m_blockman.m_dirty_blockindex.insert(pindex);
         }
         return error("%s: %s", __func__, state.ToString());
-    }
-
-    if (m_params.GetConsensus().hashGenesisBlock != block.GetHash()) {
-        const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
-        std::string bmm_error;
-        if (!IsDrivechainBmmCommitmentMined(block, sidechain_slot, &bmm_error)) {
-            state.Error(strprintf("missing mined BIP301 BMM commitment for sidechain block %s: %s",
-                block.GetHash().GetHex(), bmm_error));
-            return error("%s: %s", __func__, state.ToString());
-        }
     }
 
     // Header is valid/has work, merkle tree and segwit merkle tree are good...RELAY NOW

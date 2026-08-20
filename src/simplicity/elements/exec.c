@@ -11,6 +11,23 @@
 #include "../simplicity_assert.h"
 #include "../typeInference.h"
 
+static bool valid_optional_ecx_root(uint8_t present, const uint8_t root[32]) {
+  static const unsigned char zero[32] = {0};
+  return present <= 1 && (present ? 0 != memcmp(root, zero, sizeof(zero))
+                                  : 0 == memcmp(root, zero, sizeof(zero)));
+}
+
+static bool valid_optional_bmm_parent(const ecx_prior_active_root_env* env) {
+  static const unsigned char zero[32] = {0};
+  if (env->current_bmm_parent_present > 1) return false;
+  if (!env->current_bmm_parent_present) {
+    return 0 == memcmp(env->current_bmm_parent_block_hash_wire, zero, sizeof(zero)) &&
+           0 == env->current_bmm_parent_height && 0 == env->current_bmm_parent_mtp;
+  }
+  return 0 != memcmp(env->current_bmm_parent_block_hash_wire, zero, sizeof(zero)) &&
+         0 != env->current_bmm_parent_height && 0 != env->current_bmm_parent_mtp;
+}
+
 /* Deserialize a Simplicity 'program' with its 'witness' data and execute it in the environment of the 'ix'th input of 'tx' with `taproot`.
  *
  * If at any time malloc fails then '*error' is set to 'SIMPLICITY_ERR_MALLOC' and 'false' is returned,
@@ -42,9 +59,10 @@
  *               unsigned char program[program_len]
  *               unsigned char witness[witness_len]
  */
-extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned char* ihr
+extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* error, unsigned char* ihr
                                               , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
                                               , const unsigned char* genesisBlockHash
+                                              , const ecx_prior_active_root_env* ecxRoot
                                               , int64_t minCost, int64_t budget
                                               , const unsigned char* amr
                                               , const unsigned char* program, size_t program_len
@@ -53,10 +71,19 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
   simplicity_assert(NULL != tx);
   simplicity_assert(NULL != taproot);
   simplicity_assert(NULL != genesisBlockHash);
+  simplicity_assert(NULL != ecxRoot);
   simplicity_assert(0 <= minCost);
   simplicity_assert(minCost <= budget);
   simplicity_assert(NULL != program || 0 == program_len);
   simplicity_assert(NULL != witness || 0 == witness_len);
+
+  if (!valid_optional_ecx_root(ecxRoot->present, ecxRoot->root_wire) ||
+      !valid_optional_ecx_root(ecxRoot->forced_inbox_present, ecxRoot->forced_inbox_root_wire) ||
+      !valid_optional_ecx_root(ecxRoot->deposit_inbox_present, ecxRoot->deposit_inbox_root_wire) ||
+      !valid_optional_bmm_parent(ecxRoot)) {
+    *error = SIMPLICITY_ERR_DATA_OUT_OF_RANGE;
+    return true;
+  }
 
   combinator_counters census;
   dag_node* dag = NULL;
@@ -125,7 +152,7 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
       simplicity_free(analysis);
     }
     if (IS_OK(*error)) {
-      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ix);
+      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ecxRoot, ix);
       static_assert(BUDGET_MAX <= UBOUNDED_MAX, "BUDGET_MAX doesn't fit in ubounded.");
       *error = evalTCOProgram( dag, type_dag, (size_t)dag_len
                              , minCost <= BUDGET_MAX ? (ubounded)minCost : BUDGET_MAX
@@ -137,4 +164,17 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
 
   simplicity_free(dag);
   return IS_PERMANENT(*error);
+}
+
+extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned char* ihr
+                                              , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
+                                              , const unsigned char* genesisBlockHash
+                                              , int64_t minCost, int64_t budget
+                                              , const unsigned char* amr
+                                              , const unsigned char* program, size_t program_len
+                                              , const unsigned char* witness, size_t witness_len) {
+  const ecx_prior_active_root_env absent = {0};
+  return simplicity_elements_execSimplicityWithBlockEnv(
+      error, ihr, tx, ix, taproot, genesisBlockHash, &absent,
+      minCost, budget, amr, program, program_len, witness, witness_len);
 }

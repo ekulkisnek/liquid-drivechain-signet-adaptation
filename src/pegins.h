@@ -16,6 +16,16 @@
 
 #include <variant>
 
+struct DrivechainDepositEvidence
+{
+    std::vector<unsigned char> deposit_tx;
+    std::vector<unsigned char> txout_proof;
+    std::vector<unsigned char> previous_ctip_tx;
+    int64_t sequence_number{0};
+    int64_t previous_sequence_number{0};
+    std::vector<Sidechain::Bitcoin::CBlockHeader> headers;
+};
+
 /** Calculates script necessary for p2ch peg-in transactions */
 CScript calculate_contract(const CScript& federationRedeemScript, const CScript& witnessProgram);
 bool GetAmountFromParentChainPegin(CAmount& amount, const Sidechain::Bitcoin::CTransaction& txBTC, unsigned int nOut);
@@ -26,10 +36,24 @@ bool CheckParentProofOfWork(uint256 hash, unsigned int nBits, const Consensus::P
 bool IsValidPeginWitness(const CScriptWitness& pegin_witness, const std::vector<std::pair<CScript, CScript>>& fedpegscripts, const COutPoint& prevout, std::string& err_msg, bool check_depth, bool* depth_failed = nullptr);
 /** Checks whether a pegin witness is a trusted BIP300/301 drivechain deposit import. */
 bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness, const COutPoint& prevout, CAmount* value = nullptr, CScript* claim_script = nullptr);
+/** Return true only for the historical v1 marker format. */
+bool IsLegacyDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness);
+
+/** Extract the consensus-anchored fields from a BIP300/301 drivechain deposit import. */
+bool GetDrivechainDepositPeginData(const CScriptWitness& pegin_witness, const COutPoint& prevout, CAmount& value, CScript& claim_script, uint256& mainchain_txid);
+/** Decode the deterministic v2 evidence committed by a drivechain deposit witness. */
+bool GetDrivechainDepositEvidence(const CScriptWitness& pegin_witness, const COutPoint& prevout, DrivechainDepositEvidence& evidence, std::string& error);
 /** Return the duplicate-claim key used for sidechain pegin/deposit spent tracking. */
 std::pair<uint256, COutPoint> GetPeginSpentKey(const CScriptWitness& pegin_witness, const COutPoint& prevout);
 /** Create a pegin witness for a trusted BIP300/301 drivechain deposit import. */
 CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value, const CAsset& asset, const uint256& genesis_hash, const CScript& claim_script, const uint256& mainchain_txid);
+/** Create a deterministic v2 drivechain deposit witness. */
+CScriptWitness CreateDrivechainDepositPeginWitness(
+    const CAmount& value,
+    const CAsset& asset,
+    const uint256& genesis_hash,
+    const CScript& claim_script,
+    const DrivechainDepositEvidence& evidence);
 
 /* Consensus-critical. Matching against telescoped multisig used on Liquid v1:
  * Pseudo-structure:

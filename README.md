@@ -141,6 +141,12 @@ The high-level BMM loop is:
 5. Confirm the sidechain tip advances and the enforcer reports the BMM
    inclusion for that sidechain number.
 
+LayerTwoLabs public-signet descendants commit the independently verifiable L1
+successor and BMM evidence directly in each sidechain block. Consensus
+validation therefore does not query Bitcoin RPC or the enforcer. See
+[`doc/drivechain-bmm-proof.md`](doc/drivechain-bmm-proof.md) for the block
+format, activation checkpoint, verification rules, and reindex behavior.
+
 When running a local private signet, mine blocks with the configured signet
 miner or with Bitcoin Core RPC if your setup supports direct generation:
 

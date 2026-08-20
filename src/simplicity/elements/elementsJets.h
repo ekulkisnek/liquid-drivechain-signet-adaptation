@@ -33,6 +33,12 @@ bool simplicity_output_surjection_proof(frameItem* dst, frameItem src, const txE
 bool simplicity_output_range_proof(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_total_fee(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_genesis_block_hash(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_prior_active_exchange_state_root_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_prior_active_forced_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_prior_active_deposit_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_current_bmm_parent_block_hash_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_current_bmm_parent_height_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_current_bmm_parent_mtp_required(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env);

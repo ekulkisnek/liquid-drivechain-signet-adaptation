@@ -10,6 +10,7 @@
 namespace node {
 
 uint256 GetCurrentDrivechainWithdrawalBundleHash();
+void RestoreCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash);
 bool TryBeginDrivechainWithdrawalBundleCreation(uint256& current_bundle_hash, bool& creation_in_progress);
 void CompleteDrivechainWithdrawalBundleCreation(const uint256& bundle_hash);
 void AbortDrivechainWithdrawalBundleCreation();

@@ -153,6 +153,9 @@ BITCOIN_CORE_H = \
   dbwrapper.h \
   deploymentinfo.h \
   deploymentstatus.h \
+  drivechain_bmm.h \
+  ecx_exchange_state.h \
+  drivechain_peg.h \
   dynafed.h \
   external_signer.h \
   flatfile.h \
@@ -357,6 +360,9 @@ libbitcoin_node_a_SOURCES = \
   dynafed.cpp \
   dbwrapper.cpp \
   deploymentstatus.cpp \
+  drivechain_bmm.cpp \
+  ecx_exchange_state.cpp \
+  drivechain_peg.cpp \
   flatfile.cpp \
   httprpc.cpp \
   httpserver.cpp \

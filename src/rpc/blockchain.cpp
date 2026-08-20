@@ -15,11 +15,15 @@
 #include <core_io.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
+#include <drivechain_bmm.h>
+#include <drivechain_peg.h>
+#include <ecx_exchange_state.h>
 #include <fs.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <logging/timer.h>
+#include <mainchainrpc.h>
 #include <net.h>
 #include <net_processing.h>
 #include <node/blockstorage.h>
@@ -43,6 +47,7 @@
 #include <util/moneystr.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/system.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -216,6 +221,11 @@ UniValue blockheaderToJSON(const CBlockIndex* tip, const CBlockIndex* blockindex
     result.pushKV("versionHex", strprintf("%08x", blockindex->nVersion));
     result.pushKV("merkleroot", blockindex->hashMerkleRoot.GetHex());
     result.pushKV("withdrawalbundlehash", blockindex->hashWithdrawalBundle.GetHex());
+    result.pushKV("bmmproofhash", blockindex->hashBmmProof.GetHex());
+    result.pushKV("exchangestateroot", blockindex->hashExchangeStateRoot.GetHex());
+    result.pushKV("forcedinboxroot", blockindex->hashForcedInboxRoot.GetHex());
+    result.pushKV("depositinboxroot", blockindex->hashDepositInboxRoot.GetHex());
+    result.pushKV("ecxparentheight", static_cast<uint64_t>(blockindex->ecxParentHeight));
     result.pushKV("time", (int64_t)blockindex->nTime);
     result.pushKV("mediantime", (int64_t)blockindex->GetMedianTimePast());
     if (!g_signed_blocks) {
@@ -968,6 +978,8 @@ static RPCHelpMan getblockheader()
                             {RPCResult::Type::STR_HEX, "versionHex", "The block version formatted in hexadecimal"},
                             {RPCResult::Type::STR_HEX, "merkleroot", "The merkle root"},
                             {RPCResult::Type::STR_HEX, "withdrawalbundlehash", "The current drivechain withdrawal bundle hash committed by this block header"},
+                            {RPCResult::Type::STR_HEX, "bmmproofhash", "The BMM proof commitment appended by the existing header extension"},
+                            {RPCResult::Type::STR_HEX, "exchangestateroot", "The append-only ECX state singleton root, or zero before activation"},
                             {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM, "nonce", "The nonce"},
@@ -1101,6 +1113,8 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::STR_HEX, "versionHex", "The block version formatted in hexadecimal"},
                     {RPCResult::Type::STR_HEX, "merkleroot", "The merkle root"},
                     {RPCResult::Type::STR_HEX, "withdrawalbundlehash", "The current drivechain withdrawal bundle hash committed by this block header"},
+                    {RPCResult::Type::STR_HEX, "bmmproofhash", "The BMM proof commitment appended by the existing header extension"},
+                    {RPCResult::Type::STR_HEX, "exchangestateroot", "The append-only ECX state singleton root, or zero before activation"},
                     {RPCResult::Type::ARR, "tx", "The transaction ids",
                         {{RPCResult::Type::STR_HEX, "", "The transaction id"}}},
                     {RPCResult::Type::NUM_TIME, "time",       "The block time expressed in " + UNIX_EPOCH_TIME},
@@ -1540,6 +1554,146 @@ static RPCHelpMan gettxout()
     ret.pushKV("coinbase", (bool)coin.fCoinBase);
 
     return ret;
+},
+    };
+}
+
+static RPCHelpMan getecxstateutxoroot()
+{
+    return RPCHelpMan{"getecxstateutxoroot",
+        "Compute the exact consensus ECX header root for an existing unspent output.\n"
+        "This is intended for freezing an activated-regtest genesis singleton.\n",
+        {
+            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The singleton transaction id"},
+            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The singleton output index"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::STR_HEX, "root", "ECX/header-state/v1 root in display hex"},
+            {RPCResult::Type::BOOL, "eligible", "Whether the output has the required explicit asset/value, null nonce and P2TR shape"},
+            {RPCResult::Type::NUM, "height", "UTXO creation height"},
+        }},
+        RPCExamples{
+            HelpExampleCli("getecxstateutxoroot", "\"txid\" 0") +
+            HelpExampleRpc("getecxstateutxoroot", "\"txid\", 0")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    LOCK(cs_main);
+
+    const uint256 txid{ParseHashV(request.params[0], "txid")};
+    const int vout = request.params[1].get_int();
+    if (vout < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "vout must be nonnegative");
+    const COutPoint outpoint{txid, static_cast<uint32_t>(vout)};
+    Coin coin;
+    if (!chainman.ActiveChainstate().CoinsTip().GetCoin(outpoint, coin)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "ECX singleton UTXO not found");
+    }
+
+    const bool eligible = coin.out.nAsset.IsExplicit() &&
+        coin.out.nValue.IsExplicit() && coin.out.nNonce.IsNull() &&
+        coin.out.scriptPubKey.size() == 34 &&
+        coin.out.scriptPubKey[0] == OP_1 && coin.out.scriptPubKey[1] == 0x20;
+    UniValue result(UniValue::VOBJ);
+    result.pushKV(
+        "root",
+        ecx::ComputeStateUtxoRoot(
+            Params().GetConsensus().hashGenesisBlock,
+            outpoint,
+            coin.out).GetHex());
+    result.pushKV("eligible", eligible);
+    result.pushKV("height", coin.nHeight);
+    return result;
+},
+    };
+}
+
+static RPCHelpMan getecxconsensuscontext()
+{
+    return RPCHelpMan{"getecxconsensuscontext",
+        "Return the fail-closed ECX source heads and authenticated BMM clock "
+        "used for mempool and next-block Simplicity execution.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::NUM, "sidechainheight", "Active sidechain height"},
+            {RPCResult::Type::STR_HEX, "sidechainblockhash", "Active sidechain block hash"},
+            {RPCResult::Type::STR_HEX, "exchangestateroot", "Active ECX singleton root"},
+            {RPCResult::Type::OBJ, "forcedinbox", "Consensus forced-action source head", {
+                {RPCResult::Type::STR_HEX, "headroot", "Append-only forced inbox root"},
+                {RPCResult::Type::NUM, "entrycount", "Number of forced actions committed through this head"},
+                {RPCResult::Type::NUM, "nextindex", "Index assigned to the next forced action"},
+            }},
+            {RPCResult::Type::OBJ, "depositinbox", "Consensus confidential-deposit source head", {
+                {RPCResult::Type::STR_HEX, "headroot", "Append-only deposit inbox root"},
+                {RPCResult::Type::NUM, "entrycount", "Number of deposits committed through this head"},
+                {RPCResult::Type::NUM, "nextindex", "Index assigned to the next deposit"},
+            }},
+            {RPCResult::Type::OBJ, "bmm", "Authenticated prior-parent context", {
+                {RPCResult::Type::NUM, "parentheight", "BMM-authenticated parent height"},
+                {RPCResult::Type::NUM, "parentmtp", "BMM-authenticated parent median time past"},
+                {RPCResult::Type::STR_HEX, "parentblockhash", "BMM-authenticated parent block hash"},
+            }},
+            {RPCResult::Type::NUM, "sourceparentheight", "Approval height committed by the active ECX header"},
+        }},
+        RPCExamples{
+            HelpExampleCli("getecxconsensuscontext", "") +
+            HelpExampleRpc("getecxconsensuscontext", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    LOCK(cs_main);
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    if (!tip) throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
+
+    std::string context_error;
+    ecx::ExchangeConsensusSnapshot exchange;
+    if (!ecx::GetExchangeConsensusSnapshot(
+            chainman.ActiveChainstate().CoinsTip(),
+            tip,
+            exchange,
+            context_error)) {
+        throw JSONRPCError(RPC_MISC_ERROR, context_error);
+    }
+    drivechain::BmmL1State bmm_state;
+    if (!drivechain::GetEffectiveBmmState(
+            chainman.ActiveChainstate().CoinsTip(),
+            tip,
+            bmm_state,
+            context_error)) {
+        throw JSONRPCError(RPC_MISC_ERROR, context_error);
+    }
+    drivechain::BmmParentContext bmm;
+    if (!drivechain::GetBmmParentContext(bmm_state, bmm, context_error)) {
+        throw JSONRPCError(RPC_MISC_ERROR, context_error);
+    }
+    if (tip->ecxParentHeight == 0 || tip->ecxParentHeight != bmm.height) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "active ECX header approval height disagrees with BMM chainstate");
+    }
+
+    UniValue forced(UniValue::VOBJ);
+    forced.pushKV("headroot", exchange.forced_inbox_root.GetHex());
+    forced.pushKV("entrycount", exchange.forced_entry_count);
+    forced.pushKV("nextindex", exchange.forced_entry_count);
+    UniValue deposits(UniValue::VOBJ);
+    deposits.pushKV("headroot", exchange.deposit_inbox_root.GetHex());
+    deposits.pushKV("entrycount", exchange.deposit_entry_count);
+    deposits.pushKV("nextindex", exchange.deposit_entry_count);
+    UniValue parent(UniValue::VOBJ);
+    parent.pushKV("parentheight", bmm.height);
+    parent.pushKV("parentmtp", bmm.median_time_past);
+    parent.pushKV("parentblockhash", bmm.block_hash.GetHex());
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("sidechainheight", static_cast<uint64_t>(tip->nHeight));
+    result.pushKV("sidechainblockhash", tip->GetBlockHash().GetHex());
+    result.pushKV("exchangestateroot", exchange.exchange_state_root.GetHex());
+    result.pushKV("forcedinbox", forced);
+    result.pushKV("depositinbox", deposits);
+    result.pushKV("bmm", parent);
+    result.pushKV("sourceparentheight", static_cast<uint64_t>(tip->ecxParentHeight));
+    return result;
 },
     };
 }
@@ -3079,6 +3233,153 @@ UniValue CreateUTXOSnapshot(
 //
 // ELEMENTS:
 
+namespace {
+
+UniValue FetchDrivechainL1PegEvents(int sidechain_id)
+{
+    UniValue response(UniValue::VOBJ);
+    std::string error;
+    if (!GetDrivechainTwoWayPegData(sidechain_id, response, &error)) {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("GetTwoWayPegData failed: %s", error));
+    }
+    return drivechain::NormalizeL1PegEvents(response, sidechain_id);
+}
+
+} // namespace
+
+static RPCHelpMan getdrivechainpegevents()
+{
+    return RPCHelpMan{"getdrivechainpegevents",
+                "Returns versioned BIP300 deposit, withdrawal, bundle, and acknowledgement events.\n"
+                "Sidechain events are reconstructed from active-chain consensus data and therefore follow reorgs.\n"
+                "Set include_l1 to query and normalize CUSF GetTwoWayPegData from the configured enforcer.\n",
+                {
+                    {"start_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"tip - 999"}, "First sidechain height to scan."},
+                    {"count", RPCArg::Type::NUM, RPCArg::Default{1000}, "Number of sidechain blocks to scan (1-10000)."},
+                    {"include_l1", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include normalized L1 CUSF lifecycle events."},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "Versioned drivechain event response.",
+                    {
+                        {RPCResult::Type::NUM, "schema_version", "Event contract version."},
+                        {RPCResult::Type::NUM, "sidechain_id", "BIP300 sidechain slot."},
+                        {RPCResult::Type::OBJ, "sidechain_tip", "Active sidechain tip.",
+                            {
+                                {RPCResult::Type::STR_HEX, "hash", "Sidechain tip hash."},
+                                {RPCResult::Type::NUM, "height", "Sidechain tip height."},
+                            }},
+                        {RPCResult::Type::OBJ, "range", "Scanned sidechain range.",
+                            {
+                                {RPCResult::Type::NUM, "start_height", "First scanned height."},
+                                {RPCResult::Type::NUM, "end_height", "Last scanned height."},
+                            }},
+                        {RPCResult::Type::ARR, "events", "Normalized events in deterministic chain order.",
+                            {{RPCResult::Type::OBJ, "", "Deposit, withdrawal, bundle commitment, or L1 lifecycle event.",
+                                {
+                                    {RPCResult::Type::STR, "event_id", "Stable event identity."},
+                                    {RPCResult::Type::STR, "source", "Event source: sidechain or l1."},
+                                    {RPCResult::Type::STR, "kind", "Event kind."},
+                                    {RPCResult::Type::STR, "status", "Lifecycle status."},
+                                    {RPCResult::Type::NUM, "sidechain_id", /*optional=*/true, "BIP300 sidechain slot."},
+                                    {RPCResult::Type::STR_HEX, "sidechain_txid", /*optional=*/true, "Sidechain transaction id."},
+                                    {RPCResult::Type::NUM, "vin", /*optional=*/true, "Sidechain transaction input index."},
+                                    {RPCResult::Type::NUM, "vout", /*optional=*/true, "Sidechain transaction output index."},
+                                    {RPCResult::Type::STR_HEX, "mainchain_txid", /*optional=*/true, "Mainchain transaction id."},
+                                    {RPCResult::Type::NUM, "mainchain_vout", /*optional=*/true, "Mainchain output index."},
+                                    {RPCResult::Type::STR_HEX, "m6id", /*optional=*/true, "Withdrawal bundle id."},
+                                    {RPCResult::Type::NUM, "value_sats", /*optional=*/true, "Explicit value in satoshis."},
+                                    {RPCResult::Type::STR_HEX, "asset", /*optional=*/true, "Elements asset id."},
+                                    {RPCResult::Type::STR_HEX, "claim_script", /*optional=*/true, "Drivechain deposit claim script."},
+                                    {RPCResult::Type::STR_HEX, "address_hex", /*optional=*/true, "Enforcer deposit address bytes."},
+                                    {RPCResult::Type::NUM, "sequence_number", /*optional=*/true, "Enforcer sequence number."},
+                                    {RPCResult::Type::STR, "acknowledgement", /*optional=*/true, "Bundle acknowledgement state."},
+                                    {RPCResult::Type::STR_HEX, "mainchain_transaction", /*optional=*/true, "Final mainchain transaction."},
+                                    {RPCResult::Type::STR_HEX, "mainchain_genesis_hash", /*optional=*/true, "Parent-chain genesis hash."},
+                                    {RPCResult::Type::STR_HEX, "mainchain_script", /*optional=*/true, "Parent-chain destination script."},
+                                    {RPCResult::Type::OBJ, "sidechain", /*optional=*/true, "Sidechain block location.",
+                                        {
+                                            {RPCResult::Type::STR_HEX, "block_hash", "Sidechain block hash."},
+                                            {RPCResult::Type::NUM, "height", "Sidechain block height."},
+                                        }},
+                                    {RPCResult::Type::OBJ, "l1", /*optional=*/true, "Mainchain block location.",
+                                        {
+                                            {RPCResult::Type::STR_HEX, "block_hash", "Mainchain block hash."},
+                                            {RPCResult::Type::NUM, "height", "Mainchain block height."},
+                                            {RPCResult::Type::NUM, "timestamp", /*optional=*/true, "Mainchain block timestamp."},
+                                        }},
+                                }}}},
+                    }},
+                RPCExamples{
+                    HelpExampleCli("getdrivechainpegevents", "0 1000 true")
+                    + HelpExampleRpc("getdrivechainpegevents", "0, 1000, true")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const int sidechain_id = gArgs.GetIntArg("-drivechainbmmslot", 24);
+    if (sidechain_id < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "-drivechainbmmslot must be non-negative");
+
+    int tip_height;
+    uint256 tip_hash;
+    std::vector<const CBlockIndex*> blocks;
+    int start_height;
+    int end_height;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        if (tip == nullptr) throw JSONRPCError(RPC_MISC_ERROR, "Sidechain tip is unavailable");
+        tip_height = tip->nHeight;
+        tip_hash = tip->GetBlockHash();
+
+        start_height = request.params[0].isNull() ? std::max(0, tip_height - 999) : request.params[0].get_int();
+        const int count = request.params[1].isNull() ? 1000 : request.params[1].get_int();
+        if (start_height < 0 || start_height > tip_height) throw JSONRPCError(RPC_INVALID_PARAMETER, "start_height is outside the active sidechain");
+        if (count < 1 || count > 10000) throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 10000");
+        end_height = std::min(tip_height, start_height + count - 1);
+        blocks.reserve(end_height - start_height + 1);
+        for (int height = start_height; height <= end_height; ++height) {
+            blocks.push_back(chainman.ActiveChain()[height]);
+        }
+    }
+
+    UniValue events(UniValue::VARR);
+    for (const CBlockIndex* block_index : blocks) {
+        CBlock block;
+        if (!ReadBlockFromDisk(block, block_index, Params().GetConsensus())) {
+            throw JSONRPCError(RPC_MISC_ERROR, strprintf("Block not available at height %d", block_index->nHeight));
+        }
+        const uint256 previous_bundle_hash = block_index->pprev == nullptr ? uint256::ZERO : block_index->pprev->hashWithdrawalBundle;
+        const UniValue block_events = drivechain::ExtractSidechainPegEvents(block, block_index->nHeight, previous_bundle_hash);
+        for (const UniValue& event : block_events.getValues()) {
+            events.push_back(event);
+        }
+    }
+
+    const bool include_l1 = request.params[2].isNull() ? false : request.params[2].get_bool();
+    if (include_l1) {
+        const UniValue l1_events = FetchDrivechainL1PegEvents(sidechain_id);
+        for (const UniValue& event : l1_events.getValues()) events.push_back(event);
+    }
+
+    UniValue tip(UniValue::VOBJ);
+    tip.pushKV("hash", tip_hash.GetHex());
+    tip.pushKV("height", tip_height);
+    UniValue range(UniValue::VOBJ);
+    range.pushKV("start_height", start_height);
+    range.pushKV("end_height", end_height);
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("schema_version", drivechain::PEG_EVENT_SCHEMA_VERSION);
+    result.pushKV("sidechain_id", sidechain_id);
+    result.pushKV("sidechain_tip", tip);
+    result.pushKV("range", range);
+    result.pushKV("events", events);
+    return result;
+},
+    };
+}
+
 static RPCHelpMan getsidechaininfo()
 {
     return RPCHelpMan{"getsidechaininfo",
@@ -3190,6 +3491,8 @@ static const CRPCCommand commands[] =
     { "blockchain",         &getmempoolinfo,                     },
     { "blockchain",         &getrawmempool,                      },
     { "blockchain",         &gettxout,                           },
+    { "blockchain",         &getecxstateutxoroot,                },
+    { "blockchain",         &getecxconsensuscontext,             },
     { "blockchain",         &gettxoutsetinfo,                    },
     { "blockchain",         &pruneblockchain,                    },
     { "blockchain",         &savemempool,                        },
@@ -3200,6 +3503,7 @@ static const CRPCCommand commands[] =
     { "blockchain",         &getblockfilter,                     },
 
     // ELEMENTS:
+    { "blockchain",         &getdrivechainpegevents,            },
     { "blockchain",         &getsidechaininfo,                   },
 
     /* Not shown in help */

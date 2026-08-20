@@ -16,6 +16,13 @@
 #include <univalue.h>
 
 class CBlock;
+class CTransaction;
+struct DrivechainDepositEvidence;
+namespace drivechain {
+struct AuthenticatedDeposit;
+struct BmmL1State;
+struct BmmProof;
+}
 
 static const bool DEFAULT_NAMED=false;
 static const char DEFAULT_RPCCONNECT[] = "127.0.0.1";
@@ -36,6 +43,25 @@ public:
 };
 
 UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
+bool GetDrivechainTwoWayPegData(int sidechain_slot, UniValue& response, std::string* error = nullptr);
+bool VerifyDrivechainDeposit(
+    const CTransaction& tx,
+    size_t input_index,
+    drivechain::AuthenticatedDeposit* authenticated = nullptr,
+    std::string* error = nullptr);
+/** Build committed v2 SPV/CTIP evidence outside consensus validation. */
+bool BuildDrivechainDepositEvidence(
+    const drivechain::AuthenticatedDeposit& authenticated,
+    DrivechainDepositEvidence& evidence,
+    std::string* error = nullptr);
+/** Build and self-verify deterministic successor/BMM proof outside consensus. */
+bool BuildDrivechainBmmProof(
+    const drivechain::BmmL1State& previous_state,
+    int64_t parent_height,
+    const uint256& parent_hash,
+    const uint256& critical_hash,
+    drivechain::BmmProof& proof,
+    std::string* error = nullptr);
 
 // Verify if the block with given hash has at least the specified minimum number
 // of confirmations.
@@ -44,7 +70,5 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
 bool IsConfirmedBitcoinBlock(const uint256& hash, const int nMinConfirmationDepth, const int nbTxs);
 
 bool ExtractDrivechainParentHashFromBlock(const CBlock& block, uint256& parent_hash, std::string* error = nullptr);
-bool IsDrivechainBmmCommitmentMined(const CBlock& block, int sidechain_slot, std::string* error = nullptr);
-bool IsDrivechainBmmCommitmentMined(const uint256& sidechain_block_hash, const uint256& parent_hash, int sidechain_slot, std::string* error = nullptr);
 
 #endif // BITCOIN_MAINCHAINRPC_H

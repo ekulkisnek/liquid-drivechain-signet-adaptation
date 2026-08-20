@@ -3231,7 +3231,47 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
 
     assert(txdata->m_simplicity_tx_data);
     assert(simplicityTapEnv);
-    if (!simplicity_elements_execSimplicity(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
+    ecx_prior_active_root_env ecx_root{};
+    if (txdata->m_prior_active_exchange_state_root.has_value()) {
+        ecx_root.present = 1;
+        std::copy(
+            txdata->m_prior_active_exchange_state_root->begin(),
+            txdata->m_prior_active_exchange_state_root->end(),
+            ecx_root.root_wire);
+    }
+    if (txdata->m_prior_active_forced_inbox_root.has_value()) {
+        ecx_root.forced_inbox_present = 1;
+        std::copy(
+            txdata->m_prior_active_forced_inbox_root->begin(),
+            txdata->m_prior_active_forced_inbox_root->end(),
+            ecx_root.forced_inbox_root_wire);
+    }
+    if (txdata->m_prior_active_deposit_inbox_root.has_value()) {
+        ecx_root.deposit_inbox_present = 1;
+        std::copy(
+            txdata->m_prior_active_deposit_inbox_root->begin(),
+            txdata->m_prior_active_deposit_inbox_root->end(),
+            ecx_root.deposit_inbox_root_wire);
+    }
+    const bool bmm_hash_present{
+        txdata->m_current_bmm_parent_block_hash.has_value()};
+    const bool bmm_height_present{
+        txdata->m_current_bmm_parent_height.has_value()};
+    const bool bmm_mtp_present{txdata->m_current_bmm_parent_mtp.has_value()};
+    if (bmm_hash_present != bmm_height_present ||
+        bmm_hash_present != bmm_mtp_present) {
+        ecx_root.current_bmm_parent_present = 2;
+    } else if (bmm_hash_present) {
+        ecx_root.current_bmm_parent_present = 1;
+        std::copy(
+            txdata->m_current_bmm_parent_block_hash->begin(),
+            txdata->m_current_bmm_parent_block_hash->end(),
+            ecx_root.current_bmm_parent_block_hash_wire);
+        ecx_root.current_bmm_parent_height =
+            *txdata->m_current_bmm_parent_height;
+        ecx_root.current_bmm_parent_mtp = *txdata->m_current_bmm_parent_mtp;
+    }
+    if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &ecx_root, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
         assert(!"simplicity_elements_execSimplicity internal error");
     }
     simplicity_elements_freeTapEnv(simplicityTapEnv);

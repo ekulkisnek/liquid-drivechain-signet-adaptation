@@ -110,6 +110,24 @@ typedef struct rawElementsTapEnv {
   unsigned char pathLen;
 } rawElementsTapEnv;
 
+/*
+ * Consensus environment supplied by Elements for ECX-aware Simplicity
+ * execution. This native structure is never serialized. Presence flags must
+ * be exactly zero or one; absent roots and parent clock values must be zero.
+ */
+typedef struct ecx_prior_active_root_env {
+  uint8_t present;
+  uint8_t root_wire[32];
+  uint8_t forced_inbox_present;
+  uint8_t forced_inbox_root_wire[32];
+  uint8_t deposit_inbox_present;
+  uint8_t deposit_inbox_root_wire[32];
+  uint8_t current_bmm_parent_present;
+  uint8_t current_bmm_parent_block_hash_wire[32];
+  uint64_t current_bmm_parent_height;
+  uint64_t current_bmm_parent_mtp;
+} ecx_prior_active_root_env;
+
 /* A forward declaration for the structure containing a copy (and digest) of the rawElementsTapEnv data */
 typedef struct elementsTapEnv elementsTapEnv;
 

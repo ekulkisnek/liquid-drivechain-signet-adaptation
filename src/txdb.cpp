@@ -360,6 +360,11 @@ const CBlockIndex *CBlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTr
     pindexNew->nVersion       = pindexTrimmed->nVersion;
     pindexNew->hashMerkleRoot = pindexTrimmed->hashMerkleRoot;
     pindexNew->hashWithdrawalBundle = pindexTrimmed->hashWithdrawalBundle;
+    pindexNew->hashBmmProof   = pindexTrimmed->hashBmmProof;
+    pindexNew->hashExchangeStateRoot = pindexTrimmed->hashExchangeStateRoot;
+    pindexNew->hashForcedInboxRoot = pindexTrimmed->hashForcedInboxRoot;
+    pindexNew->hashDepositInboxRoot = pindexTrimmed->hashDepositInboxRoot;
+    pindexNew->ecxParentHeight = pindexTrimmed->ecxParentHeight;
     pindexNew->nTime          = pindexTrimmed->nTime;
     pindexNew->nBits          = pindexTrimmed->nBits;
     pindexNew->nNonce         = pindexTrimmed->nNonce;
@@ -402,6 +407,11 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->nVersion       = diskindex.nVersion;
                 pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
                 pindexNew->hashWithdrawalBundle = diskindex.hashWithdrawalBundle;
+                pindexNew->hashBmmProof   = diskindex.hashBmmProof;
+                pindexNew->hashExchangeStateRoot = diskindex.hashExchangeStateRoot;
+                pindexNew->hashForcedInboxRoot = diskindex.hashForcedInboxRoot;
+                pindexNew->hashDepositInboxRoot = diskindex.hashDepositInboxRoot;
+                pindexNew->ecxParentHeight = diskindex.ecxParentHeight;
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;
