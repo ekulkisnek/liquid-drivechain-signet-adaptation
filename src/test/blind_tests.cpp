@@ -368,4 +368,35 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(txtemp), nullptr, false));
     }
 }
+
+BOOST_AUTO_TEST_CASE(spendable_zero_value_blinding_fails_without_abort)
+{
+    CKey key;
+    unsigned char secret[32] = {1, 2, 3};
+    key.Set(&secret[0], &secret[32], true);
+
+    const CAsset asset(GetRandHash());
+    CMutableTransaction tx;
+    tx.vin.push_back(CTxIn(COutPoint(ArithToUint256(1), 0)));
+    // Confidential spendable outputs have a minimum range-proof value of one.
+    // A zero-valued spendable output must be rejected, not abort the RPC worker.
+    tx.vout.push_back(CTxOut(asset, 0, CScript() << OP_TRUE));
+    tx.vout.push_back(CTxOut(asset, 9, CScript() << OP_TRUE));
+    tx.vout.push_back(CTxOut(asset, 1, CScript()));
+
+    std::vector<uint256> input_value_blinds{uint256()};
+    std::vector<uint256> input_asset_blinds{uint256()};
+    std::vector<CAsset> input_assets{asset};
+    std::vector<CAmount> input_amounts{10};
+    std::vector<uint256> output_value_blinds;
+    std::vector<uint256> output_asset_blinds;
+    std::vector<CPubKey> output_pubkeys{key.GetPubKey(), key.GetPubKey(), CPubKey()};
+    std::vector<CKey> no_issuance_keys;
+
+    BOOST_CHECK_EQUAL(
+        BlindTransaction(input_value_blinds, input_asset_blinds, input_assets,
+                         input_amounts, output_value_blinds, output_asset_blinds,
+                         output_pubkeys, no_issuance_keys, no_issuance_keys, tx),
+        -1);
+}
 BOOST_AUTO_TEST_SUITE_END()

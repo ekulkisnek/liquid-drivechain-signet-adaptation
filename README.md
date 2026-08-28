@@ -10,156 +10,187 @@ a collection of feature experiments and extensions to the Bitcoin protocol.
 This platform enables anyone to build their own businesses or networks
 pegged to Bitcoin as a sidechain or run as a standalone blockchain with arbitrary asset tokens.
 
-Network
--------
+Modes
+-----
 
-This fork's production daemon runs one built-in network: `-chain=elements`,
-which is also the default. Inherited Liquid, Bitcoin, regtest, and custom-chain
-parameter classes remain only for unit-test/library compatibility; production
-startup rejects them. The pre-launch name `-chain=usdd` is not an alias.
+Elements supports a few different pre-set chains for syncing. Note though some are intended for QA and debugging only:
+
+* Liquid mode: `elementsd -chain=liquidv1` (syncs with Liquid network)
+* Bitcoin mainnet mode: `elementsd -chain=main` (not intended to be run for commerce)
+* Bitcoin testnet mode: `elementsd -chain=testnet3`
+* Bitcoin regtest mode: `elementsd -chain=regtest`
+* Elements custom chains: Any other `-chain=` argument. It has regtest-like default parameters that can be over-ridden by the user by a rich set of start-up options.
 
 Drivechain / BIP 300/301 adaptation
 ------------------------------------
 
-This fork contains one dedicated built-in Elements Drivechain network:
+This tree also contains an adaptation (`liquid-drivechain-signet-adaptation` branch + `drivechain-liquid-sidechain/` directory) that lets you run Liquid/Elements as a **native BIP 300/301 drivechain sidechain** (with Confidential Transactions, assets, Simplicity, etc.) on a patched Bitcoin signet, using only CUSF mechanisms (no federation).
+
+See `drivechain-liquid-sidechain/README.md` (especially the section "Setting Up the Liquid Node on a New Signet + New Sidechain ID (BIP 300/301 + Blind Merged Mining)") for:
+- Bootstrapping a fresh L1 signet + enforcer.
+- Choosing and activating an unused sidechain slot (0-255).
+- Running an isolated `elementsd` for that slot.
+- Full Blind Merged Mining (BIP 301 BMM) setup, both manual and automated (participant scripts + adapter).
+- Deposits, withdrawals, and end-to-end flows.
+
+The source lineage can be adapted to another signet or sidechain number, but
+this production branch is consensus-bound to the LayerTwoLabs slot-24
+deployment. Changing one runtime setting does not create a compatible network.
+
+The production slot-24 deposit and withdrawal procedure, including the
+required authenticated transports and crash-recovery workflow, is documented
+in [`doc/drivechain-peg-operations.md`](doc/drivechain-peg-operations.md).
+
+This branch adapts the Liquid/Elements wallet peg-out path to use a BIP300
+drivechain withdrawal bundle instead of the legacy federated/PAK
+`sendtomainchain` path. It is intended to run as an Elements sidechain attached
+to a Bitcoin signet mainchain that is coordinated by a BIP300/301 enforcer and
+a BIP301 blind merge mining (BMM) miner.
+
+### Connect to a new Bitcoin signet
+
+Start the Bitcoin mainchain node first. The mainchain node must be on the same
+signet as the enforcer and miner, and the miner must be able to sign blocks for
+that signet challenge.
+
+A minimal private signet `bitcoin.conf` looks like:
+
+```ini
+signet=1
+server=1
+txindex=1
+rpcuser=<rpc-user>
+rpcpassword=<rpc-password>
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+signetchallenge=<hex-script>
+```
+
+Use a fresh Bitcoin data directory for each new signet. If this is a private
+signet, keep the block-signing key for `signetchallenge` available to the
+mainchain miner; otherwise `generatetoaddress`/the signet miner will not be
+able to create valid blocks.
+
+Start `elementsd` with peg-in validation pointed at that signet node:
 
 ```sh
-src/elementsd -chain=elements -server=1 \
+src/elementsd \
+  -chain=<elements-chain-name> \
+  -daemon \
+  -validatepegin=1 \
+  -mainchainrpchost=127.0.0.1 \
+  -mainchainrpcport=38332 \
+  -mainchainrpcuser=<rpc-user> \
+  -mainchainrpcpassword=<rpc-password>
+```
+
+Cookie auth can be used instead of `mainchainrpcuser`/`mainchainrpcpassword`:
+
+```sh
+src/elementsd \
+  -chain=<elements-chain-name> \
+  -daemon \
+  -validatepegin=1 \
   -mainchainrpchost=127.0.0.1 \
   -mainchainrpcport=38332 \
   -mainchainrpccookiefile=/path/to/bitcoin/signet/.cookie
 ```
 
-`elements` is the sole production network identity and uses its own versioned
-`elements-v1/`
-data directory, genesis block,
-message magic, ports, address prefixes, and pegged asset. It is permanently
-assigned BIP300/301 slot 24. Taproot and Simplicity are active from genesis.
-The slot and consensus identities cannot be changed with startup arguments or
-environment variables. There is no `-chain=usdd` alias and custom chains do not
-inherit any Elements Drivechain identity.
+For a production-style deployment, use explicit config files and separate data
+directories for the Bitcoin signet node, the enforcer, and every Elements
+sidechain node.
 
-Its P2P magic is the first four bytes (`2ac59d38`) of raw
-SHA256d(`ecash-elements-drivechain-p2p-v2`), and its child genesis is
-`d758e40eace8dc9c95a9dd44f7be84c241a4f8c5a3bd72812f2346a5801e3e9e`.
-The canonical child coinbase parent tag is `ELMTP`. Its unique WIF prefix is
-`37`, extended-public prefix is `18717df5`, and extended-secret prefix is
-`b263bd77`; each is derived from the documented ASCII domain frozen in
-`elements_drivechain_identity.h`.
-Pre-launch data directories are incompatible and may be deleted or moved.
+### Confirm the sidechain identity
 
-Slot 24 is already occupied on the parent Signet by an older generic Elements
-proposal. That proposal is historical parent state only, never an alternate
-child-chain identity. The Elements network remains fail-closed until the exact
-Elements Drivechain proposal below replaces it for slot 24:
+Every BIP300 sidechain on the same signet has a unique sidechain number. Before
+launching this node:
 
-```text
-proposal description (D):
-0008456c656d656e7473456c656d656e7473204472697665636861696e2076313b206e617469766520555344443b207265706c61792076323b2053696d706c6963697479206163746976653b20736c6f74203234a8ec2ac4113afc9f4f964fc27439fd0cab5bb556b050a98e62e0a027ac2f5066f49d0cbac06d5a79012d6dc343d96b5181a1d00d
+1. Check the enforcer/signet state and list the sidechain numbers already
+   registered by other sidechains.
+2. Confirm that slot 24 is the activated LayerTwoLabs Elements sidechain with
+   the expected title and hash identities.
+3. Confirm the BIP300/301 enforcer and BMM producer are both using slot 24.
+4. Start Elements with both drivechain slot settings equal to 24.
 
-proposal hash:
-b27b2b233f9db48be36046b72cac4876efd24a3055bbb0c25392f52e55042f98
-```
+This production build is consensus-bound to sidechain slot `24`. Configure both
+`drivechainbmmslot=24` and `drivechainsidechainslot=24`; the enforcer, BMM
+producer, wallet tooling, and clients must use that same slot. A deployment in
+another slot requires a separately coordinated consensus configuration, not an
+environment-variable override.
 
-Activating it replaces the older slot-24 proposal. Before activation, no
-Elements child block or native BIP300 deposit is valid. If slot 24 is later replaced again,
-this immutable V1 halts rather than following a different proposal.
+### Configure BIP301 blind merge mining
 
-The parent must be a fully validating LayerTwo Labs Signet node with `txindex=1`
-on the same host. Native-drivechain consensus RPC accepts only IPv4 `127/8` or
-IPv6 `::1`. Static `mainchainrpcuser`/`mainchainrpcpassword` credentials are
-rejected. The node accepts only Bitcoin Core's rotating `__cookie__` credential,
-and on POSIX the cookie must be a non-symlink file owned by the Elements process
-user with no group or other permissions. This local HTTP connection is never
-permitted over a LAN, where it could expose credentials or substitute the
-parent-chain view.
-The Elements node reads raw parent headers, blocks, and transactions from that
-node and independently checks their hashes, proof of work, transaction Merkle
-roots, frozen Signet challenge, active-chain positions, canonical slot-24 M7
-commitment, and the relevant BIP300 treasury transition. The parent node remains
-responsible for full Bitcoin and BIP300 consensus, cumulative-work fork choice,
-and script validation; do not point consensus RPC at a third-party service.
+BIP301 BMM is coordinated by the mainchain/enforcer/miner stack, not by
+ordinary proof-of-work inside `elementsd`. The required pieces are:
 
-Parent proposal and CTIP state is derived by authenticating and applying every
-parent block from the pinned Signet genesis. Heights 257, 263, and 5580 are
-milestone assertions over the replayed state, not assignments or trusted
-snapshots. Replay preserves all pending proposals, applies the enforcer's
-unused-slot and used-slot threshold pairs, and ignores OP_DRIVECHAIN-looking
-outputs until slot 24 is active. Only canonical CTIP increases at or after the
-exact Elements proposal activation block can enter the mintable-deposit index.
+1. A Bitcoin signet node using the intended `signetchallenge`.
+2. A BIP300/301 enforcer connected to that Bitcoin node.
+3. The selected sidechain number proposed and activated in the enforcer.
+4. A miner that can create signet blocks and include BIP301 BMM commitments for
+   the selected sidechain number.
+5. A funded mainchain wallet for BMM critical-data transactions and withdrawal
+   bundle fees.
 
-The authenticated replay tip, every canonical M5 deposit, and every
-post-checkpoint M7 edge are stored in `elements-v1/parent-replay/` using a
-fixed 4 MiB LevelDB cache. Each parent block advances the records and replay
-tip in one synchronous atomic batch, so ordinary restarts resume from the last
-durable authenticated tip instead of replaying from genesis. The database is
-bound to its schema, child genesis, parent genesis, slot, proposal, manifest,
-Signet rules, checkpoint, CTIP, and replay thresholds. It is only a derived
-index, never a trust root: malformed records, identity changes, or a parent
-reorganization unpublish the replay generation and rebuild the index from
-authenticated parent genesis. Consensus history is not expired; the rebuild
-is a safe liveness cost rather than a fallback to a trusted checkpoint.
+The high-level BMM loop is:
 
-The BIP300/301 enforcer and `grpcurl` are used only to submit proposal, BMM, and
-withdrawal-bundle requests. Their responses never authorize a deposit,
-sidechain block, or withdrawal. A user can replace those liveness tools without
-changing consensus or custody. All enforcer calls require CA-verified mutual
-TLS; there is no plaintext or server-auth-only fallback. The default mTLS
-endpoint is `127.0.0.1:55051`, normally backed by a local proxy to an enforcer
-bound only to `127.0.0.1:50051`. See
-[`doc/drivechain-rpc-security.md`](doc/drivechain-rpc-security.md) for certificate,
-proxy, permission, health-check, and shutdown instructions.
-The automatic miner requires a funded enforcer wallet and submits
-`max(-drivechainbmmbid, candidate fees)` satoshis (default minimum: 1,000 sats)
-for each BMM request. This bid is operator-funded liveness policy, not a
-sidechain fee or consensus proof. The managed `grpcurl` child has a 10-second
-deadline and 64 KiB combined-output limit and is terminated during shutdown.
+1. Build or receive the next Elements sidechain block candidate.
+2. Ask the BIP300/301 enforcer/miner to commit that candidate's critical data
+   for `ELEMENTS_DRIVECHAIN_SIDECHAIN_ID`.
+3. Mine/sign a Bitcoin signet block that includes the BIP301 BMM commitment.
+4. Let the enforcer and sidechain nodes sync the new mainchain block.
+5. Confirm the sidechain tip advances and the enforcer reports the BMM
+   inclusion for that sidechain number.
 
-Every non-genesis Elements block commits to a parent block and is accepted only
-after the exact active successor contains one canonical M7 for that block hash.
-The authenticated parent pair is persisted with the block. Parent reorgs
-disconnect affected sidechain blocks without permanently marking them invalid;
-RPC unavailability stalls safely.
+LayerTwoLabs public-signet descendants commit the independently verifiable L1
+successor and BMM evidence directly in each sidechain block. Consensus
+validation therefore does not query Bitcoin RPC or the enforcer. See
+[`doc/drivechain-bmm-proof.md`](doc/drivechain-bmm-proof.md) for the block
+format, activation checkpoint, verification rules, and reindex behavior.
 
-Native deposits credit the exact address and full amount committed by the
-confirmed BIP300 deposit. A relayer cannot redirect the deposit or subtract a
-fee. The canonical one-input/one-output import may relay at zero fee; a relayer
-can optionally sponsor an ordinary signed input instead.
-These M5 imports mint the BTC-denominated `pegged_asset` used as the base fee
-asset; they never mint the future USDT-backed USDD issued asset.
-
-Native BIP300 withdrawals use a two-step wallet flow. `sendtomainchain` creates
-an explicit pegged-asset sidechain burn bound to the exact Bitcoin payout script,
-amount, and mainchain fee. After that burn confirms, `submitdrivechainwithdrawal`
-uses its actual sidechain block height to construct and submit the canonical
-zero-input blinded M6 over enforcer mTLS. The authenticated parent replay then
-applies M3 proposals and all four M4 encodings in parent coinbase order. A CTIP
-decrease is accepted only when its exact reconstructed M6id is still pending and
-has crossed the configured ACK threshold; malformed, unproposed, expired,
-under-voted, or over-paying M6 transactions halt validation.
-
-Example (amounts are BTC-denominated):
+When running a local private signet, mine blocks with the configured signet
+miner or with Bitcoin Core RPC if your setup supports direct generation:
 
 ```sh
-TXID=$(src/elements-cli -chain=elements -rpcwallet=withdrawals \
-  sendtomainchain tb1q... 0.02000000 false false 0.00001000)
-
-# Wait until gettransaction reports at least one active-sidechain confirmation.
-src/elements-cli -chain=elements -rpcwallet=withdrawals \
-  submitdrivechainwithdrawal "$TXID"
+ADDR=$(bitcoin-cli -signet getnewaddress)
+bitcoin-cli -signet generatetoaddress 1 "$ADDR"
 ```
 
-All slot-24 validators must upgrade and rebuild the parent replay schema before
-an M6 can be accepted. Older versions intentionally reject every CTIP decrease,
-so enabling withdrawals without a coordinated signet consensus upgrade will
-split old and new validators. The reserved USDD SP1 annex still fails closed
-because the proof-verifier jet and USDD mint/burn controller are not implemented.
-This remains experimental signet software, not a production bridge for real
-funds.
+For private signets that require explicit signing, use the miner command/script
+that has access to the signing key matching `signetchallenge`.
 
-The historical material under `drivechain-liquid-sidechain/` describes an
-older mutable slot-5 prototype. It is not the consensus or deployment guide for
-`-chain=elements` and must not be treated as production-ready documentation.
+### Configure drivechain peg RPCs
+
+Parent JSON-RPC is restricted to loopback because its credentials travel via
+HTTP Basic authentication. Enforcer RPC uses mutual TLS, normally through a
+local TLS proxy at `127.0.0.1:55051`. See
+[`doc/drivechain-peg-operations.md`](doc/drivechain-peg-operations.md) for the
+required certificate permissions and complete configuration.
+
+`sendtomainchain` now creates only the sidechain withdrawal transaction. After
+that transaction confirms in an active ECX sidechain block, call
+`submitdrivechainwithdrawal <txid>` to build and submit the confirmation-bound
+M6. Use `drivechainrecoverwithdrawal` to inspect or safely retry its exact
+durable bytes after a restart.
+
+### Validation checklist
+
+Before considering a new signet deployment ready:
+
+* `bitcoin-cli -signet getblockchaininfo` reports the expected signet and
+  blocks are being signed/mined.
+* The enforcer is synced to the same Bitcoin signet tip.
+* The selected sidechain number is proposed and activated in the enforcer.
+* The BMM miner is producing BIP301 commitments for that sidechain number.
+* `elementsd` is connected to the same mainchain RPC and has a fresh data
+  directory.
+* `importdrivechaindeposit` authenticates the exact L1 txid/vout and the
+  resulting sidechain UTXO remains spendable after restart.
+* `sendtomainchain` confirms on the sidechain before
+  `submitdrivechainwithdrawal` submits its M6.
+* After enough BIP300 acknowledgement/confirmation blocks, the mainchain
+  enforcer reports that exact M6 as succeeded and
+  `drivechainrecoverwithdrawal` marks it settled, releases the active bundle,
+  and retains a restart-safe terminal record until the next withdrawal.
 
 Confidential Assets
 ----------------

@@ -4,9 +4,11 @@
 
 #include <consensus/amount.h>
 #include <policy/fees.h>
+#include <policy/policy.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <limits>
 #include <set>
 
 BOOST_AUTO_TEST_SUITE(policy_fee_tests)
@@ -29,6 +31,28 @@ BOOST_AUTO_TEST_CASE(FeeRounder)
 
     // check that MAX_MONEY rounds to 9170997
     BOOST_CHECK_EQUAL(fee_rounder.round(MAX_MONEY), 9170997);
+}
+
+BOOST_AUTO_TEST_CASE(bmm_work_fee_quote)
+{
+    BmmWorkFeeQuote quote;
+    BOOST_REQUIRE(CalculateBmmWorkFeeQuote(20'000, 1'500'000, 1'000, 500, quote));
+    BOOST_CHECK_EQUAL(quote.verification_fee, 1'500);
+    BOOST_CHECK_EQUAL(quote.producer_reserve, 500);
+    BOOST_CHECK_EQUAL(quote.bid, 18'000);
+
+    BOOST_REQUIRE(CalculateBmmWorkFeeQuote(10, 1, 1, 0, quote));
+    BOOST_CHECK_EQUAL(quote.verification_fee, 1);
+    BOOST_CHECK_EQUAL(quote.bid, 9);
+
+    BOOST_CHECK(!CalculateBmmWorkFeeQuote(1'000, 2'000'000, 1'000, 0, quote));
+    BOOST_CHECK(!CalculateBmmWorkFeeQuote(-1, 0, 0, 0, quote));
+    BOOST_CHECK(!CalculateBmmWorkFeeQuote(
+        MAX_MONEY,
+        std::numeric_limits<uint64_t>::max(),
+        MAX_MONEY,
+        0,
+        quote));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

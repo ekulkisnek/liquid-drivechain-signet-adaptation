@@ -6,22 +6,14 @@
 #ifndef BITCOIN_INIT_H
 #define BITCOIN_INIT_H
 
-#include <consensus/amount.h>
-
 #include <any>
-#include <chrono>
-#include <cstddef>
-#include <functional>
 #include <memory>
 #include <string>
-#include <vector>
 
 //! Default value for -daemon option
 static constexpr bool DEFAULT_DAEMON = false;
 //! Default value for -daemonwait option
 static constexpr bool DEFAULT_DAEMONWAIT = false;
-//! Default liveness-only BIP301 bid submitted to the local enforcer wallet.
-static constexpr CAmount DEFAULT_DRIVECHAIN_BMM_BID{1000};
 
 class ArgsManager;
 namespace interfaces {
@@ -39,71 +31,6 @@ void InitLogging(const ArgsManager& args);
 //!Parameter interaction: change current parameters depending on various rules
 void InitParameterInteraction(ArgsManager& args);
 
-/** Native drivechains forbid DNS on synchronous consensus RPC paths. */
-bool IsMainchainRPCHostAllowed(const std::string& host, bool native_drivechain);
-
-/** Native drivechains expose their authenticated JSON-RPC server only on loopback. */
-bool ValidateNativeDrivechainRpcServerConfig(const ArgsManager& args,
-                                             std::string* error = nullptr);
-
-/** Result of running one direct-argv child with bounded time and output. */
-struct BoundedCommandResult {
-    bool started{false};
-    bool exited{false};
-    bool timed_out{false};
-    bool cancelled{false};
-    bool output_truncated{false};
-    int exit_code{-1};
-    std::string output;
-    std::string error;
-};
-
-/**
- * Execute argv directly (never through a shell), combining stdout/stderr.
- * The child process group is terminated and reaped on timeout, cancellation,
- * output truncation, or read failure.
- */
-BoundedCommandResult RunBoundedCommand(
-    const std::vector<std::string>& argv,
-    std::chrono::milliseconds timeout,
-    size_t max_output,
-    const std::function<bool()>& should_cancel = {});
-
-/**
- * Call one CUSF enforcer method through grpcurl using mandatory mutual TLS.
- * There is deliberately no plaintext or server-auth-only fallback.
- */
-BoundedCommandResult RunAuthenticatedDrivechainGrpc(
-    const std::string& method,
-    const std::string& json_payload,
-    std::chrono::milliseconds timeout,
-    size_t max_output,
-    const std::function<bool()>& should_cancel = {});
-
-/** Testable/operator-independent overload using an explicit argument set. */
-BoundedCommandResult RunAuthenticatedDrivechainGrpc(
-    const ArgsManager& args,
-    const std::string& method,
-    const std::string& json_payload,
-    std::chrono::milliseconds timeout,
-    size_t max_output,
-    const std::function<bool()>& should_cancel = {});
-
-/** Validate the configured enforcer endpoint and mTLS credential files. */
-bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args,
-                                     std::string* error = nullptr);
-
-/** Validate and select max(configured bid, candidate transaction fees). */
-bool ComputeDrivechainBmmBid(CAmount configured_bid,
-                             CAmount sidechain_fees,
-                             CAmount& selected_bid,
-                             std::string* error = nullptr);
-
-/** Strictly parse a positive, MoneyRange-safe BIP301 bid. */
-bool ParseDrivechainBmmBid(const std::string& value,
-                           CAmount& bid,
-                           std::string* error = nullptr);
-
 /** Initialize bitcoin core: Basic context setup.
  *  @note This can be done before daemonization. Do not call Shutdown() if this function fails.
  *  @pre Parameters should be parsed and config file should be read.
@@ -114,7 +41,7 @@ bool AppInitBasicSetup(const ArgsManager& args);
  * @note This can be done before daemonization. Do not call Shutdown() if this function fails.
  * @pre Parameters should be parsed and config file should be read, AppInitBasicSetup should have been called.
  */
-bool AppInitParameterInteraction(ArgsManager& args);
+bool AppInitParameterInteraction(const ArgsManager& args);
 /**
  * Initialization sanity checks: ecc init, sanity checks, dir lock.
  * @note This can be done before daemonization. Do not call Shutdown() if this function fails.

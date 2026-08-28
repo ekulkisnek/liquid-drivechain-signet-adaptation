@@ -90,6 +90,12 @@ ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/secp256k1/secp256k1_impl.h
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/secp256k1/util.h
 
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/decodeElementsJets.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ecxDecodeElementsJets.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ecxElementsJets.h.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ecxPrimitiveEnumJet.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ecxPrimitiveEnumTy.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ecxPrimitiveInitTy.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ecxPrimitiveJetNode.inc
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/elementsJets.h
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/ops.h
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitive.h

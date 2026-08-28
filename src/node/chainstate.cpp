@@ -5,7 +5,9 @@
 #include <node/chainstate.h>
 
 #include <consensus/params.h>
+#include <logging.h>
 #include <node/blockstorage.h>
+#include <node/ecx_deployment_identity.h>
 #include <validation.h>
 
 namespace node {
@@ -28,6 +30,19 @@ std::optional<ChainstateLoadingError> LoadChainstate(bool fReset,
     };
 
     LOCK(cs_main);
+
+    // This check uses the effective per-attempt reset flags, including an
+    // automatic recovery retry. It must run before CBlockTreeDB or InitCoinsDB
+    // can wipe the evidence required for safe first binding.
+    std::string ecx_reset_error;
+    if (!CheckEcxDeploymentResetAllowed(
+            fReset || fReindexChainState,
+            block_tree_db_in_memory && coins_db_in_memory,
+            ecx_reset_error)) {
+        LogPrintf("ECX consensus identity: %s\n", ecx_reset_error);
+        return ChainstateLoadingError::ERROR_ECX_CONSENSUS_IDENTITY;
+    }
+
     chainman.InitializeChainstate(mempool);
     chainman.m_total_coinstip_cache = nCoinCacheUsage;
     chainman.m_total_coinsdb_cache = nCoinDBCache;
@@ -95,7 +110,20 @@ std::optional<ChainstateLoadingError> LoadChainstate(bool fReset,
         if (!chainstate->CoinsDB().Upgrade()) {
             return ChainstateLoadingError::ERROR_CHAINSTATE_UPGRADE_FAILED;
         }
+    }
 
+    // Bind runtime consensus configuration before crash-recovery replay can
+    // mutate a coins database under different ECX/private-BMM rules.
+    std::string ecx_identity_error;
+    if (!BindEcxDeploymentIdentityIfNeeded(
+            chainman,
+            block_tree_db_in_memory && coins_db_in_memory,
+            ecx_identity_error)) {
+        LogPrintf("ECX consensus identity: %s\n", ecx_identity_error);
+        return ChainstateLoadingError::ERROR_ECX_CONSENSUS_IDENTITY;
+    }
+
+    for (CChainState* chainstate : chainman.GetAll()) {
         // ReplayBlocks is a no-op if we cleared the coinsviewdb with -reindex or -reindex-chainstate
         if (!chainstate->ReplayBlocks()) {
             return ChainstateLoadingError::ERROR_REPLAYBLOCKS_FAILED;

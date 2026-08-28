@@ -1,0 +1,35 @@
+// Copyright (c) 2026 The Elements Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#ifndef BITCOIN_NODE_DRIVECHAIN_WITHDRAWAL_BUNDLE_H
+#define BITCOIN_NODE_DRIVECHAIN_WITHDRAWAL_BUNDLE_H
+
+#include <uint256.h>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace node {
+
+uint256 GetCurrentDrivechainWithdrawalBundleHash();
+struct DrivechainWithdrawalBundleEnvelope
+{
+    uint32_t checkpoint_height{0};
+    uint256 checkpoint_block_hash;
+    std::vector<unsigned char> m6_no_witness;
+};
+std::optional<DrivechainWithdrawalBundleEnvelope> GetCurrentDrivechainWithdrawalBundleEnvelope();
+void RestoreCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash);
+bool TryBeginDrivechainWithdrawalBundleCreation(uint256& current_bundle_hash, bool& creation_in_progress);
+void CompleteDrivechainWithdrawalBundleCreation(const uint256& bundle_hash);
+void CompleteDrivechainWithdrawalBundleCreation(
+    const uint256& bundle_hash,
+    DrivechainWithdrawalBundleEnvelope envelope);
+void AbortDrivechainWithdrawalBundleCreation();
+bool ClearCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash);
+
+} // namespace node
+
+#endif // BITCOIN_NODE_DRIVECHAIN_WITHDRAWAL_BUNDLE_H

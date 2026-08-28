@@ -5,9 +5,19 @@
 #include "../simplicity_alloc.h"
 #include "../simplicity_assert.h"
 
+#if defined(ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE) && defined(ECX_SIMPLICITY_CATALOGUE_FROZEN)
+#error "private E2E and frozen production Simplicity catalogues are mutually exclusive"
+#endif
+
 /* An enumeration of all the types we need to construct to specify the input and output types of all jets created by 'decodeJet'. */
 enum TypeNamesForJets {
 #include "primitiveEnumTy.inc"
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+#include "ecxPrivateE2ePrimitiveEnumTy.inc"
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+#include "ecxPrimitiveEnumTy.inc"
+#endif
   NumberOfTypeNames
 };
 
@@ -39,6 +49,12 @@ size_t simplicity_elements_mallocBoundVars(unification_var** bound_var, size_t* 
   *bound_var = simplicity_malloc((NumberOfTypeNames + extra_var_len) * sizeof(unification_var));
   if (!(*bound_var)) return 0;
 #include "primitiveInitTy.inc"
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+#include "ecxPrivateE2ePrimitiveInitTy.inc"
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+#include "ecxPrimitiveInitTy.inc"
+#endif
   *word256_ix = ty_w256;
   *extra_var_start = NumberOfTypeNames;
 
@@ -50,6 +66,12 @@ size_t simplicity_elements_mallocBoundVars(unification_var** bound_var, size_t* 
 typedef enum jetName
 {
 #include "primitiveEnumJet.inc"
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+#include "ecxPrivateE2ePrimitiveEnumJet.inc"
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+#include "ecxPrimitiveEnumJet.inc"
+#endif
   NUMBER_OF_JET_NAMES
 } jetName;
 
@@ -81,6 +103,12 @@ static simplicity_err decodePrimitive(jetName* result, bitstream* stream) {
 static dag_node jetNode(jetName name) {
   static const dag_node jet_node[] = {
     #include "primitiveJetNode.inc"
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    #include "ecxPrivateE2ePrimitiveJetNode.inc"
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+    #include "ecxPrimitiveJetNode.inc"
+#endif
   };
 
   return jet_node[name];

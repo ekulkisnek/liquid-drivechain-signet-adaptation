@@ -154,6 +154,8 @@ private:
     uint64_t nBlockSigOpsCost;
     CAmount nFees;
     CTxMemPool::setEntries inBlock;
+    uint64_t m_ecx_source_append_budget{0};
+    uint64_t m_ecx_source_appends_selected{0};
 
     // Chain context for the block
     int nHeight;
@@ -175,7 +177,7 @@ public:
     explicit BlockAssembler(CChainState& chainstate, const CTxMemPool& mempool, const CChainParams& params, const Options& options);
 
     /** Construct a new block template with coinbase to scriptPubKeyIn */
-    std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn, std::chrono::seconds min_tx_age = std::chrono::seconds(0), DynaFedParamEntry* = nullptr, const std::vector<CScript>* commit_scripts = nullptr);
+    std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn, std::chrono::seconds min_tx_age = std::chrono::seconds(0), DynaFedParamEntry* = nullptr, const std::vector<CScript>* commit_scripts = nullptr, std::optional<uint64_t> authenticated_parent_height = std::nullopt);
 
     inline static std::optional<int64_t> m_last_block_num_txs{};
     inline static std::optional<int64_t> m_last_block_weight{};

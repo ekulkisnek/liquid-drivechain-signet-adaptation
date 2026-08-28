@@ -130,8 +130,13 @@
         case 48: *result = VERSION; return SIMPLICITY_NO_ERROR;
         case 49: *result = GENESIS_BLOCK_HASH; return SIMPLICITY_NO_ERROR;
         case 50: *result = TRANSACTION_ID; return SIMPLICITY_NO_ERROR;
-        case 51: *result = CURRENT_BMM_PARENT_MTP; return SIMPLICITY_NO_ERROR;
       }
       break;
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+#include "ecxPrivateE2eDecodeElementsJets.inc"
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+#include "ecxDecodeElementsJets.inc"
+#endif
   }
 }

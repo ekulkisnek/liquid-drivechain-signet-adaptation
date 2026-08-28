@@ -22,6 +22,9 @@ bench_bench_bitcoin_SOURCES = \
   bench/data.h \
   bench/data.cpp \
   bench/duplicate_inputs.cpp \
+  bench/ecx_simplicity_bench_shim.c \
+  bench/ecx_simplicity_bench_shim.h \
+  bench/ecx_simplicity_jets.cpp \
   bench/examples.cpp \
   bench/rollingbloom.cpp \
   bench/chacha20.cpp \
@@ -77,6 +80,7 @@ bench_bench_bitcoin_SOURCES += bench/wallet_balance.cpp
 endif
 
 bench_bench_bitcoin_LDADD += $(BDB_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(SQLITE_LIBS)
+bench_bench_bitcoin_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 bench_bench_bitcoin_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS) $(PTHREAD_FLAGS)
 
 CLEAN_BITCOIN_BENCH = bench/*.gcda bench/*.gcno $(GENERATED_BENCH_FILES)

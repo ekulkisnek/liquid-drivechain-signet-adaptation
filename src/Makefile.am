@@ -109,10 +109,7 @@ if BUILD_BITCOIN_UTIL
 endif
 
 if BUILD_BITCOIN_CHAINSTATE
-  # This utility is hardcoded to Bitcoin mainnet consensus for upstream kernel
-  # tests. Keep it buildable for CI, but never install or ship it as an Elements
-  # production program.
-  noinst_PROGRAMS += bitcoin-chainstate
+  bin_PROGRAMS += bitcoin-chainstate
 endif
 
 .PHONY: FORCE check-symbols check-security
@@ -158,8 +155,11 @@ BITCOIN_CORE_H = \
   dbwrapper.h \
   deploymentinfo.h \
   deploymentstatus.h \
-  drivechain_parent_replay.h \
-  elements_drivechain_identity.h \
+  drivechain_bmm.h \
+  ecx_exchange_state.h \
+  ecx_bond_v2.h \
+  ecxProductionActivationProfile.inc \
+  drivechain_peg.h \
   dynafed.h \
   external_signer.h \
   flatfile.h \
@@ -204,6 +204,8 @@ BITCOIN_CORE_H = \
   node/coin.h \
   node/coinstats.h \
   node/context.h \
+  node/drivechain_withdrawal_bundle.h \
+  node/ecx_deployment_identity.h \
   node/miner.h \
   node/minisketchwrapper.h \
   node/psbt.h \
@@ -363,7 +365,9 @@ libbitcoin_node_a_SOURCES = \
   dynafed.cpp \
   dbwrapper.cpp \
   deploymentstatus.cpp \
-  drivechain_parent_replay.cpp \
+  drivechain_bmm.cpp \
+  ecx_exchange_state.cpp \
+  drivechain_peg.cpp \
   flatfile.cpp \
   httprpc.cpp \
   httpserver.cpp \
@@ -383,6 +387,7 @@ libbitcoin_node_a_SOURCES = \
   node/coin.cpp \
   node/coinstats.cpp \
   node/context.cpp \
+  node/ecx_deployment_identity.cpp \
   node/interfaces.cpp \
   node/miner.cpp \
   node/minisketchwrapper.cpp \
@@ -446,7 +451,6 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/coincontrol.cpp \
   wallet/context.cpp \
   wallet/crypter.cpp \
-  wallet/drivechain_withdrawal.h \
   wallet/db.cpp \
   wallet/dump.cpp \
   wallet/external_signer_scriptpubkeyman.cpp \
@@ -588,7 +592,6 @@ libelements_consensus_a_SOURCES = \
   script/bitcoinconsensus.cpp \
   script/interpreter.cpp \
   script/interpreter.h \
-  script/usdd_sp1_annex.h \
   script/script.cpp \
   script/script.h \
   script/script_error.cpp \
@@ -735,6 +738,7 @@ elements_bin_ldadd = \
   $(LIBELEMENTSSIMPLICITY)
 
 elements_bin_ldadd += $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS)
+elements_bin_ldadd += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 
 elementsd_SOURCES = $(elements_daemon_sources) init/bitcoind.cpp
 elementsd_CPPFLAGS = $(elements_bin_cppflags)
@@ -785,6 +789,7 @@ elements_tx_LDADD = \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBSECP256K1) \
   $(LIBELEMENTSSIMPLICITY)
+elements_tx_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 #
 
 # bitcoin-wallet binary #
@@ -809,6 +814,7 @@ elements_wallet_LDADD = \
   $(LIBLEVELDB_SSE42) \
   $(LIBMEMENV) \
   $(SQLITE_LIBS)
+elements_wallet_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 
 if TARGET_WINDOWS
 elements_wallet_SOURCES += bitcoin-wallet-res.rc
@@ -833,6 +839,7 @@ elements_util_LDADD = \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBSECP256K1) \
   $(LIBELEMENTSSIMPLICITY)
+elements_util_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 #
 
 # bitcoin-chainstate binary #
@@ -854,6 +861,9 @@ bitcoin_chainstate_SOURCES = \
   dbwrapper.cpp \
   deploymentinfo.cpp \
   deploymentstatus.cpp \
+  drivechain_bmm.cpp \
+  drivechain_peg.cpp \
+  ecx_exchange_state.cpp \
   flatfile.cpp \
   fs.cpp \
   hash.cpp \
@@ -867,6 +877,7 @@ bitcoin_chainstate_SOURCES = \
   node/blockstorage.cpp \
   node/chainstate.cpp \
   node/coinstats.cpp \
+  node/ecx_deployment_identity.cpp \
   node/ui_interface.cpp \
   policy/feerate.cpp \
   policy/fees.cpp \
@@ -924,7 +935,6 @@ bitcoin_chainstate_SOURCES += \
   common/bloom.cpp \
   confidential_validation.cpp \
   dynafed.cpp \
-  drivechain_parent_replay.cpp \
   issuance.cpp \
   mainchainrpc.cpp \
   merkleblock.cpp \
@@ -947,6 +957,8 @@ bitcoin_chainstate_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES)
 bitcoin_chainstate_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 bitcoin_chainstate_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS) $(PTHREAD_FLAGS)
 bitcoin_chainstate_LDADD = \
+  $(LIBBITCOIN_COMMON) \
+  $(LIBBITCOIN_UTIL) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBUNIVALUE) \
   $(LIBSECP256K1) \
@@ -956,7 +968,9 @@ bitcoin_chainstate_LDADD = \
   $(LIBMEMENV)
 # ELEMENTS:
 bitcoin_chainstate_LDADD += \
-  $(EVENT_LIBS)
+  $(EVENT_LIBS) \
+  $(ECX_SP1_VERIFIER_LIB) \
+  $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 
 # Required for obj/build.h to be generated first.
 # More details: https://www.gnu.org/software/automake/manual/html_node/Built-Sources-Example.html
@@ -969,7 +983,7 @@ include_HEADERS = script/bitcoinconsensus.h
 libelementsconsensus_la_SOURCES = support/cleanse.cpp $(crypto_libbitcoin_crypto_base_a_SOURCES) $(libelements_consensus_a_SOURCES)
 
 libelementsconsensus_la_LDFLAGS = $(AM_LDFLAGS) -no-undefined $(RELDFLAGS)
-libelementsconsensus_la_LIBADD = $(LIBSECP256K1) $(LIBELEMENTSSIMPLICITY)
+libelementsconsensus_la_LIBADD = $(LIBSECP256K1) $(LIBELEMENTSSIMPLICITY) $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 libelementsconsensus_la_CPPFLAGS = $(AM_CPPFLAGS) -I$(builddir)/obj -I$(srcdir)/secp256k1/include -I$(srcdir)/$(ELEMENTS_SIMPLICITY_INCLUDE_DIR_INT) -DBUILD_BITCOIN_INTERNAL
 libelementsconsensus_la_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
 

@@ -5,18 +5,23 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chainparams.h>
+#include <clientversion.h>
+#include <coins.h>
 #include <consensus/merkle.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <node/miner.h>
 #include <pow.h>
 #include <random.h>
 #include <script/standard.h>
+#include <streams.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <util/time.h>
 #include <validation.h>
 #include <validationinterface.h>
 
+#include <set>
 #include <thread>
 
 using node::BlockAssembler;
@@ -35,6 +40,262 @@ struct MinerTestingSetup : public TestingSetup {
 } // namespace validation_block_tests
 
 BOOST_FIXTURE_TEST_SUITE(validation_block_tests, MinerTestingSetup)
+
+BOOST_AUTO_TEST_CASE(bits16_through20_remain_ordinary_on_standard_regtest)
+{
+    bool ignored{false};
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(
+        Params(),
+        std::make_shared<CBlock>(Params().GenesisBlock()),
+        true,
+        &ignored));
+
+    auto block{Block(Params().GenesisBlock().GetHash())};
+    block->nVersion |=
+        CBlockHeader::BMM_PROOF_HF_MASK |
+        CBlockHeader::EXCHANGE_STATE_HF_MASK |
+        CBlockHeader::FORCED_INBOX_HF_MASK |
+        CBlockHeader::DEPOSIT_INBOX_HF_MASK |
+        CBlockHeader::INBOX_CURSOR_HF_MASK;
+    block->hashBmmProof = uint256S("01");
+    block->hashExchangeStateRoot = uint256S("01");
+    block->hashForcedInboxRoot = uint256S("02");
+    block->hashDepositInboxRoot = uint256S("03");
+    block->ecxParentHeight = 123;
+    block->forcedProcessedCursor = 4;
+    block->depositProcessedCursor = 5;
+    block->sourceBacklogOldestParentHeight = 6;
+    CBlockHeader without_hidden_ecx_data{block->GetBlockHeader()};
+    without_hidden_ecx_data.hashBmmProof.SetNull();
+    without_hidden_ecx_data.hashExchangeStateRoot.SetNull();
+    without_hidden_ecx_data.hashForcedInboxRoot.SetNull();
+    without_hidden_ecx_data.hashDepositInboxRoot.SetNull();
+    without_hidden_ecx_data.ecxParentHeight = 0;
+    without_hidden_ecx_data.forcedProcessedCursor = 0;
+    without_hidden_ecx_data.depositProcessedCursor = 0;
+    without_hidden_ecx_data.sourceBacklogOldestParentHeight = 0;
+    BOOST_CHECK_EQUAL(block->GetHash(), without_hidden_ecx_data.GetHash());
+    BOOST_CHECK_EQUAL(
+        GetSerializeSize(block->GetBlockHeader(), PROTOCOL_VERSION),
+        80U);
+    while (!CheckProofOfWork(
+        block->GetHash(), block->nBits, Params().GetConsensus())) {
+        ++block->nNonce;
+    }
+
+    BlockValidationState state;
+    const CBlockIndex* accepted{nullptr};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(
+        {block->GetBlockHeader()}, state, Params(), &accepted));
+    BOOST_CHECK(state.IsValid());
+    BOOST_REQUIRE(accepted != nullptr);
+    BOOST_CHECK_EQUAL(accepted->GetBlockHash(), block->GetHash());
+    BOOST_CHECK(WITH_LOCK(
+        ::cs_main,
+        return m_node.chainman->m_blockman.LookupBlockIndex(block->GetHash()) !=
+            nullptr));
+
+    CDiskBlockIndex disk_index{accepted};
+    CDataStream disk_bytes{SER_DISK, CLIENT_VERSION};
+    disk_bytes << disk_index;
+    CDiskBlockIndex decoded_disk_index;
+    disk_bytes >> decoded_disk_index;
+    BOOST_CHECK(disk_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_disk_index.nVersion, accepted->nVersion);
+    BOOST_CHECK(decoded_disk_index.hashBmmProof.IsNull());
+    BOOST_CHECK(decoded_disk_index.hashExchangeStateRoot.IsNull());
+    BOOST_CHECK(decoded_disk_index.hashForcedInboxRoot.IsNull());
+    BOOST_CHECK(decoded_disk_index.hashDepositInboxRoot.IsNull());
+    BOOST_CHECK_EQUAL(decoded_disk_index.ecxParentHeight, 0U);
+    BOOST_CHECK_EQUAL(decoded_disk_index.forcedProcessedCursor, 0U);
+    BOOST_CHECK_EQUAL(decoded_disk_index.depositProcessedCursor, 0U);
+    BOOST_CHECK_EQUAL(
+        decoded_disk_index.sourceBacklogOldestParentHeight, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(bit20_does_not_extend_standard_regtest_block_body)
+{
+    bool ignored{false};
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(
+        Params(),
+        std::make_shared<CBlock>(Params().GenesisBlock()),
+        true,
+        &ignored));
+
+    auto block{Block(Params().GenesisBlock().GetHash())};
+    block->nVersion |= CBlockHeader::BMM_PROOF_HF_MASK;
+    block->m_bmm_proof = {0xde, 0xad, 0xbe, 0xef};
+    const auto finalized{FinalizeBlock(block)};
+
+    CBlock without_bmm_payload{*finalized};
+    without_bmm_payload.m_bmm_proof.clear();
+    BOOST_CHECK_EQUAL(
+        GetSerializeSize(*finalized, PROTOCOL_VERSION),
+        GetSerializeSize(without_bmm_payload, PROTOCOL_VERSION));
+    BOOST_CHECK_EQUAL(
+        GetBlockWeight(*finalized),
+        GetBlockWeight(without_bmm_payload));
+
+    CDataStream encoded{SER_NETWORK, PROTOCOL_VERSION};
+    encoded << *finalized;
+    CBlock decoded;
+    encoded >> decoded;
+    BOOST_CHECK(encoded.empty());
+    BOOST_CHECK(decoded.m_bmm_proof.empty());
+    BOOST_CHECK_EQUAL(decoded.GetHash(), finalized->GetHash());
+
+    bool new_block{false};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(
+        Params(), std::make_shared<CBlock>(decoded), true, &new_block));
+    BOOST_CHECK(new_block);
+}
+
+BOOST_AUTO_TEST_CASE(bit30_withdrawal_extension_is_elements_only)
+{
+    bool ignored{false};
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(
+        Params(),
+        std::make_shared<CBlock>(Params().GenesisBlock()),
+        true,
+        &ignored));
+
+    auto block{Block(Params().GenesisBlock().GetHash())};
+    block->nVersion |= CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
+    block->hashWithdrawalBundle = uint256S("01");
+
+    CBlockHeader without_hidden_withdrawal{block->GetBlockHeader()};
+    without_hidden_withdrawal.hashWithdrawalBundle.SetNull();
+    BOOST_CHECK_EQUAL(block->GetHash(), without_hidden_withdrawal.GetHash());
+    BOOST_CHECK_EQUAL(
+        GetSerializeSize(block->GetBlockHeader(), PROTOCOL_VERSION),
+        80U);
+
+    CDataStream header_bytes{SER_NETWORK, PROTOCOL_VERSION};
+    header_bytes << block->GetBlockHeader();
+    CBlockHeader decoded_header;
+    header_bytes >> decoded_header;
+    BOOST_CHECK(header_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_header.nVersion, block->nVersion);
+    BOOST_CHECK(decoded_header.hashWithdrawalBundle.IsNull());
+
+    const auto finalized{FinalizeBlock(block)};
+    CDataStream block_bytes{SER_NETWORK, PROTOCOL_VERSION};
+    block_bytes << *finalized;
+    CBlock decoded_block;
+    block_bytes >> decoded_block;
+    BOOST_CHECK(block_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_block.nVersion, finalized->nVersion);
+    BOOST_CHECK(decoded_block.hashWithdrawalBundle.IsNull());
+    BOOST_CHECK_EQUAL(decoded_block.GetHash(), finalized->GetHash());
+    BOOST_CHECK_EQUAL(decoded_block.vtx.size(), finalized->vtx.size());
+
+    bool new_block{false};
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(
+        Params(), std::make_shared<CBlock>(decoded_block), true, &new_block));
+    BOOST_CHECK(new_block);
+
+    const CBlockIndex* accepted{WITH_LOCK(
+        ::cs_main,
+        return m_node.chainman->m_blockman.LookupBlockIndex(
+            finalized->GetHash()))};
+    BOOST_REQUIRE(accepted != nullptr);
+    CDiskBlockIndex disk_index{accepted};
+    CDataStream disk_bytes{SER_DISK, CLIENT_VERSION};
+    disk_bytes << disk_index;
+    CDiskBlockIndex decoded_disk_index;
+    disk_bytes >> decoded_disk_index;
+    BOOST_CHECK(disk_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_disk_index.nVersion, accepted->nVersion);
+    BOOST_CHECK(decoded_disk_index.hashWithdrawalBundle.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(bit31_dynafed_extension_is_elements_only)
+{
+    auto block{Block(Params().GenesisBlock().GetHash())};
+    block->nVersion = static_cast<int32_t>(
+        static_cast<uint32_t>(block->nVersion) |
+        CBlockHeader::DYNAFED_HF_MASK);
+    const DynaFedParamEntry hidden_current{
+        CScript{} << OP_TRUE, 1, uint256S("01")};
+    block->m_dynafed_params =
+        DynaFedParams{hidden_current, DynaFedParamEntry{}};
+
+    CBlockHeader without_hidden_dynafed{block->GetBlockHeader()};
+    without_hidden_dynafed.m_dynafed_params.SetNull();
+    BOOST_CHECK_EQUAL(block->GetHash(), without_hidden_dynafed.GetHash());
+    BOOST_CHECK_EQUAL(
+        GetSerializeSize(block->GetBlockHeader(), PROTOCOL_VERSION),
+        80U);
+
+    CDataStream header_bytes{SER_NETWORK, PROTOCOL_VERSION};
+    header_bytes << block->GetBlockHeader();
+    CBlockHeader decoded_header;
+    header_bytes >> decoded_header;
+    BOOST_CHECK(header_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_header.nVersion, block->nVersion);
+    BOOST_CHECK(decoded_header.m_dynafed_params.IsNull());
+
+    CDataStream block_bytes{SER_NETWORK, PROTOCOL_VERSION};
+    block_bytes << *block;
+    CBlock decoded_block;
+    block_bytes >> decoded_block;
+    BOOST_CHECK(block_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_block.nVersion, block->nVersion);
+    BOOST_CHECK(decoded_block.m_dynafed_params.IsNull());
+    BOOST_CHECK_EQUAL(decoded_block.GetHash(), block->GetHash());
+    BOOST_CHECK_EQUAL(decoded_block.vtx.size(), block->vtx.size());
+
+    CBlockIndex memory_index{block->GetBlockHeader()};
+    CDiskBlockIndex disk_index{&memory_index};
+    CDataStream disk_bytes{SER_DISK, CLIENT_VERSION};
+    disk_bytes << disk_index;
+    CDiskBlockIndex decoded_disk_index;
+    disk_bytes >> decoded_disk_index;
+    BOOST_CHECK(disk_bytes.empty());
+    BOOST_CHECK_EQUAL(decoded_disk_index.nVersion, memory_index.nVersion);
+    BOOST_CHECK(!decoded_disk_index.is_dynafed_block());
+    BOOST_CHECK(decoded_disk_index.dynafed_params().IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(ecx_reserved_outpoints_are_ordinary_on_standard_regtest)
+{
+    CCoinsView base;
+    CCoinsViewCache view{&base};
+    const std::vector<COutPoint> outpoints{
+        {uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041"), 0},
+        {uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1"), 0},
+        {uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586"), 0},
+        {uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9"), 0},
+        {uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1"), 0},
+    };
+
+    for (const COutPoint& outpoint : outpoints) {
+        view.AddCoin(
+            outpoint,
+            Coin{CTxOut{CAsset{}, 2 * COIN, CScript{} << OP_TRUE}, 1, false},
+            false);
+        CMutableTransaction mutable_tx;
+        mutable_tx.vin.emplace_back(outpoint);
+        mutable_tx.vout.emplace_back(
+            CAsset{}, COIN, CScript{} << OP_TRUE);
+        const CTransaction tx{mutable_tx};
+        TxValidationState state;
+        CAmountMap fees;
+        std::set<std::pair<uint256, COutPoint>> pegins;
+        BOOST_CHECK(Consensus::CheckTxInputs(
+            tx,
+            state,
+            view,
+            2,
+            fees,
+            pegins,
+            nullptr,
+            false,
+            false,
+            {}));
+        BOOST_CHECK(state.IsValid());
+    }
+}
 
 struct TestSubscriber final : public CValidationInterface {
     uint256 m_expected_tip;
