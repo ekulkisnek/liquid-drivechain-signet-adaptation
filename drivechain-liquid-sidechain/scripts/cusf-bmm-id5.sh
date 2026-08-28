@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+printf '%s\n' 'ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.' >&2
+exit 64
+
 # cusf-bmm-id5.sh — Minimal reliable BMM driver for Liquid/Elements ID 5
 # Uses the *exact* proven host buf one-liner from liquid-side-status.sh + e2e grpc_curl pattern.
 # Bypasses all Python f-string / subprocess fragility on this Mac (arm64 + homebrew buf).

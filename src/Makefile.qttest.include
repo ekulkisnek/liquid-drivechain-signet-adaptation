@@ -2,7 +2,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-bin_PROGRAMS += qt/test/test_elements-qt
+check_PROGRAMS += qt/test/test_elements-qt
 TESTS += qt/test/test_elements-qt
 
 TEST_QT_MOC_CPP = \

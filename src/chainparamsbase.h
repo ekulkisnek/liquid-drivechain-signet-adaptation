@@ -27,6 +27,7 @@ public:
     static const std::string LIQUID1;
     static const std::string LIQUID1TEST;
     static const std::string LIQUIDTESTNET;
+    static const std::string ELEMENTS;
     ///@}
 
     static const std::string DEFAULT;
@@ -58,6 +59,17 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain
  *Set the arguments for chainparams
  */
 void SetupChainParamsBaseOptions(ArgsManager& argsman);
+
+/**
+ * Reject a noncanonical chain selector in an installed production program.
+ *
+ * Legacy parameter classes intentionally remain available to unit, fuzz, and
+ * library tests. Installed binaries must call this before selecting parameters
+ * or resolving a network-specific path.
+ *
+ * @throws std::runtime_error if the selected chain is not `elements`.
+ */
+void EnsureElementsProductionChain(const ArgsManager& args);
 
 /**
  * Return the currently selected parameters. This won't change after app

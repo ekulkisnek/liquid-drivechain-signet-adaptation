@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+printf '%s\n' 'ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.' >&2
+exit 64
+
 # start-liquid-id5-regtest.sh — Launch a clean, isolated regtest elementsd for Liquid sidechain ID 5.
 # This is the sidechain participant equivalent to the bitassets process.
 set -euo pipefail
@@ -7,6 +10,7 @@ DATADIR="${DATADIR:-/tmp/liquid-id5-regtest}"
 RPCPORT="${RPCPORT:-18443}"
 P2PPORT="${P2PPORT:-18444}"
 BIND="${BIND:-127.0.0.1}"
+LIQUID_ID="${LIQUID_ID:-24}"
 
 mkdir -p "$DATADIR"
 
@@ -26,6 +30,7 @@ echo "P2P: $BIND:$P2PPORT"
   -listen=1 \
   -server=1 \
   -txindex=1 \
+  -drivechainbmmslot="$LIQUID_ID" \
   -printtoconsole=0 \
   -logips=1 \
   -daemon \

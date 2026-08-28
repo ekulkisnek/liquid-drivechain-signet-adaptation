@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+if __name__ == "__main__":
+    import sys as _quarantine_sys
+    _quarantine_sys.stderr.write(
+        "ERROR: this historical tutorial launches elementsregtest, which this fork rejects. "
+        "Only Elements Drivechain (-chain=elements), BIP300 slot 24, is supported.\n"
+    )
+    raise SystemExit(64)
+
 from test_framework.authproxy import JSONRPCException
 from test_framework.daemon import Daemon, sync_all
 import argparse
@@ -341,6 +349,5 @@ x = alice.finalizepsbt(complete, True)
 assert x["complete"]
 # The complete transaction is in x["hex"] but again we won't print it because
 # it's massive.
-
 
 

@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+if __name__ == "__main__":
+    import sys as _quarantine_sys
+    _quarantine_sys.stderr.write(
+        "ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only "
+        "Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.\n"
+    )
+    raise SystemExit(64)
+
 """
 grpc_bmm_id5.py — Clean Python gRPC caller for Liquid ID5 CreateBmmCriticalDataTransaction
 using sibling CUSF protos + installed grpcio. Bypasses buf/docker entirely.

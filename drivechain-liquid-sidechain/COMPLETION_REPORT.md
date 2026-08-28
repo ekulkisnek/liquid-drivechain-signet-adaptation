@@ -1,5 +1,11 @@
 # Honest Progress & Evidence — Liquid/Elements Native Drivechain Sidechain (ID 5)
 
+> **QUARANTINED HISTORICAL REPORT.** These slot-5/regtest results do not apply
+> to this fork's canonical chain and must not be treated as deployment evidence.
+> Only **Elements Drivechain**, `-chain=elements`, BIP300 slot **24**, is
+> supported. See the [canonical README](../README.md). All legacy executables
+> now exit before performing work; the report remains solely for audit history.
+
 **Date**: 2026-05-25 (post honest re-assessment)  
 **Branch**: liquid-drivechain-signet-adaptation (ElementsProject/elements @ 75499e7 base + adaptation work)  
 **Target stack**: Luke's private CUSF/BIP300/301 signet (drivechain-wallet-dev/local-dev, enforcer + mainchain + bitassets ID4 healthy, Mac QEMU)

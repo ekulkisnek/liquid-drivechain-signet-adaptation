@@ -77,6 +77,8 @@ noinst_LTLIBRARIES =
 
 bin_PROGRAMS =
 noinst_PROGRAMS =
+noinst_LIBRARIES =
+check_PROGRAMS =
 TESTS =
 BENCHMARKS =
 

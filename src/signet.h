@@ -7,14 +7,29 @@
 
 #include <consensus/params.h>
 #include <primitives/block.h>
+#include <primitives/bitcoin/block.h>
 #include <primitives/transaction.h>
 
 #include <optional>
+#include <string>
 
 /**
  * Extract signature and check whether a block has a valid solution
  */
 bool CheckSignetBlockSolution(const CBlock& block, const Consensus::Params& consensusParams);
+
+/**
+ * Verify BIP325 for a raw Bitcoin-format parent block.
+ *
+ * Elements keeps separate Bitcoin transaction primitives for peg proofs.  The
+ * ordinary CheckSignetBlockSolution overload cannot be used for those blocks:
+ * translating a Bitcoin transaction into an Elements transaction changes its
+ * txid and therefore changes both the Merkle root and the signet sighash.
+ */
+bool CheckBitcoinSignetBlockSolution(const Sidechain::Bitcoin::CBlock& block,
+                                     const CScript& challenge,
+                                     const uint256& genesis_hash,
+                                     std::string* error = nullptr);
 
 /**
  * Generate the signet tx corresponding to the given block

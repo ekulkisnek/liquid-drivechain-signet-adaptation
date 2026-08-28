@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+printf '%s\n' 'ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.' >&2
+exit 64
+
 # activate-liquid-id5.sh — Wrapper for native Liquid/Elements sidechain ID 5 activation.
 # Uses the exact same canonical mechanism as plain-bitassets ID 4 (CreateSidechainProposal + mine until active).
 # Includes fallback to WalletService/GenerateBlocks for Mac QEMU GBT/mintime fragility during rapid activation mining.

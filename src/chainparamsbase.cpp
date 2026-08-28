@@ -5,6 +5,8 @@
 
 #include <chainparamsbase.h>
 
+#include <elements_drivechain_identity.h>
+
 #include <tinyformat.h>
 #include <util/system.h>
 
@@ -17,20 +19,20 @@ const std::string CBaseChainParams::REGTEST = "regtest";
 const std::string CBaseChainParams::LIQUID1 = "liquidv1";
 const std::string CBaseChainParams::LIQUID1TEST = "liquidv1test";
 const std::string CBaseChainParams::LIQUIDTESTNET = "liquidtestnet";
+const std::string CBaseChainParams::ELEMENTS = "elements";
 
-const std::string CBaseChainParams::DEFAULT = CBaseChainParams::LIQUID1;
+const std::string CBaseChainParams::DEFAULT = CBaseChainParams::ELEMENTS;
 
 void SetupChainParamsBaseOptions(ArgsManager& argsman)
 {
-    argsman.AddArg("-chain=<chain>", "Use the chain <chain> (default: liquidv1). Reserved values: main, test, signet, regtest, liquidv1, liquidv1test, liquidtestnet", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
-    argsman.AddArg("-regtest", "Enter regression test mode, which uses a special chain in which blocks can be solved instantly. "
-                 "This is intended for regression testing tools and app development. Equivalent to -chain=regtest.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-chain=<chain>", "Use the production chain <chain> (default and only accepted production value: elements)", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-regtest", "Select internal regtest parameters for test/library contexts; the production elementsd startup gate rejects this mode.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-testactivationheight=name@height.", "Set the activation height of 'name' (segwit, bip34, dersig, cltv, csv). (regtest-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-testnet", "Use the test chain. Equivalent to -chain=test.", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-testnet", "Select internal test parameters; installed Elements programs reject this mode.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-vbparams=deployment:start:end[:min_activation_height]", "Use given start/end times and min_activation_height for specified version bits deployment (regtest or custom only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-seednode=<ip>", "Use specified node as seed node. This option can be specified multiple times to connect to multiple nodes. (custom only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
 
-    argsman.AddArg("-signet", "Use the signet chain. Equivalent to -chain=signet. Note that the network is defined by the -signetchallenge parameter", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-signet", "Select internal signet parameters; installed Elements programs reject this mode.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-signetchallenge", "Blocks must satisfy the given script to be considered valid (only for signet networks; defaults to the LayerTwo-Labs drivechain signet challenge)", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-signetseednode", "Specify a seed node for the signet network, in the hostname[:port] format, e.g. sig.net:1234 (may be used multiple times to specify multiple seed nodes; defaults to the LayerTwo-Labs drivechain signet seed node(s))", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::CHAINPARAMS);
 
@@ -66,6 +68,14 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
     //
 }
 
+void EnsureElementsProductionChain(const ArgsManager& args)
+{
+    if (args.GetChainName() != CBaseChainParams::ELEMENTS) {
+        throw std::runtime_error(
+            "This program only supports the canonical -chain=elements production network");
+    }
+}
+
 static std::unique_ptr<CBaseChainParams> globalChainBaseParams;
 
 const CBaseChainParams& BaseParams()
@@ -94,6 +104,17 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain
         return std::make_unique<CBaseChainParams>("liquidv1test", 7040, 18332, 37040);  // Use same ports as customparams
     } else if (chain == CBaseChainParams::LIQUIDTESTNET) {
         return std::make_unique<CBaseChainParams>(chain, 7039, 18331, 37039);
+    } else if (chain == CBaseChainParams::ELEMENTS) {
+        // Dedicated Elements Drivechain ports. The mainchain RPC port is the
+        // LayerTwo-Labs Signet RPC port.
+        return std::make_unique<CBaseChainParams>(
+            ElementsDrivechainIdentity::DATA_DIR,
+            ElementsDrivechainIdentity::RPC_PORT,
+            ElementsDrivechainIdentity::MAINCHAIN_RPC_PORT,
+            ElementsDrivechainIdentity::ONION_TARGET_PORT);
+    } else if (chain == "usdd") {
+        throw std::runtime_error(
+            "The pre-launch 'usdd' chain identity is unsupported; use -chain=elements");
     }
 
     // ELEMENTS:

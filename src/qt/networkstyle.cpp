@@ -17,6 +17,7 @@ static const struct {
     const int iconColorHueShift;
     const int iconColorSaturationReduction;
 } network_styles[] = {
+    {"elements", QAPP_APP_NAME_ELEMENTS, 0, 0},
     {"main", QAPP_APP_NAME_DEFAULT, 0, 0},
     {"test", QAPP_APP_NAME_TESTNET, 70, 30},
     {"liquidv1", QAPP_APP_NAME_LIQUID, 0, 0},
@@ -81,7 +82,8 @@ NetworkStyle::NetworkStyle(const QString &_appName, const int iconColorHueShift,
 
 const NetworkStyle* NetworkStyle::instantiate(const std::string& networkId)
 {
-    std::string titleAddText = networkId == "liquidv1" ? "" : strprintf("[%s]", networkId);
+    const bool canonical_name = networkId == CBaseChainParams::ELEMENTS;
+    std::string titleAddText = canonical_name || networkId == "liquidv1" ? "" : strprintf("[%s]", networkId);
     for (const auto& network_style : network_styles) {
         if (networkId == network_style.networkId)
             return new NetworkStyle(

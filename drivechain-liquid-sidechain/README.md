@@ -1,5 +1,13 @@
 # liquid-signet-sidechain — Native Liquid/Elements Drivechain Sidechain (BIP 300/301)
 
+> **QUARANTINED HISTORICAL PROTOTYPE — DO NOT RUN.** This directory describes
+> the retired slot-5/regtest experiment and is not compatible with this fork's
+> canonical network. Every executable below exits before performing any work.
+> The only supported node identity is **Elements Drivechain**, selected with
+> `elementsd -chain=elements` and fixed to BIP300 slot **24**. Follow the
+> [repository README](../README.md) instead. The remaining text is retained
+> only as an audit trail and does not describe the current implementation.
+
 **Production-ready fork/adaptation of Blockstream Elements/Liquid** to run as a native sidechain on Luke's private drivechain signet (and future real BIP300/301 networks), **using only the CUSF native mechanisms** (no federation, no multisig pegin shortcut).
 
 - **Upstream base**: ElementsProject/elements (cloned into this workspace at commit 75499e7 on branch `liquid-drivechain-signet-adaptation`).

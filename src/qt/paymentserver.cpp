@@ -37,7 +37,7 @@
 #include <QUrlQuery>
 
 const int BITCOIN_IPC_CONNECT_TIMEOUT = 1000; // milliseconds
-const QString BITCOIN_IPC_PREFIX("bitcoin:");
+const QString ELEMENTS_IPC_PREFIX("elements:");
 
 //
 // Create a name that is unique for:
@@ -48,9 +48,7 @@ static QString ipcServerName()
 {
     QString name("ElementsQt");
 
-    // Append a simple hash of the datadir
-    // Note that gArgs.GetDataDirNet() returns a different path
-    // for -testnet versus main net
+    // Append a simple hash of the canonical Elements network datadir.
     QString ddir(GUIUtil::PathToQString(gArgs.GetDataDirNet()));
     name.append(QString::number(qHash(ddir)));
 
@@ -81,11 +79,7 @@ void PaymentServer::ipcParseCommandLine(int argc, char* argv[])
         if (arg.startsWith("-"))
             continue;
 
-        // If the bitcoin: URI contains a payment request, we are not able to detect the
-        // network as that would require fetching and parsing the payment request.
-        // That means clicking such an URI which contains a testnet payment request
-        // will start a mainnet instance and throw a "wrong network" error.
-        if (arg.startsWith(BITCOIN_IPC_PREFIX, Qt::CaseInsensitive)) // bitcoin: URI
+        if (arg.startsWith(ELEMENTS_IPC_PREFIX, Qt::CaseInsensitive))
         {
             if (savedPaymentRequests.contains(arg)) continue;
             savedPaymentRequests.insert(arg);
@@ -93,15 +87,9 @@ void PaymentServer::ipcParseCommandLine(int argc, char* argv[])
             SendCoinsRecipient r;
             if (GUIUtil::parseBitcoinURI(arg, &r) && !r.address.isEmpty())
             {
-                auto tempChainParams = CreateChainParams(gArgs, CBaseChainParams::MAIN);
-
-                if (IsValidDestinationString(r.address.toStdString(), *tempChainParams)) {
-                    SelectParams(CBaseChainParams::MAIN);
-                } else {
-                    tempChainParams = CreateChainParams(gArgs, CBaseChainParams::TESTNET);
-                    if (IsValidDestinationString(r.address.toStdString(), *tempChainParams)) {
-                        SelectParams(CBaseChainParams::TESTNET);
-                    }
+                const auto elementsParams = CreateChainParams(gArgs, CBaseChainParams::ELEMENTS);
+                if (IsValidDestinationString(r.address.toStdString(), *elementsParams)) {
+                    SelectParams(CBaseChainParams::ELEMENTS);
                 }
             }
         }
@@ -154,7 +142,7 @@ PaymentServer::PaymentServer(QObject* parent, bool startLocalServer) :
     optionsModel(nullptr)
 {
     // Install global event filter to catch QFileOpenEvents
-    // on Mac: sent when you click bitcoin: links
+    // on Mac: sent when you click elements: links
     // other OSes: helpful when dealing with payment request files
     if (parent)
         parent->installEventFilter(this);
@@ -171,7 +159,7 @@ PaymentServer::PaymentServer(QObject* parent, bool startLocalServer) :
         if (!uriServer->listen(name)) {
             // constructor is called early in init, so don't use "Q_EMIT message()" here
             QMessageBox::critical(nullptr, tr("Payment request error"),
-                tr("Cannot start bitcoin: click-to-pay handler"));
+                tr("Cannot start elements: click-to-pay handler"));
         }
         else {
             connect(uriServer, &QLocalServer::newConnection, this, &PaymentServer::handleURIConnection);
@@ -184,7 +172,7 @@ PaymentServer::~PaymentServer()
 }
 
 //
-// OSX-specific way of handling bitcoin: URIs
+// OSX-specific way of handling elements: URIs
 //
 bool PaymentServer::eventFilter(QObject *object, QEvent *event)
 {
@@ -219,12 +207,12 @@ void PaymentServer::handleURIOrFile(const QString& s)
         return;
     }
 
-    if (s.startsWith("bitcoin://", Qt::CaseInsensitive))
+    if (s.startsWith("elements://", Qt::CaseInsensitive))
     {
-        Q_EMIT message(tr("URI handling"), tr("'bitcoin://' is not a valid URI. Use 'bitcoin:' instead."),
+        Q_EMIT message(tr("URI handling"), tr("'elements://' is not a valid URI. Use 'elements:' instead."),
             CClientUIInterface::MSG_ERROR);
     }
-    else if (s.startsWith(BITCOIN_IPC_PREFIX, Qt::CaseInsensitive)) // bitcoin: URI
+    else if (s.startsWith(ELEMENTS_IPC_PREFIX, Qt::CaseInsensitive))
     {
         QUrlQuery uri((QUrl(s)));
         // normal URI
@@ -292,4 +280,3 @@ void PaymentServer::setOptionsModel(OptionsModel *_optionsModel)
 {
     this->optionsModel = _optionsModel;
 }
-

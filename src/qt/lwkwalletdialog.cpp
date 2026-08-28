@@ -65,7 +65,7 @@ LwkWalletDialog::LwkWalletDialog(ClientModel* clientModel, QWidget* parent)
     : QDialog(parent),
       m_client_model(clientModel)
 {
-    setWindowTitle(tr("Liquid Wallet Kit (LWK) Wallet"));
+    setWindowTitle(tr("LWK Wallet"));
     setModal(true);
     setMinimumSize(700, 600);
 

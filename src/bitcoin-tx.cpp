@@ -92,16 +92,6 @@ static int AppInitRawTx(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    // Check for chain settings (Params() calls are only valid after this clause)
-    try {
-        SelectParams(gArgs.GetChainName());
-    } catch (const std::exception& e) {
-        tfm::format(std::cerr, "Error: %s\n", e.what());
-        return EXIT_FAILURE;
-    }
-
-    fCreateBlank = gArgs.GetBoolArg("-create", false);
-
     if (argc < 2 || HelpRequested(gArgs) || gArgs.IsArgSet("-version")) {
         // First part of help message is specific to this utility
         std::string strUsage = PACKAGE_NAME " elements-tx utility version " + FormatFullVersion() + "\n";
@@ -124,6 +114,20 @@ static int AppInitRawTx(int argc, char* argv[])
         }
         return EXIT_SUCCESS;
     }
+
+    // Do not let the installed transaction tool encode addresses or
+    // transactions under an inherited/custom chain identity.
+    try {
+#ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
+        EnsureElementsProductionChain(gArgs);
+#endif
+        SelectParams(gArgs.GetChainName());
+    } catch (const std::exception& e) {
+        tfm::format(std::cerr, "Error: %s\n", e.what());
+        return EXIT_FAILURE;
+    }
+
+    fCreateBlank = gArgs.GetBoolArg("-create", false);
     return CONTINUE_EXECUTION;
 }
 

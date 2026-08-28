@@ -7,12 +7,76 @@ noinst_PROGRAMS += test/fuzz/fuzz
 endif
 
 if !ENABLE_FUZZ
-bin_PROGRAMS += test/test_bitcoin
+check_PROGRAMS += test/test_bitcoin
 endif
 
 TEST_SRCDIR = test
 TEST_BINARY=test/test_bitcoin$(EXEEXT)
 FUZZ_BINARY=test/fuzz/fuzz$(EXEEXT)
+
+# Legacy/custom chain parameters remain necessary for unit and functional
+# coverage, but installed programs must never expose a switch that bypasses the
+# canonical Elements identity gate. These non-installed artifacts are compiled
+# separately with the test policy fixed at build time. A test-enabled ordinary
+# build produces them so functional CI never falls back to production tools.
+if BUILD_BITCOIND
+noinst_LIBRARIES += libelements_functional_test_node.a
+noinst_PROGRAMS += elements-functional-test-node
+
+libelements_functional_test_node_a_SOURCES = $(libbitcoin_node_a_SOURCES)
+libelements_functional_test_node_a_CPPFLAGS = $(libbitcoin_node_a_CPPFLAGS) -DELEMENTS_FUNCTIONAL_TEST_ONLY
+libelements_functional_test_node_a_CXXFLAGS = $(libbitcoin_node_a_CXXFLAGS)
+
+elements_functional_test_node_SOURCES = $(elements_daemon_sources) init/bitcoind.cpp
+elements_functional_test_node_CPPFLAGS = $(elements_bin_cppflags) -DELEMENTS_FUNCTIONAL_TEST_ONLY
+elements_functional_test_node_CXXFLAGS = $(elements_bin_cxxflags)
+elements_functional_test_node_LDFLAGS = $(elements_bin_ldflags)
+elements_functional_test_node_LDADD = libelements_functional_test_node.a $(elements_bin_ldadd)
+endif
+
+if BUILD_BITCOIN_CLI
+noinst_PROGRAMS += elements-functional-test-cli
+
+elements_functional_test_cli_SOURCES = bitcoin-cli.cpp
+elements_functional_test_cli_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(EVENT_CFLAGS) -DELEMENTS_FUNCTIONAL_TEST_ONLY
+elements_functional_test_cli_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
+elements_functional_test_cli_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS) $(PTHREAD_FLAGS)
+elements_functional_test_cli_LDADD = $(LIBBITCOIN_CLI) $(LIBUNIVALUE) $(LIBBITCOIN_UTIL) $(LIBBITCOIN_CRYPTO) $(EVENT_LIBS)
+
+if TARGET_WINDOWS
+elements_functional_test_cli_SOURCES += bitcoin-cli-res.rc
+endif
+endif
+
+if BUILD_BITCOIN_TX
+noinst_PROGRAMS += elements-functional-test-tx
+
+elements_functional_test_tx_SOURCES = bitcoin-tx.cpp
+elements_functional_test_tx_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) -DELEMENTS_FUNCTIONAL_TEST_ONLY
+elements_functional_test_tx_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
+elements_functional_test_tx_LDFLAGS = $(RELDFLAGS) $(AM_LDFLAGS) $(LIBTOOL_APP_LDFLAGS) $(PTHREAD_FLAGS)
+elements_functional_test_tx_LDADD = $(elements_tx_LDADD)
+
+if TARGET_WINDOWS
+elements_functional_test_tx_SOURCES += bitcoin-tx-res.rc
+endif
+endif
+
+if ENABLE_WALLET
+if BUILD_BITCOIN_WALLET
+noinst_PROGRAMS += elements-functional-test-wallet
+
+elements_functional_test_wallet_SOURCES = bitcoin-wallet.cpp init/bitcoin-wallet.cpp
+elements_functional_test_wallet_CPPFLAGS = $(elements_bin_cppflags) -DELEMENTS_FUNCTIONAL_TEST_ONLY
+elements_functional_test_wallet_CXXFLAGS = $(elements_bin_cxxflags)
+elements_functional_test_wallet_LDFLAGS = $(elements_bin_ldflags)
+elements_functional_test_wallet_LDADD = $(elements_wallet_LDADD)
+
+if TARGET_WINDOWS
+elements_functional_test_wallet_SOURCES += bitcoin-wallet-res.rc
+endif
+endif
+endif
 
 JSON_TEST_FILES = \
   test/data/script_tests.json \

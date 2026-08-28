@@ -90,11 +90,9 @@
 // Application startup time (used for uptime calculation)
 const int64_t nStartupTime = GetTime();
 
-#ifdef LIQUID
-const char * const BITCOIN_CONF_FILENAME = "liquid.conf";
-#else
+// The sole production identity always uses the Elements application namespace.
+// Build flags must not redirect it into a legacy Liquid config/data hierarchy.
 const char * const BITCOIN_CONF_FILENAME = "elements.conf";
-#endif
 const char * const BITCOIN_SETTINGS_FILENAME = "settings.json";
 
 ArgsManager gArgs;
@@ -766,7 +764,7 @@ static std::string FormatException(const std::exception* pex, const char* pszThr
     char pszModule[MAX_PATH] = "";
     GetModuleFileNameA(nullptr, pszModule, sizeof(pszModule));
 #else
-    const char* pszModule = "bitcoin";
+    const char* pszModule = "elements";
 #endif
     if (pex)
         return strprintf(
@@ -783,38 +781,11 @@ void PrintExceptionContinue(const std::exception* pex, const char* pszThread)
     tfm::format(std::cerr, "\n\n************************\n%s\n", message);
 }
 
-#ifdef LIQUID
 fs::path GetDefaultDataDir()
 {
-    // Windows < Vista: C:\Documents and Settings\Username\Application Data\Liquid
-    // Windows >= Vista: C:\Users\Username\AppData\Roaming\Liquid
-    // Mac: ~/Library/Application Support/Liquid
-    // Unix: ~/.liquid
-#ifdef WIN32
-    // Windows
-    return GetSpecialFolderPath(CSIDL_APPDATA) / "Liquid";
-#else
-    fs::path pathRet;
-    char* pszHome = getenv("HOME");
-    if (pszHome == nullptr || strlen(pszHome) == 0)
-        pathRet = fs::path("/");
-    else
-        pathRet = fs::path(pszHome);
-#ifdef MAC_OSX
-    // Mac
-    return pathRet / "Library/Application Support/Liquid";
-#else
-    // Unix
-    return pathRet / ".liquid";
-#endif
-#endif
-}
-#else
-fs::path GetDefaultDataDir()
-{
-    // Windows: C:\Users\Username\AppData\Roaming\Bitcoin
-    // macOS: ~/Library/Application Support/Bitcoin
-    // Unix-like: ~/.bitcoin
+    // Windows: C:\Users\Username\AppData\Roaming\Elements
+    // macOS: ~/Library/Application Support/Elements
+    // Unix-like: ~/.elements
 #ifdef WIN32
     // Windows
     return GetSpecialFolderPath(CSIDL_APPDATA) / "Elements";
@@ -834,7 +805,6 @@ fs::path GetDefaultDataDir()
 #endif
 #endif
 }
-#endif
 
 fs::path GetMainchainDefaultDataDir()
 {

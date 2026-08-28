@@ -8,6 +8,7 @@
 #endif
 
 #include <chainparams.h>
+#include <chainparamsbase.h>
 #include <clientversion.h>
 #include <compat.h>
 #include <init.h>
@@ -155,6 +156,15 @@ static bool AppInit(NodeContext& node, int argc, char* argv[])
         if (!args.ReadConfigFiles(error, true)) {
             return InitError(Untranslated(strprintf("Error reading configuration file: %s\n", error)));
         }
+        // This production binary has one immutable network. Refuse any other
+        // chain name before constructing custom parameters, selecting a
+        // network-specific settings namespace, or initializing sockets.
+#ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
+        if (args.GetChainName() != CBaseChainParams::ELEMENTS) {
+            return InitError(Untranslated(
+                "This binary only supports the canonical -chain=elements production network\n"));
+        }
+#endif
         // Check for chain settings (Params() calls are only valid after this clause)
         try {
             SelectParams(args.GetChainName());

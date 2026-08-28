@@ -12,8 +12,8 @@ Deposit flow:
   1. CreateDepositTransaction on WalletService for sidechain ID 5.
   2. Record the returned mainchain txid as pending.
   3. Reconcile against ValidatorService.GetTwoWayPegData.
-  4. If an Elements RPC named importdrivechaindeposit exists, call it.
-     Otherwise the deposit remains pending_side_credit instead of being faked.
+  4. Pass the exact confirmed block, outpoint, value, and address to elementsd.
+     elementsd independently queries GetTwoWayPegData and rejects any mismatch.
 
 Withdrawal flow:
   1. Accept a real withdrawal bundle hex from the sidechain wallet/node.
@@ -25,6 +25,14 @@ loaded best-effort and rewritten into the structured format.
 """
 
 from __future__ import annotations
+
+if __name__ == "__main__":
+    import sys as _quarantine_sys
+    _quarantine_sys.stderr.write(
+        "ERROR: quarantined legacy slot-5/regtest launcher. This fork supports only "
+        "Elements Drivechain (-chain=elements), BIP300 slot 24. See the repository README.md.\n"
+    )
+    raise SystemExit(64)
 
 import argparse
 import base64
@@ -38,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SIDECHAIN_ID = 5
+DEFAULT_SIDECHAIN_ID = 24
 DEFAULT_STATE_FILE = (
     Path(__file__).resolve().parents[1] / "tests" / "liquid-id5-peg-state.json"
 )
@@ -286,6 +294,51 @@ def get_tip_hash(args: argparse.Namespace) -> str:
     return value
 
 
+def unwrap_proto_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if "hex" in value:
+            return value["hex"]
+        if "value" in value:
+            return value["value"]
+    return value
+
+
+def find_deposit_event(peg_data: dict[str, Any], txid: str) -> dict[str, Any] | None:
+    wanted_txid = txid.lower()
+    for block in peg_data.get("blocks", []):
+        header = block.get("blockHeaderInfo") or block.get("block_header_info") or {}
+        block_hash = unwrap_proto_value(header.get("blockHash") or header.get("block_hash"))
+        block_info = block.get("blockInfo") or block.get("block_info") or {}
+        for event in block_info.get("events", []):
+            deposit = event.get("deposit")
+            if not isinstance(deposit, dict):
+                continue
+            outpoint = deposit.get("outpoint") or {}
+            event_txid = unwrap_proto_value(outpoint.get("txid"))
+            if not isinstance(event_txid, str) or event_txid.lower() != wanted_txid:
+                continue
+            output = deposit.get("output") or {}
+            address_hex = unwrap_proto_value(output.get("address"))
+            try:
+                address = bytes.fromhex(str(address_hex)).decode("utf-8")
+                vout = int(unwrap_proto_value(outpoint.get("vout")))
+                value_sats = int(
+                    unwrap_proto_value(output.get("valueSats") or output.get("value_sats"))
+                )
+            except (TypeError, ValueError, UnicodeDecodeError):
+                raise BridgeError(f"malformed BIP300 deposit event for {txid}: {deposit}")
+            if not isinstance(block_hash, str) or len(block_hash) != 64:
+                raise BridgeError(f"deposit event for {txid} has no containing block hash")
+            return {
+                "block_hash": block_hash,
+                "txid": event_txid,
+                "vout": vout,
+                "address": address,
+                "value_sats": value_sats,
+            }
+    return None
+
+
 def reconcile_deposits(args: argparse.Namespace, state: dict[str, Any]) -> list[dict[str, Any]]:
     end_hash = get_tip_hash(args)
     payload = {
@@ -298,20 +351,34 @@ def reconcile_deposits(args: argparse.Namespace, state: dict[str, Any]) -> list[
         payload,
         timeout=args.timeout,
     )
-    raw = json.dumps(peg_data)
     changed: list[dict[str, Any]] = []
     can_import = elements_available(args) and elements_has_method(args, "importdrivechaindeposit")
     for deposit in state["deposits"]:
         txid = deposit.get("txid")
-        if txid and txid.lower() in raw.lower():
+        event = find_deposit_event(peg_data, txid) if txid else None
+        if event is not None:
+            if event["address"] != deposit["address"]:
+                raise BridgeError(
+                    f"deposit {txid} commits to address {event['address']}, "
+                    f"not requested address {deposit['address']}"
+                )
+            if event["value_sats"] != deposit["value_sats"]:
+                raise BridgeError(
+                    f"deposit {txid} has value {event['value_sats']}, "
+                    f"not requested value {deposit['value_sats']}"
+                )
             deposit["status"] = "seen_in_two_way_peg_data"
             deposit["seen_in_two_way_peg_data_at"] = now_iso()
+            deposit["mainchain_block_hash"] = event["block_hash"]
+            deposit["mainchain_vout"] = event["vout"]
         if deposit.get("status") == "seen_in_two_way_peg_data":
             if can_import:
                 import_resp = elements_cli(
                     args,
                     "importdrivechaindeposit",
                     txid,
+                    str(deposit["mainchain_vout"]),
+                    deposit["mainchain_block_hash"],
                     deposit["address"],
                     str(deposit["value_sats"]),
                     timeout=args.timeout,
