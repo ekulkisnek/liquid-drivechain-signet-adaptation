@@ -9,15 +9,12 @@
 #include <crypto/sha256.h>
 #include <deploymentstatus.h>
 #include <drivechain_peg.h>
-#include <drivechain_settings.h>
 #include <dynafed.h>
 #include <hash.h>
 #include <issuance.h>
-#include <interfaces/chain.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
 #include <node/drivechain_withdrawal_bundle.h>
-#include <node/drivechain_withdrawal_journal.h>
 #include <rpc/rawtransaction_util.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
@@ -25,20 +22,17 @@
 #include <script/pegins.h>
 #include <secp256k1.h>
 #include <streams.h>
-#include <util/fees.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
 #include <util/system.h>
-#include <util/time.h>
 #include <wallet/coincontrol.h>
-#include <wallet/drivechain_withdrawal.h>
 #include <wallet/fees.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
-#include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 
@@ -65,54 +59,22 @@ RPCHelpMan signrawtransactionwithwallet();
 namespace {
 static secp256k1_context *secp256k1_ctx;
 
-//! Drivechain peg-out settings.
-//!
-//! These were previously read from the process environment with silent
-//! defaults, which meant a custody safety property could be switched off by an
-//! unrecorded change to a service unit. They are ordinary validated startup
-//! arguments now, they are range-checked on every read, and the L1 payout
-//! verification they used to gate is no longer optional at all.
-static int DrivechainSidechainSlot()
+static std::string GetEnvString(const char* name, const std::string& fallback)
 {
-    const int64_t slot = gArgs.GetIntArg("-drivechainsidechainslot", DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT);
-    if (slot < 0 || slot > 255) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            strprintf("-drivechainsidechainslot must be a BIP300 slot in [0, 255] (got %d)", slot));
-    }
-    const int64_t bmm_slot = gArgs.GetIntArg("-drivechainbmmslot", DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT);
-    if (slot != bmm_slot) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            strprintf(
-                "-drivechainsidechainslot (%d) must match -drivechainbmmslot (%d)",
-                slot, bmm_slot));
-    }
-    return static_cast<int>(slot);
+    const char* value = std::getenv(name);
+    return value == nullptr || std::string{value}.empty() ? fallback : std::string{value};
 }
 
-//! Mainchain fee, in satoshi, reserved out of the withdrawal for the M6 bundle.
-//!
-//! This used to default to zero, which produces a bundle miners have no reason
-//! to include, so a withdrawal could be accepted and then simply never pay out.
-//! A positive fee is required and the caller must be able to cover it.
-static CAmount DrivechainPegoutMainchainFee(CAmount withdrawal_amount)
+static int GetEnvInt(const char* name, int fallback)
 {
-    const int64_t fee = gArgs.GetIntArg("-drivechainpegoutmainfee", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS);
-    if (fee <= 0) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "-drivechainpegoutmainfee must be a positive satoshi amount; an M6 bundle "
-            "with no mainchain fee has no incentive to be mined and can strand the payout");
+    const char* value = std::getenv(name);
+    if (value == nullptr || std::string{value}.empty()) return fallback;
+
+    int parsed{fallback};
+    if (!ParseInt32(value, &parsed)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid integer in %s", name));
     }
-    if (fee >= withdrawal_amount) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            strprintf(
-                "withdrawal amount %d does not cover the configured mainchain bundle fee %d",
-                withdrawal_amount, fee));
-    }
-    return static_cast<CAmount>(fee);
+    return parsed;
 }
 
 static void PushLE32(std::vector<unsigned char>& bytes, uint32_t value)
@@ -244,75 +206,63 @@ static CScript BuildWithdrawalStateMarkerScript(const uint256& anchor)
 }
 
 
-//! Decode a withdrawal destination into the script that will be paid on the
-//! parent chain.
-//!
-//! Every failure path here throws. There is deliberately no fallback that
-//! wraps unrecognised text in an OP_RETURN: doing so converted a mistyped or
-//! merely non-bech32 address -- an ordinary base58 P2PKH address, for instance
-//! -- into a provably unspendable payout, destroying the withdrawal with no
-//! warning and no recovery.
-//!
-//! Decoding is delegated to DecodeParentDestination, which resolves base58
-//! prefixes and the bech32 HRP against the configured parent network only. A
-//! testnet address on a mainnet parent is rejected rather than paid out.
 static CScript BuildDrivechainPayoutScript(const std::string& destination)
 {
-    if (destination.empty()) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Withdrawal destination must not be empty");
+    if (destination.rfind("hex:", 0) == 0) {
+        const std::vector<unsigned char> script_bytes = ParseHex(destination.substr(4));
+        if (script_bytes.empty()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "hex: destination script is empty or invalid");
+        }
+        return CScript(script_bytes.begin(), script_bytes.end());
     }
 
-    std::string error_msg;
-    const CTxDestination parsed = DecodeParentDestination(destination, error_msg);
-    if (!IsValidDestination(parsed)) {
-        throw JSONRPCError(
-            RPC_INVALID_ADDRESS_OR_KEY,
-            strprintf(
-                "Invalid withdrawal destination for parent network '%s': %s",
-                Params().ParentBech32HRP(),
-                error_msg.empty() ? "address could not be decoded" : error_msg));
+    const auto dec = bech32::Decode(destination);
+    if ((dec.hrp == "bc" || dec.hrp == "tb" || dec.hrp == "bcrt") && !dec.data.empty()) {
+        const int version = dec.data[0];
+        if (version < 0 || version > 16) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid witness version in Bitcoin address");
+        }
+        if (version == 0 && dec.encoding != bech32::Encoding::BECH32) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Version 0 witness address must use Bech32 checksum");
+        }
+        if (version != 0 && dec.encoding != bech32::Encoding::BECH32M) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Version 1+ witness address must use Bech32m checksum");
+        }
+
+        std::vector<unsigned char> witness_program;
+        if (!ConvertBits<5, 8, false>([&](unsigned char c) { witness_program.push_back(c); }, dec.data.begin() + 1, dec.data.end())) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bech32 witness program");
+        }
+        if (witness_program.size() < 2 || witness_program.size() > 40) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bech32 witness program size");
+        }
+        if (version == 0 && witness_program.size() != 20 && witness_program.size() != 32) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bech32 v0 witness program size");
+        }
+
+        CScript script;
+        script << CScript::EncodeOP_N(version) << witness_program;
+        return script;
     }
 
-    const CScript payout_script = GetScriptForDestination(parsed);
-    if (payout_script.empty()) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Withdrawal destination produced an empty payout script");
-    }
-    // Belt and braces: a destination must never resolve to something provably
-    // unspendable, whatever the decoder does in future.
-    if (payout_script.IsUnspendable()) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Withdrawal destination resolves to an unspendable script");
-    }
-    return payout_script;
+    const std::vector<unsigned char> destination_bytes(destination.begin(), destination.end());
+    return CScript() << OP_RETURN << destination_bytes;
 }
 
-static CScript BuildDrivechainWithdrawalBurnScript(const CScript& payout_script)
+struct DrivechainWithdrawalBundle
 {
-    const uint256 parent_genesis = Params().ParentGenesisBlockHash();
-    NullData commitment;
-    commitment << std::vector<unsigned char>(
-        parent_genesis.begin(), parent_genesis.end());
-    commitment << std::vector<unsigned char>(
-        payout_script.begin(), payout_script.end());
-    const CScript script = GetScriptForDestination(CTxDestination{commitment});
-    if (!script.IsPegoutScript(parent_genesis)) {
-        throw JSONRPCError(
-            RPC_INTERNAL_ERROR,
-            "Failed to construct the canonical sidechain withdrawal commitment");
-    }
-    return script;
-}
+    std::vector<unsigned char> bytes;
+    std::vector<unsigned char> no_witness_bytes;
+    uint32_t checkpoint_height{0};
+    uint256 checkpoint_block_hash;
+    uint256 previous_child_hash;
+    uint256 exchange_state_root;
+    uint256 m6id;
+};
 
-//! Serialize the M6 withdrawal bundle.
-//!
-//! The payout script is passed in already decoded and validated rather than
-//! being parsed from the destination string here. The caller must validate it
-//! before spending anything on the sidechain, and the same script object is
-//! then used for both the sidechain peg-out output and this bundle, so the two
-//! cannot disagree about where the money is going.
 static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
     CAmount amount,
-    CAmount mainchain_fee,
-    const CScript& payout_script,
+    const std::string& destination,
     const COutPoint& withdrawal_outpoint,
     uint32_t sidechain_block_height,
     bool include_witness_marker,
@@ -320,11 +270,9 @@ static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
     const uint256& previous_child_hash,
     const uint256& exchange_state_root)
 {
-    if (amount <= 0 || !MoneyRange(amount) || mainchain_fee <= 0 ||
-        !MoneyRange(mainchain_fee) || mainchain_fee >= amount) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "withdrawal amount and mainchain fee must be in range, with a positive fee less than the amount");
+    const CAmount mainchain_fee = GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS", 0);
+    if (mainchain_fee < 0 || mainchain_fee >= amount) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS must be non-negative and less than the withdrawal amount");
     }
 
     const uint64_t fee_sats = static_cast<uint64_t>(mainchain_fee);
@@ -337,6 +285,7 @@ static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
         DrivechainInputsCommitment(withdrawal_outpoint, sidechain_block_height);
     const CScript inputs_commitment_script =
         BuildDrivechainInputsCommitmentScript(withdrawal_commitment);
+    const CScript payout_script = BuildDrivechainPayoutScript(destination);
     const uint256 state_anchor = BuildWithdrawalStateAnchor(
         child_genesis,
         sidechain_block_height,
@@ -361,39 +310,54 @@ static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
     return bytes;
 }
 
-static wallet::DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundleImpl(
+static DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
     CAmount amount,
-    CAmount mainchain_fee,
-    const CScript& payout_script,
+    const std::string& destination,
     const COutPoint& withdrawal_outpoint,
     uint32_t sidechain_block_height,
+    const uint256& checkpoint_block_hash,
     const uint256& child_genesis,
     const uint256& previous_child_hash,
     const uint256& exchange_state_root)
 {
-    wallet::DrivechainWithdrawalBundle bundle;
+    DrivechainWithdrawalBundle bundle;
     bundle.bytes = BuildDrivechainWithdrawalBundleBytes(
         amount,
-        mainchain_fee,
-        payout_script,
+        destination,
         withdrawal_outpoint,
         sidechain_block_height,
         true,
         child_genesis,
         previous_child_hash,
         exchange_state_root);
-    const std::vector<unsigned char> no_witness_bytes = BuildDrivechainWithdrawalBundleBytes(
+    bundle.no_witness_bytes = BuildDrivechainWithdrawalBundleBytes(
         amount,
-        mainchain_fee,
-        payout_script,
+        destination,
         withdrawal_outpoint,
         sidechain_block_height,
         false,
         child_genesis,
         previous_child_hash,
         exchange_state_root);
-    bundle.m6id = Hash(no_witness_bytes);
+    bundle.checkpoint_height = sidechain_block_height;
+    bundle.checkpoint_block_hash = checkpoint_block_hash;
+    bundle.previous_child_hash = previous_child_hash;
+    bundle.exchange_state_root = exchange_state_root;
+    bundle.m6id = Hash(bundle.no_witness_bytes);
     return bundle;
+}
+
+static UniValue CallDrivechainConnectJSONResult(
+    const std::string& enforcer,
+    const std::string& method,
+    const UniValue& payload)
+{
+    UniValue result;
+    std::string error;
+    if (!CallDrivechainConnectJSON(enforcer, method, payload, result, &error)) {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("Drivechain enforcer request failed: %s", error));
+    }
+    return result;
 }
 
 static UniValue CallMainChainRPCResult(const std::string& method, const UniValue& params)
@@ -406,48 +370,112 @@ static UniValue CallMainChainRPCResult(const std::string& method, const UniValue
     return find_value(reply, "result");
 }
 
-static std::string FetchDrivechainWithdrawalBundleEventStatus(
-    const int sidechain_id,
-    const std::string& m6id_hex,
-    std::string& mainchain_tip)
+static std::string WithdrawalBundleEventStatus(const UniValue& event)
+{
+    const UniValue& status = event["event"];
+    if (!status.isObject()) return "";
+    if (!status["submitted"].isNull()) return "submitted";
+    if (!status["succeeded"].isNull()) return "succeeded";
+    if (!status["failed"].isNull()) return "failed";
+    return "";
+}
+
+static std::string FindWithdrawalBundleEventStatus(const UniValue& two_way_peg_data, const std::string& m6id_hex)
+{
+    const UniValue& blocks = two_way_peg_data["blocks"];
+    if (!blocks.isArray()) return "";
+
+    for (const UniValue& block : blocks.getValues()) {
+        const UniValue& events = block["blockInfo"]["events"];
+        if (!events.isArray()) continue;
+
+        for (const UniValue& event : events.getValues()) {
+            const UniValue& withdrawal_bundle = event["withdrawalBundle"];
+            if (!withdrawal_bundle.isObject()) continue;
+
+            const UniValue& m6id = withdrawal_bundle["m6id"]["hex"];
+            // The enforcer's ConsensusHex field is serialized byte order,
+            // whereas uint256::GetHex() is display order.
+            if (m6id.isStr()) {
+                const std::vector<unsigned char> consensus_bytes = ParseHex(m6id.get_str());
+                uint256 event_m6id;
+                if (consensus_bytes.size() == event_m6id.size()) {
+                    std::copy(consensus_bytes.begin(), consensus_bytes.end(), event_m6id.begin());
+                    if (event_m6id.GetHex() == m6id_hex) {
+                        return WithdrawalBundleEventStatus(withdrawal_bundle);
+                    }
+                }
+            }
+        }
+    }
+
+    return "";
+}
+
+static std::string FetchDrivechainWithdrawalBundleEventStatus(const int sidechain_id, const std::string& enforcer, const std::string& m6id_hex, std::string& mainchain_tip)
 {
     UniValue no_params(UniValue::VARR);
     mainchain_tip = CallMainChainRPCResult("getbestblockhash", no_params).get_str();
-    UniValue peg_data;
-    std::string error;
-    if (!GetDrivechainTwoWayPegData(sidechain_id, peg_data, &error)) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "Authenticated withdrawal status lookup failed: " + error);
-    }
-    if (!IsHex(m6id_hex) || m6id_hex.size() != 64) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Withdrawal bundle id must be 32-byte hex");
-    }
-    try {
-        return drivechain::GetWithdrawalBundleStatus(
-            peg_data, sidechain_id, uint256S(m6id_hex));
-    } catch (const std::exception& error) {
-        throw JSONRPCError(
-            RPC_VERIFY_REJECTED,
-            "Authenticated withdrawal event data is malformed: " +
-                std::string{error.what()});
-    }
+
+    UniValue end_block_hash(UniValue::VOBJ);
+    end_block_hash.pushKV("hex", mainchain_tip);
+
+    UniValue payload(UniValue::VOBJ);
+    payload.pushKV("sidechainId", sidechain_id);
+    payload.pushKV("endBlockHash", end_block_hash);
+
+    const UniValue peg_data = CallDrivechainConnectJSONResult(
+        enforcer,
+        "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
+        payload);
+    return FindWithdrawalBundleEventStatus(peg_data, m6id_hex);
 }
 
-static UniValue VerifyDrivechainWithdrawalBundleEvent(
-    const int sidechain_id,
-    const std::string& m6id_hex)
+static UniValue VerifyDrivechainWithdrawalBundleEvent(const int sidechain_id, const std::string& enforcer, const std::string& m6id_hex)
 {
     std::string mainchain_tip;
-    const std::string status = FetchDrivechainWithdrawalBundleEventStatus(
-        sidechain_id, m6id_hex, mainchain_tip);
+    const std::string status = FetchDrivechainWithdrawalBundleEventStatus(sidechain_id, enforcer, m6id_hex, mainchain_tip);
 
     UniValue verification(UniValue::VOBJ);
     verification.pushKV("mainchain_tip", mainchain_tip);
     verification.pushKV("m6id", m6id_hex);
     verification.pushKV("event_status", status.empty() ? "missing" : status);
 
+    if (status.empty()) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            strprintf(
+                "Drivechain withdrawal bundle broadcast returned, but the enforcer has no withdrawal bundle event for M6 id %s at L1 tip %s",
+                m6id_hex,
+                mainchain_tip));
+    }
+    if (status == "failed") {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("Drivechain withdrawal bundle M6 id %s is already marked failed on L1", m6id_hex));
+    }
+
     return verification;
+}
+
+static void ClearFinalDrivechainWithdrawalBundle()
+{
+    const uint256 current_bundle_hash = node::GetCurrentDrivechainWithdrawalBundleHash();
+    if (current_bundle_hash.IsNull()) {
+        return;
+    }
+
+    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
+    if (sidechain_id < 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
+    }
+
+    const std::string enforcer = GetEnvString(
+        "ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER",
+        gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051"));
+    std::string mainchain_tip;
+    const std::string status = FetchDrivechainWithdrawalBundleEventStatus(sidechain_id, enforcer, current_bundle_hash.GetHex(), mainchain_tip);
+    if (status == "succeeded" || status == "failed") {
+        node::ClearCurrentDrivechainWithdrawalBundleHash(current_bundle_hash);
+    }
 }
 
 class DrivechainWithdrawalBundleCreationGuard
@@ -462,7 +490,7 @@ public:
         bool creation_in_progress{false};
         if (!node::TryBeginDrivechainWithdrawalBundleCreation(current_bundle_hash, creation_in_progress)) {
             if (creation_in_progress) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "A drivechain withdrawal bundle is already being created; wait for submitdrivechainwithdrawal to finish before creating another bundle");
+                throw JSONRPCError(RPC_WALLET_ERROR, "A drivechain withdrawal bundle is already being created; wait for that sendtomainchain call to finish before creating another bundle");
             }
             throw JSONRPCError(RPC_WALLET_ERROR, strprintf(
                 "A drivechain withdrawal bundle is already active: %s. Wait for it to complete on L1 before creating another bundle",
@@ -478,17 +506,24 @@ public:
         }
     }
 
-    void Complete(const uint256& bundle_hash)
+    void Complete(const DrivechainWithdrawalBundle& bundle)
     {
-        node::CompleteDrivechainWithdrawalBundleCreation(bundle_hash);
+        node::CompleteDrivechainWithdrawalBundleCreation(
+            bundle.m6id,
+            node::DrivechainWithdrawalBundleEnvelope{
+                bundle.checkpoint_height,
+                bundle.checkpoint_block_hash,
+                bundle.no_witness_bytes});
         m_active = false;
     }
 };
 
-static UniValue BroadcastDrivechainWithdrawalBundle(
-    const wallet::DrivechainWithdrawalBundle& bundle)
+static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBundle& bundle)
 {
-    const int sidechain_id = DrivechainSidechainSlot();
+    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
+    if (sidechain_id < 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
+    }
 
     const std::string tx_base64 = EncodeBase64(MakeUCharSpan(bundle.bytes));
     const std::string tx_hex = HexStr(bundle.bytes);
@@ -498,35 +533,25 @@ static UniValue BroadcastDrivechainWithdrawalBundle(
     payload.pushKV("sidechainId", sidechain_id);
     payload.pushKV("transaction", tx_base64);
 
-    const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
-        "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
-        payload.write(),
-        std::chrono::seconds{30},
-        64U * 1024U);
-    if (!child.started || !child.exited || child.exit_code != 0 ||
-        child.timed_out || child.cancelled || child.output_truncated ||
-        !child.error.empty()) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            strprintf(
-                "Authenticated withdrawal submission failed: %s%s",
-                child.error,
-                child.output.empty() ? "" : strprintf(" (%s)", child.output)));
-    }
-    UniValue response;
-    if (!response.read(child.output) || !response.isObject()) {
-        throw JSONRPCError(
-            RPC_PARSE_ERROR,
-            "Authenticated enforcer returned a non-JSON withdrawal response");
-    }
-
+    const std::string enforcer = GetEnvString(
+        "ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER",
+        gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051"));
     UniValue result(UniValue::VOBJ);
     result.pushKV("enabled", true);
     result.pushKV("sidechain_id", sidechain_id);
-    result.pushKV("enforcer", GetDrivechainGrpcAddress(gArgs));
+    result.pushKV("enforcer", enforcer);
     result.pushKV("m6id", m6id_hex);
+    result.pushKV("checkpoint_height", static_cast<uint64_t>(bundle.checkpoint_height));
+    result.pushKV("checkpoint_block_hash", bundle.checkpoint_block_hash.GetHex());
+    result.pushKV("previous_child_hash", bundle.previous_child_hash.GetHex());
+    result.pushKV("exchange_state_root", bundle.exchange_state_root.GetHex());
     result.pushKV("withdrawal_bundle_hex", tx_hex);
-    result.pushKV("broadcast_response", response);
+    result.pushKV(
+        "broadcast_response",
+        CallDrivechainConnectJSONResult(
+            enforcer,
+            "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+            payload));
     return result;
 }
 
@@ -543,22 +568,6 @@ static CSecp256k1Init instance_of_csecp256k1;
 }
 
 namespace wallet {
-DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
-    const CAmount amount,
-    const CAmount mainchain_fee,
-    const CScript& payout_script,
-    const COutPoint& withdrawal_outpoint,
-    const uint32_t sidechain_block_height,
-    const uint256& child_genesis,
-    const uint256& previous_child_hash,
-    const uint256& exchange_state_root)
-{
-    return BuildDrivechainWithdrawalBundleImpl(
-        amount, mainchain_fee, payout_script, withdrawal_outpoint,
-        sidechain_block_height, child_genesis, previous_child_hash,
-        exchange_state_root);
-}
-
 RPCHelpMan signblock()
 {
     return RPCHelpMan{"signblock",
@@ -952,14 +961,14 @@ RPCHelpMan initpegoutwallet()
 RPCHelpMan sendtomainchain_base()
 {
     return RPCHelpMan{"sendtomainchain",
-                "\nCreates and broadcasts a sidechain withdrawal transaction. After it confirms "
-                "in a sidechain block, call submitdrivechainwithdrawal with the returned txid. "
-                "Only that second call can build the height-bound BIP300 M6 bundle.\n"
+                "\nSends sidechain funds to the given mainchain address through the BIP300 drivechain peg-out mechanism.\n"
+                "By default this RPC requires the enforcer to report the submitted withdrawal bundle in L1 two-way-peg data; "
+                "set ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT=0 only for diagnostics.\n"
                 + wallet::HELP_REQUIRING_PASSPHRASE,
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination address on the configured Bitcoin parent network."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination address on Bitcoin mainchain, or hex:<scriptPubKey>"},
                     {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The amount being sent to Bitcoin mainchain"},
-                    {"subtractfeefromamount", RPCArg::Type::BOOL, RPCArg::Default{false}, "Must be false; the M6 payout is bound to the exact committed burn amount."},
+                    {"subtractfeefromamount", RPCArg::Type::BOOL, RPCArg::Default{false}, "The fee will be deducted from the amount being pegged-out."},
                     {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, return extra information about the transaction."},
                 },
                 {
@@ -971,8 +980,7 @@ RPCHelpMan sendtomainchain_base()
                         {
                             {RPCResult::Type::STR_HEX, "txid", "The transaction id."},
                             {RPCResult::Type::STR, "fee reason", "The transaction fee reason."},
-                            {RPCResult::Type::STR, "withdrawal_status", "waiting_for_sidechain_confirmation"},
-                            {RPCResult::Type::STR, "next_rpc", "The follow-up RPC used after confirmation."}
+                            {RPCResult::Type::OBJ, "drivechain_pegout", "BIP300 withdrawal bundle broadcast result."}
                         },
                     },
                 },
@@ -982,6 +990,12 @@ RPCHelpMan sendtomainchain_base()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    const auto& consensus = Params().GetConsensus();
+    if (!consensus.elements_mode || !consensus.has_parent_chain) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "sendtomainchain is unavailable outside an Elements parent-chain configuration");
+    }
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
 
@@ -990,383 +1004,121 @@ RPCHelpMan sendtomainchain_base()
     EnsureWalletIsUnlocked(*pwallet);
 
     const std::string mainchain_destination = request.params[0].get_str();
-    const CScript payout_script = BuildDrivechainPayoutScript(mainchain_destination);
-    const CScript sidechain_withdrawal_script =
-        BuildDrivechainWithdrawalBurnScript(payout_script);
-    const CAmount amount = AmountFromValue(request.params[1]);
-    if (amount <= 0 || !MoneyRange(amount)) {
-        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid withdrawal amount");
+
+    CAmount nAmount = AmountFromValue(request.params[1]);
+    if (nAmount <= 0)
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for send");
+
+    bool subtract_fee = false;
+    if (request.params.size() > 2) {
+        subtract_fee = request.params[2].get_bool();
     }
-    if (request.params.size() > 2 && !request.params[2].isNull() &&
-        request.params[2].get_bool()) {
+
+    const std::vector<unsigned char> destination_bytes(mainchain_destination.begin(), mainchain_destination.end());
+    CScript mainchain_script;
+    mainchain_script << destination_bytes;
+
+    uint256 genesisBlockHash = Params().ParentGenesisBlockHash();
+
+    // Asset type is implicit, no need to add to script
+    NullData nulldata;
+    nulldata << std::vector<unsigned char>(genesisBlockHash.begin(), genesisBlockHash.end());
+    nulldata << std::vector<unsigned char>(mainchain_script.begin(), mainchain_script.end());
+    CTxDestination address(nulldata);
+    const CScript sidechain_withdrawal_script = GetScriptForDestination(address);
+
+    std::vector<CRecipient> recipients;
+    CRecipient recipient = {sidechain_withdrawal_script, nAmount, Params().GetConsensus().pegged_asset, CPubKey(), subtract_fee};
+    recipients.push_back(recipient);
+
+    /* Fail before SendMoney mutates the wallet or broadcasts a sidechain
+     * transaction.  The withdrawal bundle is inseparable from its finalized
+     * ECX checkpoint, so discovering a missing/wrong checkpoint afterwards
+     * would strand an unauthorizable pegout while returning an RPC error. */
+    CBlockIndex* const chain_tip = pwallet->chain().getTip();
+    if (chain_tip == nullptr || chain_tip->nHeight < 0 ||
+        static_cast<uint64_t>(chain_tip->nHeight) >
+            std::numeric_limits<uint32_t>::max()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Cannot determine sidechain height for drivechain withdrawal bundle");
+    }
+    if (GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24) != 24) {
         throw JSONRPCError(
             RPC_INVALID_PARAMETER,
-            "subtractfeefromamount is not supported for native drivechain withdrawals");
+            "ECX withdrawals are consensus-bound to BIP300 sidechain slot 24");
     }
-    const CAmount mainchain_fee = DrivechainPegoutMainchainFee(amount);
-    if (DrivechainSidechainSlot() != DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            strprintf("ECX withdrawals are consensus-bound to BIP300 sidechain slot %d",
-                DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT));
-    }
-
-    std::vector<CRecipient> recipients{
-        {sidechain_withdrawal_script, amount,
-         Params().GetConsensus().pegged_asset, CPubKey(), false},
-    };
-
-    mapValue_t metadata;
-    metadata[DRIVECHAIN_WITHDRAWAL_DESTINATION_KEY] = mainchain_destination;
-    metadata[DRIVECHAIN_WITHDRAWAL_AMOUNT_KEY] = ToString(amount);
-    metadata[DRIVECHAIN_WITHDRAWAL_MAIN_FEE_KEY] = ToString(mainchain_fee);
-    metadata[DRIVECHAIN_WITHDRAWAL_PAYOUT_SCRIPT_KEY] = HexStr(payout_script);
-    CCoinControl coin_control;
-    coin_control.m_include_unsafe_inputs = true;
-    UniValue send_result = SendMoney(
-        *pwallet, coin_control, recipients, std::move(metadata),
-        /*verbose=*/true, /*ignore_blind_fail=*/true);
-    const UniValue& txid = find_value(send_result, "txid");
-    if (!txid.isStr()) {
+    if (chain_tip->pprev == nullptr ||
+        (static_cast<uint32_t>(chain_tip->nVersion) &
+         CBlockHeader::EXCHANGE_STATE_HF_MASK) == 0 ||
+        chain_tip->hashExchangeStateRoot.IsNull()) {
         throw JSONRPCError(
             RPC_WALLET_ERROR,
-            "Created withdrawal transaction has no txid");
+            "Cannot withdraw before a finalized ECX state header is active");
+    }
+    const uint32_t checkpoint_height{static_cast<uint32_t>(chain_tip->nHeight)};
+    const uint256 checkpoint_block_hash{chain_tip->GetBlockHash()};
+    const uint256 previous_child_hash{chain_tip->pprev->GetBlockHash()};
+    const uint256 checkpoint_exchange_state_root{chain_tip->hashExchangeStateRoot};
+
+    EnsureWalletIsUnlocked(*pwallet);
+
+    bool verbose = request.params[3].isNull() ? false: request.params[3].get_bool();
+    mapValue_t mapValue;
+    CCoinControl no_coin_control; // This is a deprecated API
+    no_coin_control.m_include_unsafe_inputs = true;
+    ClearFinalDrivechainWithdrawalBundle();
+    DrivechainWithdrawalBundleCreationGuard withdrawal_bundle_creation;
+    UniValue send_result = SendMoney(*pwallet, no_coin_control, recipients, std::move(mapValue), true /* verbose */, true /* ignore_blind_fail */);
+
+    const std::string txid_str = send_result.isObject() ? find_value(send_result, "txid").get_str() : send_result.get_str();
+    const uint256 txid = uint256S(txid_str);
+    const CWalletTx* wtx = pwallet->GetWalletTx(txid);
+    if (wtx == nullptr || !wtx->tx) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Created pegout transaction is not available in the wallet");
     }
 
-    const bool verbose = request.params.size() > 3 &&
-        !request.params[3].isNull() && request.params[3].get_bool();
-    if (!verbose) return txid.get_str();
-    send_result.pushKV(
-        "withdrawal_status", "waiting_for_sidechain_confirmation");
-    send_result.pushKV("next_rpc", "submitdrivechainwithdrawal");
-    send_result.pushKV("mainchain_destination", mainchain_destination);
-    send_result.pushKV("mainchain_fee", ValueFromAmount(mainchain_fee));
-    return send_result;
-},
-    };
-}
-
-RPCHelpMan submitdrivechainwithdrawal()
-{
-    return RPCHelpMan{"submitdrivechainwithdrawal",
-                "\nBuild and submit the BIP300 M6 bundle for a confirmed sidechain withdrawal.\n"
-                "The transaction must have been created by sendtomainchain, must be confirmed in the "
-                "active sidechain, and must still contain the exact persisted withdrawal output. The M6 "
-                "is bound to that confirmation block's height, parent, and ECX state root.\n",
-                {
-                    {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The confirmed sidechain transaction returned by sendtomainchain."},
-                },
-                RPCResult{
-                    RPCResult::Type::OBJ, "", "",
-                    {
-                        {RPCResult::Type::STR_HEX, "txid", "The confirmed sidechain withdrawal transaction."},
-                        {RPCResult::Type::NUM, "sidechain_vout", "The exact withdrawal output index."},
-                        {RPCResult::Type::NUM, "sidechain_height", "The active confirmation height used by M6."},
-                        {RPCResult::Type::STR_HEX, "m6id", "The deterministic withdrawal bundle id."},
-                        {RPCResult::Type::STR, "withdrawal_status", "The durable lifecycle state."},
-                        {RPCResult::Type::OBJ, "broadcast", /*optional=*/true, "Authenticated enforcer response."},
-                    },
-                },
-                RPCExamples{
-                    HelpExampleCli("submitdrivechainwithdrawal", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
-    if (!pwallet) return NullUniValue;
-
-    const uint256 txid = ParseHashV(request.params[0], "txid");
-    CAmount amount{0};
-    CAmount mainchain_fee{0};
-    std::string destination;
-    CScript payout_script;
-    uint32_t withdrawal_vout{0};
-    uint32_t confirmation_height{0};
-    uint256 previous_child_hash;
-    uint256 exchange_state_root;
-
-    {
-        LOCK(pwallet->cs_wallet);
-        const CWalletTx* const wtx = pwallet->GetWalletTx(txid);
-        if (wtx == nullptr || !wtx->tx) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Withdrawal transaction is not in this wallet");
+    std::optional<uint32_t> withdrawal_vout;
+    for (uint32_t i = 0; i < wtx->tx->vout.size(); ++i) {
+        if (wtx->tx->vout[i].scriptPubKey == sidechain_withdrawal_script) {
+            withdrawal_vout = i;
+            break;
         }
-        const wallet::TxStateConfirmed* const confirmed =
-            wtx->state<wallet::TxStateConfirmed>();
-        if (confirmed == nullptr || pwallet->GetTxDepthInMainChain(*wtx) < 1) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Withdrawal is not confirmed in the active sidechain; wait for a sidechain block and retry");
-        }
-        if (confirmed->confirmed_block_height < 0 ||
-            static_cast<uint64_t>(confirmed->confirmed_block_height) >
-                std::numeric_limits<uint32_t>::max()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Withdrawal confirmation height is invalid");
-        }
-
-        bool active{false};
-        CBlock confirmation_block;
-        if (!pwallet->chain().findBlock(
-                confirmed->confirmed_block_hash,
-                interfaces::FoundBlock().inActiveChain(active).data(confirmation_block)) ||
-            !active || confirmation_block.IsNull()) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Withdrawal confirmation block is unavailable or no longer active");
-        }
-        if (confirmed->position_in_block < 0 ||
-            static_cast<size_t>(confirmed->position_in_block) >= confirmation_block.vtx.size() ||
-            confirmation_block.vtx[confirmed->position_in_block]->GetHash() != txid) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Wallet confirmation metadata does not match the sidechain block");
-        }
-        if ((static_cast<uint32_t>(confirmation_block.nVersion) &
-                CBlockHeader::EXCHANGE_STATE_HF_MASK) == 0 ||
-            confirmation_block.hashExchangeStateRoot.IsNull()) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Withdrawal confirmation block does not carry a finalized ECX state root");
-        }
-
-        const auto metadata = [&](const char* key) -> const std::string& {
-            const auto it = wtx->mapValue.find(key);
-            if (it == wtx->mapValue.end() || it->second.empty()) {
-                throw JSONRPCError(
-                    RPC_WALLET_ERROR,
-                    strprintf("Withdrawal transaction is missing required wallet metadata '%s'", key));
-            }
-            return it->second;
-        };
-        destination = metadata(DRIVECHAIN_WITHDRAWAL_DESTINATION_KEY);
-        int64_t parsed_amount{0};
-        int64_t parsed_fee{0};
-        if (!ParseInt64(metadata(DRIVECHAIN_WITHDRAWAL_AMOUNT_KEY), &parsed_amount) ||
-            parsed_amount <= 0 || !MoneyRange(parsed_amount) ||
-            !ParseInt64(metadata(DRIVECHAIN_WITHDRAWAL_MAIN_FEE_KEY), &parsed_fee) ||
-            parsed_fee <= 0 || parsed_fee >= parsed_amount || !MoneyRange(parsed_fee)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Withdrawal wallet metadata contains an invalid amount or mainchain fee");
-        }
-        amount = parsed_amount;
-        mainchain_fee = parsed_fee;
-
-        const std::string payout_script_hex =
-            metadata(DRIVECHAIN_WITHDRAWAL_PAYOUT_SCRIPT_KEY);
-        if (!IsHex(payout_script_hex)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Withdrawal payout script metadata is not hex");
-        }
-        const std::vector<unsigned char> payout_bytes = ParseHex(payout_script_hex);
-        payout_script = CScript(payout_bytes.begin(), payout_bytes.end());
-        if (payout_script.empty() || payout_script.IsUnspendable() ||
-            payout_script != BuildDrivechainPayoutScript(destination)) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Withdrawal destination and persisted payout script do not match");
-        }
-
-        const CScript burn_script =
-            BuildDrivechainWithdrawalBurnScript(payout_script);
-        std::optional<uint32_t> matched_vout;
-        for (uint32_t vout = 0; vout < wtx->tx->vout.size(); ++vout) {
-            const CTxOut& output = wtx->tx->vout[vout];
-            if (output.scriptPubKey != burn_script) continue;
-            if (!output.nAsset.IsExplicit() ||
-                output.nAsset.GetAsset() != Params().GetConsensus().pegged_asset ||
-                !output.nValue.IsExplicit() || output.nValue.GetAmount() != amount) {
-                throw JSONRPCError(
-                    RPC_WALLET_ERROR,
-                    "Withdrawal output no longer matches its persisted asset and amount");
-            }
-            if (matched_vout.has_value()) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Withdrawal transaction contains duplicate matching outputs");
-            }
-            matched_vout = vout;
-        }
-        if (!matched_vout.has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Withdrawal transaction does not contain its persisted burn output");
-        }
-
-        withdrawal_vout = *matched_vout;
-        confirmation_height = static_cast<uint32_t>(confirmed->confirmed_block_height);
-        previous_child_hash = confirmation_block.hashPrevBlock;
-        exchange_state_root = confirmation_block.hashExchangeStateRoot;
+    }
+    if (!withdrawal_vout.has_value()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Created pegout transaction does not contain the expected sidechain withdrawal output");
     }
 
-    if (DrivechainSidechainSlot() != DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            strprintf("ECX withdrawals are consensus-bound to BIP300 sidechain slot %d",
-                DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT));
-    }
-
-    const COutPoint withdrawal_outpoint(txid, withdrawal_vout);
-    const wallet::DrivechainWithdrawalBundle bundle =
-        wallet::BuildDrivechainWithdrawalBundle(
-            amount,
-            mainchain_fee,
-            payout_script,
-            withdrawal_outpoint,
-            confirmation_height,
-            Params().GetConsensus().hashGenesisBlock,
-            previous_child_hash,
-            exchange_state_root);
-
-    node::WithdrawalJournalEntry expected;
-    expected.m6id = bundle.m6id;
-    expected.sidechain_txid = txid;
-    expected.sidechain_vout = withdrawal_vout;
-    expected.sidechain_height = confirmation_height;
-    expected.amount = amount;
-    expected.mainchain_fee = mainchain_fee;
-    expected.destination = destination;
-    expected.payout_script = payout_script;
-    expected.sidechain_slot = DrivechainSidechainSlot();
-    expected.created_time = GetTime();
-    expected.bundle_bytes = bundle.bytes;
-
-    const fs::path data_dir = gArgs.GetDataDirNet();
-    node::WithdrawalJournalEntry journal;
-    std::string journal_error;
-    const node::WithdrawalJournalReadResult journal_result =
-        node::ReadWithdrawalJournal(data_dir, journal, &journal_error);
-    if (journal_result == node::WithdrawalJournalReadResult::CORRUPT) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            "Withdrawal journal is corrupt; refusing to submit or replace custody state: " + journal_error);
-    }
-
-    const auto same_withdrawal = [&](const node::WithdrawalJournalEntry& entry) {
-        return entry.m6id == expected.m6id &&
-            entry.sidechain_txid == expected.sidechain_txid &&
-            entry.sidechain_vout == expected.sidechain_vout &&
-            entry.sidechain_height == expected.sidechain_height &&
-            entry.amount == expected.amount &&
-            entry.mainchain_fee == expected.mainchain_fee &&
-            entry.destination == expected.destination &&
-            entry.payout_script == expected.payout_script &&
-            entry.sidechain_slot == expected.sidechain_slot &&
-            entry.bundle_bytes == expected.bundle_bytes;
-    };
-
-    bool replace_settled_journal{false};
-    if (journal_result == node::WithdrawalJournalReadResult::OK &&
-        !same_withdrawal(journal)) {
-        if (journal.GetState() != node::WithdrawalJournalState::SETTLED) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf(
-                    "A different withdrawal is already journalled (m6id %s); recover it before submitting another",
-                    journal.m6id.GetHex()));
-        }
-
-        const uint256 current = node::GetCurrentDrivechainWithdrawalBundleHash();
-        if (current == journal.m6id) {
-            node::ClearCurrentDrivechainWithdrawalBundleHash(journal.m6id);
-        } else if (!current.IsNull()) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf(
-                    "Settled journal m6id %s conflicts with active bundle %s",
-                    journal.m6id.GetHex(), current.GetHex()));
-        }
-        replace_settled_journal = true;
-    }
-
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("txid", txid.GetHex());
-    result.pushKV("sidechain_vout", static_cast<uint64_t>(withdrawal_vout));
-    result.pushKV("sidechain_height", static_cast<uint64_t>(confirmation_height));
-    result.pushKV("m6id", bundle.m6id.GetHex());
-    result.pushKV("mainchain_destination", destination);
-    result.pushKV("withdrawal_amount", ValueFromAmount(amount));
-    result.pushKV("mainchain_fee", ValueFromAmount(mainchain_fee));
-    result.pushKV("payout_amount", ValueFromAmount(amount - mainchain_fee));
-
-    if (journal_result == node::WithdrawalJournalReadResult::OK &&
-        same_withdrawal(journal) &&
-        journal.GetState() == node::WithdrawalJournalState::SETTLED) {
-        const uint256 current = node::GetCurrentDrivechainWithdrawalBundleHash();
-        if (current == journal.m6id) {
-            node::ClearCurrentDrivechainWithdrawalBundleHash(journal.m6id);
-        } else if (!current.IsNull()) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                strprintf(
-                    "Settled journal m6id %s conflicts with active bundle %s",
-                    journal.m6id.GetHex(), current.GetHex()));
-        }
-        result.pushKV("withdrawal_status", "settled");
-        result.pushKV("journal_retained", true);
-        return result;
-    }
-
-    const uint256 current_bundle =
-        node::GetCurrentDrivechainWithdrawalBundleHash();
-    if (!current_bundle.IsNull() && current_bundle != bundle.m6id) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            strprintf("A different withdrawal bundle is active: %s", current_bundle.GetHex()));
-    }
-
-    if (journal_result == node::WithdrawalJournalReadResult::OK &&
-        journal.GetState() == node::WithdrawalJournalState::BUNDLE_SUBMITTED) {
-        if (current_bundle.IsNull()) {
-            node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle.m6id);
-        }
-        result.pushKV("withdrawal_status", "bundle_submitted");
-        try {
-            result.pushKV(
-                "l1_event_verification",
-                VerifyDrivechainWithdrawalBundleEvent(
-                    DrivechainSidechainSlot(), bundle.m6id.GetHex()));
-        } catch (const UniValue& error) {
-            result.pushKV("l1_event_verification_error", error.write());
-        } catch (const std::exception& error) {
-            result.pushKV("l1_event_verification_error", error.what());
-        }
-        return result;
-    }
-
-    std::optional<DrivechainWithdrawalBundleCreationGuard> creation_guard;
-    if (current_bundle.IsNull()) {
-        creation_guard.emplace();
-    }
-
-    if (journal_result == node::WithdrawalJournalReadResult::MISSING ||
-        replace_settled_journal) {
-        if (!node::WriteWithdrawalJournal(data_dir, expected)) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Unable to durably journal the withdrawal; no M6 was submitted");
-        }
-        journal = expected;
-    }
-
-    result.pushKV("broadcast", BroadcastDrivechainWithdrawalBundle(bundle));
-
-    node::WithdrawalJournalEntry submitted = journal;
-    submitted.SetState(node::WithdrawalJournalState::BUNDLE_SUBMITTED);
-    if (!node::WriteWithdrawalJournal(data_dir, submitted)) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            "M6 was submitted, but the submitted journal state could not be persisted; retry is safe and uses the same M6");
-    }
-    if (creation_guard.has_value()) {
-        creation_guard->Complete(bundle.m6id);
-    }
-
-    result.pushKV("withdrawal_status", "bundle_submitted");
-    try {
-        result.pushKV(
+    const std::string tx_hex = EncodeHexTx(*wtx->tx, pwallet->chain().rpcSerializationFlags());
+    const COutPoint withdrawal_outpoint(txid, *withdrawal_vout);
+    const DrivechainWithdrawalBundle withdrawal_bundle = BuildDrivechainWithdrawalBundle(
+        nAmount,
+        mainchain_destination,
+        withdrawal_outpoint,
+        checkpoint_height,
+        checkpoint_block_hash,
+        Params().GetConsensus().hashGenesisBlock,
+        previous_child_hash,
+        checkpoint_exchange_state_root);
+    UniValue drivechain_result = BroadcastDrivechainWithdrawalBundle(withdrawal_bundle);
+    withdrawal_bundle_creation.Complete(withdrawal_bundle);
+    if (GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT", 1) != 0) {
+        drivechain_result.pushKV(
             "l1_event_verification",
             VerifyDrivechainWithdrawalBundleEvent(
-                DrivechainSidechainSlot(), bundle.m6id.GetHex()));
-    } catch (const UniValue& error) {
-        result.pushKV("l1_event_verification_error", error.write());
-    } catch (const std::exception& error) {
-        result.pushKV("l1_event_verification_error", error.what());
+                find_value(drivechain_result, "sidechain_id").get_int(),
+                find_value(drivechain_result, "enforcer").get_str(),
+                withdrawal_bundle.m6id.GetHex()));
     }
-    return result;
+    drivechain_result.pushKV("sidechain_pegout_tx_hex", tx_hex);
+    drivechain_result.pushKV("sidechain_withdrawal_vout", static_cast<int>(*withdrawal_vout));
+    drivechain_result.pushKV(
+        "sidechain_height", static_cast<uint64_t>(checkpoint_height));
+
+    if (!verbose) {
+        return txid_str;
+    }
+
+    send_result.pushKV("drivechain_pegout", drivechain_result);
+    return send_result;
 },
     };
 }
@@ -1645,207 +1397,6 @@ RPCHelpMan sendtomainchain_pak()
 RPCHelpMan sendtomainchain()
 {
     return sendtomainchain_base();
-}
-
-RPCHelpMan drivechainrecoverwithdrawal()
-{
-    return RPCHelpMan{"drivechainrecoverwithdrawal",
-                "\nInspect, and optionally resubmit, a drivechain withdrawal that is still in flight.\n"
-                "\nThe exact M6 is journalled before first submission. A crash or enforcer outage therefore\n"
-                "leaves a durable record instead of forcing reconstruction from chain state that may move.\n"
-                "This call reports that record and can resubmit the exact same bundle bytes.\n"
-                "\nResubmission is idempotent: the M6 identity is fixed by the journal, so retrying cannot\n"
-                "create a second, competing bundle.\n",
-                {
-                    {"resubmit", RPCArg::Type::BOOL, RPCArg::Default{false}, "Resubmit the journalled bundle to the enforcer."},
-                },
-                RPCResult{
-                    RPCResult::Type::OBJ, "", "",
-                    {
-                        {RPCResult::Type::BOOL, "pending", "whether a withdrawal is in flight"},
-                        {RPCResult::Type::STR_HEX, "m6id", /*optional=*/true, "the withdrawal bundle identity"},
-                        {RPCResult::Type::STR_HEX, "sidechain_txid", /*optional=*/true, "the sidechain spend"},
-                        {RPCResult::Type::NUM, "state", /*optional=*/true, "0 reserved, 1 legacy transition, 2 bundle submitted, 3 settled, 4 failed"},
-                        {RPCResult::Type::STR, "destination", /*optional=*/true, "the requested parent-chain destination"},
-                        {RPCResult::Type::STR_AMOUNT, "amount", /*optional=*/true, "withdrawal amount"},
-                        {RPCResult::Type::STR, "l1_status", /*optional=*/true, "enforcer view of the bundle"},
-                        {RPCResult::Type::BOOL, "journal_retained", /*optional=*/true, "whether the durable lifecycle record is retained for restart safety"},
-                    },
-                },
-                RPCExamples{
-                    HelpExampleCli("drivechainrecoverwithdrawal", "")
-            + HelpExampleCli("drivechainrecoverwithdrawal", "true")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    const fs::path data_dir = gArgs.GetDataDirNet();
-    node::WithdrawalJournalEntry journal;
-    std::string journal_error;
-    const node::WithdrawalJournalReadResult journal_result =
-        node::ReadWithdrawalJournal(data_dir, journal, &journal_error);
-
-    UniValue result(UniValue::VOBJ);
-    if (journal_result == node::WithdrawalJournalReadResult::MISSING) {
-        result.pushKV("pending", false);
-        return result;
-    }
-    if (journal_result == node::WithdrawalJournalReadResult::CORRUPT) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            "Withdrawal journal is corrupt; refusing recovery or replacement: " + journal_error);
-    }
-    if (journal.sidechain_slot != DrivechainSidechainSlot()) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            strprintf(
-                "Withdrawal journal belongs to sidechain slot %d, not configured slot %d",
-                journal.sidechain_slot, DrivechainSidechainSlot()));
-    }
-
-    result.pushKV("pending", journal.GetState() != node::WithdrawalJournalState::SETTLED);
-    result.pushKV("m6id", journal.m6id.GetHex());
-    result.pushKV("sidechain_txid", journal.sidechain_txid.GetHex());
-    result.pushKV("sidechain_vout", static_cast<uint64_t>(journal.sidechain_vout));
-    result.pushKV("sidechain_height", static_cast<uint64_t>(journal.sidechain_height));
-    result.pushKV("destination", journal.destination);
-    result.pushKV("amount", ValueFromAmount(journal.amount));
-    result.pushKV("mainchain_fee_sats", journal.mainchain_fee);
-    result.pushKV("mainchain_payout_script", HexStr(journal.payout_script));
-    result.pushKV("created_time", journal.created_time);
-    result.pushKV("journal_retained", true);
-
-    const int sidechain_id = DrivechainSidechainSlot();
-    const std::string m6id_hex = journal.m6id.GetHex();
-
-    std::string mainchain_tip;
-    std::string l1_status;
-    std::string status_error;
-    try {
-        l1_status = FetchDrivechainWithdrawalBundleEventStatus(
-            sidechain_id, m6id_hex, mainchain_tip);
-    } catch (const UniValue& error) {
-        status_error = error.write();
-    } catch (const std::exception& error) {
-        status_error = error.what();
-    }
-    if (!mainchain_tip.empty()) result.pushKV("mainchain_tip", mainchain_tip);
-    result.pushKV(
-        "l1_status",
-        status_error.empty() ? (l1_status.empty() ? "missing" : l1_status) : "unavailable");
-    if (!status_error.empty()) result.pushKV("l1_status_error", status_error);
-
-    // SETTLED is terminal even if removing the journal failed after the L1
-    // success was persisted. Never let an enforcer outage or an explicit
-    // resubmit request turn that durable completion record back into an active
-    // bundle.
-    if (journal.GetState() == node::WithdrawalJournalState::SETTLED) {
-        if (node::GetCurrentDrivechainWithdrawalBundleHash() == journal.m6id) {
-            node::ClearCurrentDrivechainWithdrawalBundleHash(journal.m6id);
-        }
-        result.pushKV("pending", false);
-        result.pushKV("state", int{journal.state});
-        result.pushKV("resubmitted", false);
-        return result;
-    }
-
-    if (l1_status == "succeeded") {
-        node::WithdrawalJournalEntry settled = journal;
-        settled.SetState(node::WithdrawalJournalState::SETTLED);
-        if (!node::WriteWithdrawalJournal(data_dir, settled)) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "Unable to persist the settled withdrawal state");
-        }
-        if (node::GetCurrentDrivechainWithdrawalBundleHash() == journal.m6id) {
-            node::ClearCurrentDrivechainWithdrawalBundleHash(journal.m6id);
-        }
-        result.pushKV("pending", false);
-        result.pushKV("state", int{settled.state});
-        return result;
-    }
-
-    const bool resubmit = !request.params[0].isNull() && request.params[0].get_bool();
-    if (resubmit && !status_error.empty()) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "Refusing to resubmit while authenticated L1/enforcer status is unavailable: " +
-                status_error);
-    }
-    if (l1_status == "failed") {
-        if (journal.GetState() != node::WithdrawalJournalState::FAILED) {
-            journal.SetState(node::WithdrawalJournalState::FAILED);
-            if (!node::WriteWithdrawalJournal(data_dir, journal)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to persist the failed withdrawal state");
-            }
-        }
-        if (node::GetCurrentDrivechainWithdrawalBundleHash() == journal.m6id) {
-            node::ClearCurrentDrivechainWithdrawalBundleHash(journal.m6id);
-        }
-        result.pushKV("action_required", "retry with resubmit=true after correcting the L1 rejection cause");
-        if (!resubmit) {
-            result.pushKV("state", int{journal.state});
-            return result;
-        }
-    }
-
-    if (l1_status == "submitted") {
-        if (journal.GetState() != node::WithdrawalJournalState::BUNDLE_SUBMITTED) {
-            journal.SetState(node::WithdrawalJournalState::BUNDLE_SUBMITTED);
-            if (!node::WriteWithdrawalJournal(data_dir, journal)) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to persist the submitted withdrawal state");
-            }
-        }
-        const uint256 current = node::GetCurrentDrivechainWithdrawalBundleHash();
-        if (!current.IsNull() && current != journal.m6id) {
-            throw JSONRPCError(RPC_WALLET_ERROR, "A different withdrawal bundle is active");
-        }
-        if (current.IsNull()) node::RestoreCurrentDrivechainWithdrawalBundleHash(journal.m6id);
-        result.pushKV("state", int{journal.state});
-        result.pushKV("resubmitted", false);
-        result.pushKV("note", "the enforcer already holds this bundle; no resubmission was needed");
-        return result;
-    }
-
-    if (!resubmit) {
-        result.pushKV("state", int{journal.state});
-        return result;
-    }
-
-    const uint256 current = node::GetCurrentDrivechainWithdrawalBundleHash();
-    if (!current.IsNull() && current != journal.m6id) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            strprintf("A different withdrawal bundle is active: %s", current.GetHex()));
-    }
-    std::optional<DrivechainWithdrawalBundleCreationGuard> creation_guard;
-    if (current.IsNull()) creation_guard.emplace();
-
-    wallet::DrivechainWithdrawalBundle bundle;
-    bundle.bytes = journal.bundle_bytes;
-    bundle.m6id = journal.m6id;
-    result.pushKV("broadcast", BroadcastDrivechainWithdrawalBundle(bundle));
-    result.pushKV("resubmitted", true);
-
-    node::WithdrawalJournalEntry submitted = journal;
-    submitted.SetState(node::WithdrawalJournalState::BUNDLE_SUBMITTED);
-    if (!node::WriteWithdrawalJournal(data_dir, submitted)) {
-        throw JSONRPCError(
-            RPC_WALLET_ERROR,
-            "M6 was resubmitted, but the submitted journal state could not be persisted; retry remains safe");
-    }
-    if (creation_guard.has_value()) creation_guard->Complete(journal.m6id);
-    result.pushKV("state", int{submitted.state});
-
-    try {
-        result.pushKV(
-            "l1_event_verification",
-            VerifyDrivechainWithdrawalBundleEvent(sidechain_id, m6id_hex));
-    } catch (const UniValue& error) {
-        result.pushKV("l1_event_verification_error", error.write());
-    } catch (const std::exception& error) {
-        result.pushKV("l1_event_verification_error", error.what());
-    }
-    return result;
-},
-    };
 }
 
 extern UniValue signrawtransaction(const JSONRPCRequest& request);
@@ -2167,14 +1718,12 @@ RPCHelpMan importdrivechaindeposit()
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The Elements address to credit."},
                     {"value_sats", RPCArg::Type::NUM, RPCArg::Optional::NO, "The deposit value in satoshis."},
                     {"fee_sats", RPCArg::Type::NUM, RPCArg::Default{1000}, "The sidechain relay fee to subtract from the credited output."},
-                    {"mainchain_vout", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Exact mainchain deposit output. If omitted, it is inferred only when authenticated slot data has one unambiguous txid/address/value match."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
                     {
                         {RPCResult::Type::STR_HEX, "txid", "The deterministic wallet credit transaction id."},
                         {RPCResult::Type::STR_HEX, "mainchain_txid", "The mainchain deposit transaction id."},
-                        {RPCResult::Type::NUM, "mainchain_vout", "The authenticated mainchain deposit output index."},
                         {RPCResult::Type::STR, "address", "The credited Elements address."},
                         {RPCResult::Type::STR_AMOUNT, "amount", "The credited amount in pegged asset units."},
                         {RPCResult::Type::NUM, "value_sats", "The credited amount in satoshis."},
@@ -2186,15 +1735,20 @@ RPCHelpMan importdrivechaindeposit()
                     },
                 },
                 RPCExamples{
-                    HelpExampleCli("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" \"el1qq...\" 100000 1000 2")
-            + HelpExampleRpc("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", \"el1qq...\", 100000, 1000, 2")
+                    HelpExampleCli("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" \"el1qq...\" 100000")
+            + HelpExampleRpc("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", \"el1qq...\", 100000")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    const auto& consensus = Params().GetConsensus();
+    if (!consensus.elements_mode || !consensus.has_parent_chain) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "importdrivechaindeposit is unavailable outside an Elements parent-chain configuration");
+    }
     std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
     if (!wallet) return NullUniValue;
     CWallet* const pwallet = wallet.get();
-    pwallet->BlockUntilSyncedToCurrentChain();
 
     const std::string mainchain_txid_str = request.params[0].get_str();
     if (!IsHex(mainchain_txid_str) || mainchain_txid_str.size() != 64) {
@@ -2205,14 +1759,6 @@ RPCHelpMan importdrivechaindeposit()
     const CTxDestination dest = DecodeDestination(address);
     if (!IsValidDestination(dest)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Elements address");
-    }
-    {
-        LOCK(pwallet->cs_wallet);
-        if (!(pwallet->IsMine(dest) & ISMINE_SPENDABLE)) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "Deposit address is not spendable by this wallet");
-        }
     }
 
     int64_t value_sats{0};
@@ -2245,81 +1791,10 @@ RPCHelpMan importdrivechaindeposit()
     const CAmount amount = value_sats - fee_sats;
 
     const uint256 mainchain_txid = uint256S(mainchain_txid_str);
-    uint32_t mainchain_vout{0};
-    if (request.params.size() > 4 && !request.params[4].isNull()) {
-        int64_t parsed_vout{-1};
-        if (request.params[4].isNum()) {
-            parsed_vout = request.params[4].get_int64();
-        } else if (request.params[4].isStr() &&
-                   ParseInt64(request.params[4].get_str(), &parsed_vout)) {
-        } else {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "mainchain_vout must be a non-negative integer");
-        }
-        if (parsed_vout < 0 ||
-            static_cast<uint64_t>(parsed_vout) > std::numeric_limits<uint32_t>::max()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "mainchain_vout is out of range");
-        }
-        mainchain_vout = static_cast<uint32_t>(parsed_vout);
-    } else {
-        UniValue two_way_peg_data;
-        std::string lookup_error;
-        if (!GetDrivechainTwoWayPegData(
-                DrivechainSidechainSlot(), two_way_peg_data, &lookup_error)) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "Unable to infer mainchain_vout from authenticated enforcer data: " + lookup_error);
-        }
-
-        UniValue events;
-        try {
-            events = drivechain::NormalizeL1PegEvents(
-                two_way_peg_data, DrivechainSidechainSlot());
-        } catch (const std::exception& error) {
-            throw JSONRPCError(
-                RPC_VERIFY_REJECTED,
-                "Authenticated deposit event data is malformed: " + std::string{error.what()});
-        }
-
-        const std::string address_hex = HexStr(std::vector<unsigned char>(address.begin(), address.end()));
-        std::optional<uint32_t> inferred_vout;
-        for (const UniValue& event : events.getValues()) {
-            if (!event.isObject() || !event["kind"].isStr() ||
-                event["kind"].get_str() != "deposit" ||
-                !event["mainchain_txid"].isStr() ||
-                !IsHex(event["mainchain_txid"].get_str()) ||
-                event["mainchain_txid"].get_str().size() != 64 ||
-                uint256S(event["mainchain_txid"].get_str()) != mainchain_txid ||
-                !event["address_hex"].isStr() ||
-                event["address_hex"].get_str() != address_hex ||
-                !event["value_sats"].isNum() ||
-                event["value_sats"].get_int64() != value_sats ||
-                !event["mainchain_vout"].isNum()) {
-                continue;
-            }
-            const int64_t candidate = event["mainchain_vout"].get_int64();
-            if (candidate < 0 ||
-                static_cast<uint64_t>(candidate) > std::numeric_limits<uint32_t>::max()) {
-                throw JSONRPCError(RPC_VERIFY_REJECTED, "Authenticated deposit event has an invalid vout");
-            }
-            if (inferred_vout.has_value()) {
-                throw JSONRPCError(
-                    RPC_INVALID_PARAMETER,
-                    "More than one authenticated deposit output matches txid/address/value; specify mainchain_vout explicitly");
-            }
-            inferred_vout = static_cast<uint32_t>(candidate);
-        }
-        if (!inferred_vout.has_value()) {
-            throw JSONRPCError(
-                RPC_VERIFY_REJECTED,
-                "No authenticated slot deposit matches the supplied txid, address, and value");
-        }
-        mainchain_vout = *inferred_vout;
-    }
-
     CMutableTransaction mtx;
     mtx.nVersion = 2;
 
-    CTxIn pegin_input(COutPoint(mainchain_txid, mainchain_vout), CScript(), CTxIn::SEQUENCE_FINAL);
+    CTxIn pegin_input(COutPoint(mainchain_txid, 0), CScript(), CTxIn::SEQUENCE_FINAL);
     pegin_input.m_is_pegin = true;
     mtx.vin.push_back(pegin_input);
     mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, amount, GetScriptForDestination(dest)));
@@ -2359,50 +1834,33 @@ RPCHelpMan importdrivechaindeposit()
     const uint256 side_txid = tx_ref->GetHash();
     const std::string tx_hex = EncodeHexTx(*tx_ref);
     bool already_imported;
-    bool already_confirmed{false};
     {
         LOCK(pwallet->cs_wallet);
-        const CWalletTx* const wallet_tx = pwallet->GetWalletTx(side_txid);
-        already_imported = wallet_tx != nullptr;
-        already_confirmed = wallet_tx != nullptr &&
-            pwallet->GetTxDepthInMainChain(*wallet_tx) > 0;
+        already_imported = pwallet->GetWalletTx(side_txid) != nullptr;
     }
     bool broadcast = false;
 
-    // A wallet record alone is not evidence that an unconfirmed import is
-    // still in the mempool. Always rebroadcast non-confirmed imports so a
-    // restart or mempool eviction cannot leave a valid deposit stranded while
-    // this RPC misleadingly reports success.
-    if (!already_confirmed) {
+    if (!already_imported) {
         std::string err_string;
         if (pwallet->chain().broadcastTransaction(tx_ref, /*max_tx_fee=*/0, /*relay=*/true, err_string)) {
             broadcast = true;
-            // Do not make the UI wait for the asynchronous mempool callback
-            // before it can display the newly credited output.
-            pwallet->transactionAddedToMempool(tx_ref, /*mempool_sequence=*/0);
-        } else if (err_string.find("txn-already-in-mempool") != std::string::npos) {
-            already_imported = true;
-            pwallet->transactionAddedToMempool(tx_ref, /*mempool_sequence=*/0);
         } else if (err_string.find("already in block chain") != std::string::npos ||
+                   err_string.find("txn-already-in-mempool") != std::string::npos ||
                    err_string.find("Transaction already in block chain") != std::string::npos) {
-            throw JSONRPCError(
-                RPC_WALLET_ERROR,
-                "The authenticated deposit is already confirmed, but this wallet has not indexed it; "
-                "run rescanblockchain for the deposit height, then retry importdrivechaindeposit");
+            already_imported = true;
         } else {
             throw JSONRPCError(RPC_TRANSACTION_REJECTED, err_string);
         }
     }
 
     UniValue ret(UniValue::VOBJ);
-    ret.pushKV("txid", side_txid.GetHex());
-    ret.pushKV("mainchain_txid", mainchain_txid.GetHex());
-    ret.pushKV("mainchain_vout", static_cast<uint64_t>(mainchain_vout));
-    ret.pushKV("address", address);
-    ret.pushKV("amount", ValueFromAmount(amount));
-    ret.pushKV("value_sats", value_sats);
-    ret.pushKV("deposit_value_sats", deposit_amount);
-    ret.pushKV("fee_sats", fee_sats);
+        ret.pushKV("txid", side_txid.GetHex());
+        ret.pushKV("mainchain_txid", mainchain_txid.GetHex());
+        ret.pushKV("address", address);
+        ret.pushKV("amount", ValueFromAmount(amount));
+        ret.pushKV("value_sats", value_sats);
+        ret.pushKV("deposit_value_sats", deposit_amount);
+        ret.pushKV("fee_sats", fee_sats);
     ret.pushKV("hex", tx_hex);
     ret.pushKV("already_imported", already_imported);
     ret.pushKV("broadcast", broadcast);

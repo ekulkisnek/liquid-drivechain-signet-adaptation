@@ -37,6 +37,7 @@ namespace node {
 namespace {
 Mutex g_current_drivechain_withdrawal_bundle_mutex;
 uint256 g_current_drivechain_withdrawal_bundle_hash GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex);
+std::optional<DrivechainWithdrawalBundleEnvelope> g_current_drivechain_withdrawal_bundle_envelope GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex);
 bool g_drivechain_withdrawal_bundle_creation_in_progress GUARDED_BY(g_current_drivechain_withdrawal_bundle_mutex) = false;
 } // namespace
 
@@ -46,10 +47,17 @@ uint256 GetCurrentDrivechainWithdrawalBundleHash()
     return g_current_drivechain_withdrawal_bundle_hash;
 }
 
+std::optional<DrivechainWithdrawalBundleEnvelope> GetCurrentDrivechainWithdrawalBundleEnvelope()
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    return g_current_drivechain_withdrawal_bundle_envelope;
+}
+
 void RestoreCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
 {
     LOCK(g_current_drivechain_withdrawal_bundle_mutex);
     g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
+    g_current_drivechain_withdrawal_bundle_envelope.reset();
     g_drivechain_withdrawal_bundle_creation_in_progress = false;
 }
 
@@ -69,6 +77,17 @@ void CompleteDrivechainWithdrawalBundleCreation(const uint256& bundle_hash)
 {
     LOCK(g_current_drivechain_withdrawal_bundle_mutex);
     g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
+    g_current_drivechain_withdrawal_bundle_envelope.reset();
+    g_drivechain_withdrawal_bundle_creation_in_progress = false;
+}
+
+void CompleteDrivechainWithdrawalBundleCreation(
+    const uint256& bundle_hash,
+    DrivechainWithdrawalBundleEnvelope envelope)
+{
+    LOCK(g_current_drivechain_withdrawal_bundle_mutex);
+    g_current_drivechain_withdrawal_bundle_hash = bundle_hash;
+    g_current_drivechain_withdrawal_bundle_envelope = std::move(envelope);
     g_drivechain_withdrawal_bundle_creation_in_progress = false;
 }
 
@@ -85,6 +104,7 @@ bool ClearCurrentDrivechainWithdrawalBundleHash(const uint256& bundle_hash)
         return false;
     }
     g_current_drivechain_withdrawal_bundle_hash.SetNull();
+    g_current_drivechain_withdrawal_bundle_envelope.reset();
     return true;
 }
 
@@ -201,13 +221,32 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     assert(pindexPrev != nullptr);
     nHeight = pindexPrev->nHeight + 1;
 
+    const ecx::ExchangeConsensus& ecx_consensus = ecx::LayerTwoLabsExchangeConsensus();
+    m_ecx_source_append_budget = 0;
+    m_ecx_source_appends_selected = 0;
+    if (chainparams.GetConsensus().elements_mode &&
+        nHeight > ecx_consensus.activation_height) {
+        ecx::ExchangeConsensusSnapshot snapshot;
+        std::string snapshot_error;
+        if (!ecx::GetExchangeConsensusSnapshot(
+                m_chainstate.CoinsTip(), pindexPrev, snapshot, snapshot_error)) {
+            throw std::runtime_error(
+                "CreateNewBlock(): cannot read ECX source backlog: " + snapshot_error);
+        }
+        if (!ecx::ComputeSourceAppendBudget(
+                snapshot, m_ecx_source_append_budget, snapshot_error)) {
+            throw std::runtime_error("CreateNewBlock(): " + snapshot_error);
+        }
+    }
+
     pblock->nVersion = g_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
     // -regtest only: allow overriding block.nVersion with
     // -blockversion=N to test forking scenarios
     if (chainparams.MineBlocksOnDemand()) {
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
     }
-    if (drivechain::BmmProofRequiredAfter(pindexPrev)) {
+    if (chainparams.GetConsensus().elements_mode &&
+        drivechain::BmmProofRequiredAfter(pindexPrev)) {
         pblock->nVersion |= CBlockHeader::BMM_PROOF_HF_MASK;
     }
 
@@ -225,7 +264,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // transaction (which in most cases can be a no-op).
     fIncludeWitness = DeploymentActiveAfter(pindexPrev, chainparams.GetConsensus(), Consensus::DEPLOYMENT_SEGWIT);
 
-    if (DeploymentActiveAfter(pindexPrev, chainparams.GetConsensus(), Consensus::DEPLOYMENT_DYNA_FED)) {
+    if (chainparams.GetConsensus().elements_mode &&
+        DeploymentActiveAfter(pindexPrev, chainparams.GetConsensus(), Consensus::DEPLOYMENT_DYNA_FED)) {
         const DynaFedParamEntry current_params = ComputeNextBlockCurrentParameters(m_chainstate.m_chain.Tip(), chainparams.GetConsensus());
         const DynaFedParams block_params(current_params, proposed_entry ? *proposed_entry : DynaFedParamEntry());
         pblock->m_dynafed_params = block_params;
@@ -270,6 +310,32 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         }
     }
     coinbaseTx.vin[0].scriptSig = CScript() << nHeight << OP_0;
+    const uint256 withdrawal_bundle_hash =
+        chainparams.GetConsensus().elements_mode &&
+            chainparams.GetConsensus().has_parent_chain
+        ? GetCurrentDrivechainWithdrawalBundleHash()
+        : uint256::ZERO;
+    if (chainparams.GetConsensus().elements_mode &&
+        !withdrawal_bundle_hash.IsNull() &&
+        (withdrawal_bundle_hash != pindexPrev->hashWithdrawalBundle ||
+         (static_cast<uint32_t>(pindexPrev->nVersion) &
+          CBlockHeader::EXCHANGE_STATE_HF_MASK) == 0)) {
+        const auto envelope = GetCurrentDrivechainWithdrawalBundleEnvelope();
+        if (!envelope.has_value() || Hash(envelope->m6_no_witness) != withdrawal_bundle_hash) {
+            throw std::runtime_error(
+                "CreateNewBlock(): new withdrawal bundle lacks its authenticated M6 preimage");
+        }
+        coinbaseTx.vout.insert(
+            std::prev(coinbaseTx.vout.end()),
+            CTxOut(
+                policyAsset,
+                0,
+                ecx::BuildWithdrawalBundleEnvelopeScript(
+                    ecx::WithdrawalBundleEnvelopeV1{
+                        envelope->checkpoint_height,
+                        envelope->checkpoint_block_hash,
+                        envelope->m6_no_witness})));
+    }
     // Non-consensus commitment output before finishing coinbase transaction
     if (commit_scripts && !commit_scripts->empty()) {
         for (auto commit_script: *commit_scripts) {
@@ -284,17 +350,34 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
 
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
-    pblock->hashWithdrawalBundle = GetCurrentDrivechainWithdrawalBundleHash();
+    pblock->hashWithdrawalBundle = withdrawal_bundle_hash;
     std::string exchange_error;
-    if (!ecx::PrepareExchangeStateHeader(
-            *pblock,
-            pindexPrev,
-            m_chainstate.CoinsTip(),
-            nHeight,
-            exchange_error,
-            ecx::LayerTwoLabsExchangeConsensus(),
-            authenticated_parent_height)) {
-        throw std::runtime_error("CreateNewBlock(): " + exchange_error);
+    // All block-template paths, including regtest's generatetoaddress RPC,
+    // must commit the authenticated BMM parent height when one is available.
+    // Previously only the L1-sync miner supplied it, so a private checkpoint
+    // produced an internally accepted header whose ECX parent height disagreed
+    // with the BMM chainstate exposed to Simplicity and RPC consumers.
+    if (chainparams.GetConsensus().elements_mode) {
+        if (!authenticated_parent_height.has_value()) {
+            drivechain::BmmL1State bmm_state;
+            drivechain::BmmParentContext bmm_parent;
+            std::string bmm_error;
+            if (drivechain::GetEffectiveBmmState(
+                    m_chainstate.CoinsTip(), pindexPrev, bmm_state, bmm_error) &&
+                drivechain::GetBmmParentContext(bmm_state, bmm_parent, bmm_error)) {
+                authenticated_parent_height = bmm_parent.height;
+            }
+        }
+        if (!ecx::PrepareExchangeStateHeader(
+                *pblock,
+                pindexPrev,
+                m_chainstate.CoinsTip(),
+                nHeight,
+                exchange_error,
+                ecx::LayerTwoLabsExchangeConsensus(),
+                authenticated_parent_height)) {
+            throw std::runtime_error("CreateNewBlock(): " + exchange_error);
+        }
     }
     UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     pblock->nBits          = g_signed_blocks ? 0 : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
@@ -305,7 +388,15 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     pblocktemplate->vTxSigOpsCost[0] = WITNESS_SCALE_FACTOR * GetLegacySigOpCount(*pblock->vtx[0]);
 
     BlockValidationState state;
-    if (!TestBlockValidity(state, chainparams, m_chainstate, *pblock, pindexPrev, false, false)) {
+    if (!TestBlockValidity(
+            state,
+            chainparams,
+            m_chainstate,
+            *pblock,
+            pindexPrev,
+            false,
+            false,
+            true)) {
         throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, state.ToString()));
     }
     int64_t nTime2 = GetTimeMicros();
@@ -577,11 +668,45 @@ void BlockAssembler::addPackageTxs(int& nPackagesSelected, int& nDescendantsUpda
         std::vector<CTxMemPool::txiter> sortedEntries;
         SortForBlock(ancestors, sortedEntries);
 
+        uint64_t package_source_appends{0};
+        bool source_package_valid{true};
+        if (chainparams.GetConsensus().elements_mode) {
+            for (const CTxMemPool::txiter& entry : sortedEntries) {
+                uint64_t forced_count{0};
+                uint64_t deposit_count{0};
+                std::string source_error;
+                if (!ecx::CountSourceTransactionMarkers(
+                        entry->GetTx(),
+                        forced_count,
+                        deposit_count,
+                        source_error,
+                        ecx::LayerTwoLabsExchangeConsensus()) ||
+                    forced_count > std::numeric_limits<uint64_t>::max() - deposit_count ||
+                    package_source_appends >
+                        std::numeric_limits<uint64_t>::max() - forced_count - deposit_count) {
+                    source_package_valid = false;
+                    break;
+                }
+                package_source_appends += forced_count + deposit_count;
+            }
+        }
+        if (!source_package_valid ||
+            m_ecx_source_appends_selected > m_ecx_source_append_budget ||
+            package_source_appends >
+                m_ecx_source_append_budget - m_ecx_source_appends_selected) {
+            if (fUsingModified) {
+                mapModifiedTx.get<confidential_score>().erase(modit);
+                failedTx.insert(iter);
+            }
+            continue;
+        }
+
         for (size_t i = 0; i < sortedEntries.size(); ++i) {
             AddToBlock(sortedEntries[i]);
             // Erase from the modified set, if present
             mapModifiedTx.erase(sortedEntries[i]);
         }
+        m_ecx_source_appends_selected += package_source_appends;
 
         ++nPackagesSelected;
 

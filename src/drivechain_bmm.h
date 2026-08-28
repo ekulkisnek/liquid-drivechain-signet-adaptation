@@ -15,6 +15,7 @@
 #include <vector>
 
 class CBlockIndex;
+class CCoinsView;
 class CCoinsViewCache;
 
 namespace drivechain {
@@ -101,6 +102,9 @@ struct BmmConsensus
     int sidechain_slot{BMM_SIDECHAIN_SLOT};
     size_t max_entries{MAX_BMM_PROOF_ENTRIES};
     size_t max_proof_bytes{MAX_BMM_PROOF_BYTES};
+    // Appended so legacy seven-field aggregate initializers retain their
+    // original field mapping and safely default to public signet validation.
+    bool require_signet_solution{true};
 
     int64_t DifficultyAdjustmentInterval() const
     {
@@ -114,15 +118,41 @@ const BmmL1State& LayerTwoLabsInitialBmmState();
 const uint256& LayerTwoLabsPublicSidechainBlock1();
 const uint256& LayerTwoLabsPublicSidechainBlock2();
 
+/** Canonical identity of every selected BMM rule/bootstrap constant. */
+uint256 RuntimeBmmConsensusFingerprint();
+
+/** Detect a connected BMM tracker while first-binding a legacy datadir. */
+bool HasPersistedBmmConsensusState(const CCoinsView& view);
+
+/** Prevent transactions from naming the synthetic BMM chainstate record. */
+bool IsBmmStateInternalOutpoint(const COutPoint& outpoint);
+
 /** Header activation and critical-hash rules for the public slot-24 branch. */
 bool BmmProofRequiredAfter(const CBlockIndex* previous);
-bool CheckBmmHeader(const CBlockHeader& block, const CBlockIndex* previous, std::string& error);
+bool CheckBmmHeader(
+    const CBlockHeader& block,
+    const CBlockIndex* previous,
+    std::string& error,
+    bool allow_incomplete_candidate = false);
+
+/** Revalidate the BMM commitments of an already-persisted block-index entry. */
+bool CheckBmmIndexHeader(
+    const CBlockIndex& index,
+    std::string& error);
 
 /** Canonical proof encoding and header commitment. */
 bool SerializeBmmProof(const BmmProof& proof, std::vector<unsigned char>& bytes, std::string& error);
 bool DeserializeBmmProof(const std::vector<unsigned char>& bytes, BmmProof& proof, std::string& error);
 uint256 BmmProofCommitment(const std::vector<unsigned char>& bytes);
 bool AttachBmmProof(CBlock& block, const BmmProof& proof, std::string& error);
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+/** Build one valid synthetic parent successor for explicit private regtest only. */
+bool BuildPrivateE2eBmmProof(
+    const BmmL1State& previous,
+    const uint256& critical_hash,
+    BmmProof& proof,
+    std::string& error);
+#endif
 
 /** Deterministic proof verification, with injectable parameters for focused tests. */
 bool VerifyBmmProof(

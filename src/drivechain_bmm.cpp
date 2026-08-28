@@ -9,6 +9,7 @@
 #include <chainparams.h>
 #include <coins.h>
 #include <consensus/consensus.h>
+#include <crypto/sha256.h>
 #include <hash.h>
 #include <primitives/bitcoin/merkleblock.h>
 #include <primitives/bitcoin/transaction.h>
@@ -55,33 +56,25 @@ const BmmConsensus LAYER_TWO_LABS_CONSENSUS{
     }(),
     BMM_SIDECHAIN_SLOT,
     MAX_BMM_PROOF_ENTRIES,
-    MAX_BMM_PROOF_BYTES};
+    MAX_BMM_PROOF_BYTES,
+    true};
 
-/**
- * Sidechain height from which strict BMM is mandatory on this deployment.
- *
- * Unset by default, which preserves the existing public-Signet behaviour. A
- * newly activated chain must set it -- and every node must agree on the value,
- * exactly as with any other consensus boundary -- so that the chain has a
- * defined point at which BMM enforcement begins.
- */
-std::optional<int> BmmActivationHeight()
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+const BmmConsensus PRIVATE_E2E_REGTEST_CONSENSUS{
+    uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+    14 * 24 * 60 * 60,
+    10 * 60,
+    CScript{},
+    BMM_SIDECHAIN_SLOT,
+    MAX_BMM_PROOF_ENTRIES,
+    MAX_BMM_PROOF_BYTES,
+    false};
+
+bool PrivateE2eBmmEnabled()
 {
-    static const std::optional<int> cached = [] () -> std::optional<int> {
-        const int64_t height = gArgs.GetIntArg("-drivechainbmmactivationheight", -1);
-        if (height < 0) return std::nullopt;
-        if (height == 0) {
-            throw std::runtime_error(
-                "-drivechainbmmactivationheight must be greater than 0; the genesis block "
-                "cannot carry a BMM proof");
-        }
-        if (height > std::numeric_limits<int>::max()) {
-            throw std::runtime_error("-drivechainbmmactivationheight is out of range");
-        }
-        return static_cast<int>(height);
-    }();
-    return cached;
+    return gArgs.GetBoolArg("-ecxprivatebmmcheckpoint", false);
 }
+#endif
 
 const BmmL1State LAYER_TWO_LABS_INITIAL_STATE{
     uint256S("0000031bb69e844ed1ebd48cc0ab6cee90de29fb98ff7fb439d49b0b19747665"),
@@ -103,6 +96,91 @@ const BmmL1State LAYER_TWO_LABS_INITIAL_STATE{
         1784825405,
         1784826005,
     }};
+
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+// Test-only checkpoint matching the independently replayed private Truthcoin
+// witness used by the Windows full-covenant E2E.  This is deliberately behind
+// the same compile-time boundary as the private jet catalogue and additionally
+// requires an explicit runtime flag.  Public builds cannot select it.
+const BmmL1State PRIVATE_E2E_REPLAY_CHECKPOINT{
+    // uint256 stores consensus bytes little-endian. This visual value is the
+    // reverse of ProofBindingV1's raw 9f8d...4f63 byte record.
+    uint256S("634fe8d468190cd24fee51a626f17aa7435723503fc389ce6c1af778f9728d9f"),
+    2096,
+    1802055061,
+    0x207fffff,
+    2016,
+    1786323045,
+    {
+        1802055058,
+        1802055058,
+        1802055059,
+        1802055058,
+        1802055059,
+        1802055059,
+        1802055060,
+        1802055059,
+        1802055060,
+        1802055060,
+        1802055061,
+    }};
+#endif
+
+void FingerprintU32(std::vector<unsigned char>& bytes, uint32_t value)
+{
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        bytes.push_back(static_cast<unsigned char>(value >> shift));
+    }
+}
+
+void FingerprintU64(std::vector<unsigned char>& bytes, uint64_t value)
+{
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        bytes.push_back(static_cast<unsigned char>(value >> shift));
+    }
+}
+
+void FingerprintBytes(
+    std::vector<unsigned char>& output,
+    const unsigned char* begin,
+    const size_t size)
+{
+    FingerprintU64(output, size);
+    if (size != 0) output.insert(output.end(), begin, begin + size);
+}
+
+void FingerprintState(
+    std::vector<unsigned char>& bytes,
+    const BmmL1State& state)
+{
+    bytes.insert(bytes.end(), state.block_hash.begin(), state.block_hash.end());
+    FingerprintU32(bytes, state.height);
+    FingerprintU32(bytes, state.block_time);
+    FingerprintU32(bytes, state.n_bits);
+    FingerprintU32(bytes, state.period_start_height);
+    FingerprintU32(bytes, state.period_start_time);
+    FingerprintU64(bytes, state.recent_times.size());
+    for (const uint32_t time : state.recent_times) FingerprintU32(bytes, time);
+}
+
+uint256 FingerprintTagged(
+    const std::string& tag,
+    const std::vector<unsigned char>& payload)
+{
+    uint256 tag_hash;
+    CSHA256 tag_hasher;
+    tag_hasher.Write(
+        reinterpret_cast<const unsigned char*>(tag.data()), tag.size());
+    tag_hasher.Finalize(tag_hash.begin());
+
+    uint256 result;
+    CSHA256 hasher;
+    hasher.Write(tag_hash.begin(), tag_hash.size());
+    hasher.Write(tag_hash.begin(), tag_hash.size());
+    if (!payload.empty()) hasher.Write(payload.data(), payload.size());
+    hasher.Finalize(result.begin());
+    return result;
+}
 
 template <typename T>
 bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
@@ -145,32 +223,6 @@ bool ValidState(const BmmL1State& state, const BmmConsensus& consensus, std::str
     }
     return true;
 }
-
-/**
- * Parent-chain state anchoring the first BMM proof on a configured deployment.
- *
- * This is the equivalent of LAYER_TWO_LABS_INITIAL_STATE for a chain that is
- * not a descendant of the hard-coded Signet checkpoint: the parent-chain state
- * as of the agreed activation boundary, against which the first proof is
- * checked.
- */
-std::optional<BmmL1State> BmmAnchorState()
-{
-    static const std::optional<BmmL1State> cached = [] () -> std::optional<BmmL1State> {
-        const std::string hex = gArgs.GetArg("-drivechainbmmanchorstate", "");
-        if (hex.empty()) return std::nullopt;
-        if (!IsHex(hex)) {
-            throw std::runtime_error("-drivechainbmmanchorstate must be hex-encoded");
-        }
-        BmmL1State state;
-        if (!DeserializeExactly(ParseHex(hex), state)) {
-            throw std::runtime_error("-drivechainbmmanchorstate could not be decoded");
-        }
-        return state;
-    }();
-    return cached;
-}
-
 
 uint32_t MedianTimePast(const std::vector<uint32_t>& times)
 {
@@ -589,6 +641,9 @@ void SetBmmState(CCoinsViewCache& view, const BmmL1State& state, const int heigh
 
 const BmmConsensus& LayerTwoLabsBmmConsensus()
 {
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    if (PrivateE2eBmmEnabled()) return PRIVATE_E2E_REGTEST_CONSENSUS;
+#endif
     return LAYER_TWO_LABS_CONSENSUS;
 }
 
@@ -607,55 +662,156 @@ const uint256& LayerTwoLabsPublicSidechainBlock2()
     return PUBLIC_SIDECHAIN_BLOCK_2;
 }
 
-bool BmmProofRequiredAfter(const CBlockIndex* previous)
+uint256 RuntimeBmmConsensusFingerprint()
 {
-    if (previous == nullptr) return false;
-
-    // Historical public-Signet branch: activation is pinned to its checkpoint.
-    if (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2) return true;
-
-    // Once any ancestor has signalled, the rule stays on.
-    if ((static_cast<uint32_t>(previous->nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) {
-        return true;
+    const BmmConsensus& consensus{LayerTwoLabsBmmConsensus()};
+    std::vector<unsigned char> payload;
+    FingerprintU32(payload, 4);
+    payload.push_back(BMM_PROOF_SCHEMA_VERSION);
+    FingerprintU32(payload, CBlockHeader::BMM_PROOF_HF_MASK);
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    payload.push_back(PrivateE2eBmmEnabled() ? 1 : 0);
+#else
+    payload.push_back(0);
+#endif
+    payload.insert(payload.end(), consensus.pow_limit.begin(), consensus.pow_limit.end());
+    FingerprintU64(payload, static_cast<uint64_t>(consensus.target_timespan));
+    FingerprintU64(payload, static_cast<uint64_t>(consensus.target_spacing));
+    FingerprintBytes(
+        payload,
+        consensus.signet_challenge.data(),
+        consensus.signet_challenge.size());
+    payload.push_back(consensus.require_signet_solution ? 1 : 0);
+    FingerprintU32(payload, static_cast<uint32_t>(consensus.sidechain_slot));
+    FingerprintU64(payload, consensus.max_entries);
+    FingerprintU64(payload, consensus.max_proof_bytes);
+    // The immutable public checkpoint branch remains reachable even in a
+    // private-E2E build, so always bind it. Private mode adds (rather than
+    // substitutes) its selected replay checkpoint.
+    FingerprintState(payload, LAYER_TWO_LABS_INITIAL_STATE);
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    if (PrivateE2eBmmEnabled()) {
+        FingerprintState(payload, PRIVATE_E2E_REPLAY_CHECKPOINT);
     }
-
-    // Configured activation boundary.
-    //
-    // Without this, strict BMM was unreachable on any chain that is not a
-    // descendant of the hard-coded Signet checkpoint: proofs were never
-    // required, and CheckBmmHeader rejected the first block that tried to
-    // signal, so there was no way in. The advertised rule -- accept a
-    // sidechain block only if its L1 BMM commitment was mined -- was therefore
-    // never enforced on a fresh deployment.
-    if (const std::optional<int> activation = BmmActivationHeight()) {
-        return previous->nHeight + 1 >= *activation;
-    }
-    return false;
+#endif
+    payload.insert(
+        payload.end(), PUBLIC_SIDECHAIN_BLOCK_1.begin(), PUBLIC_SIDECHAIN_BLOCK_1.end());
+    payload.insert(
+        payload.end(), PUBLIC_SIDECHAIN_BLOCK_2.begin(), PUBLIC_SIDECHAIN_BLOCK_2.end());
+    payload.insert(
+        payload.end(), BMM_STATE_OUTPOINT.hash.begin(), BMM_STATE_OUTPOINT.hash.end());
+    FingerprintU32(payload, BMM_STATE_OUTPOINT.n);
+    FingerprintBytes(payload, BMM_STATE_MARKER.data(), BMM_STATE_MARKER.size());
+    payload.insert(payload.end(), SIGNET_HEADER.begin(), SIGNET_HEADER.end());
+    payload.insert(payload.end(), M8_MAGIC.begin(), M8_MAGIC.end());
+    FingerprintU32(payload, SIGNET_SCRIPT_FLAGS);
+    return FingerprintTagged("ECX/BMM-runtime-consensus/v4", payload);
 }
 
-bool CheckBmmHeader(
-    const CBlockHeader& block,
+bool HasPersistedBmmConsensusState(const CCoinsView& view)
+{
+    Coin coin;
+    return view.GetCoin(BMM_STATE_OUTPOINT, coin) && !coin.IsSpent();
+}
+
+bool IsBmmStateInternalOutpoint(const COutPoint& outpoint)
+{
+    return outpoint == BMM_STATE_OUTPOINT;
+}
+
+bool BmmProofRequiredAfter(const CBlockIndex* previous)
+{
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    // The private replay checkpoint is an explicit test-only substitute for
+    // the immutable public sidechain height-2 checkpoint.  Selecting it must
+    // activate the same header/proof branch at an explicit sidechain height;
+    // otherwise loading an existing private E2E chain would retroactively
+    // invalidate its pre-BMM history during VerifyDB.
+    if (previous && PrivateE2eBmmEnabled()) {
+        if (!gArgs.IsArgSet("-ecxprivatebmmactivationheight")) {
+            throw std::runtime_error(
+                "-ecxprivatebmmcheckpoint requires an explicit "
+                "-ecxprivatebmmactivationheight");
+        }
+        const int64_t activation_height{
+            gArgs.GetIntArg("-ecxprivatebmmactivationheight", -1)};
+        if (activation_height <= 0 ||
+            activation_height >= std::numeric_limits<int>::max()) {
+            throw std::runtime_error("invalid -ecxprivatebmmactivationheight");
+        }
+        return static_cast<int64_t>(previous->nHeight) + 1 >= activation_height;
+    }
+#endif
+    return previous != nullptr &&
+        (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2 ||
+         (static_cast<uint32_t>(previous->nVersion) &
+          CBlockHeader::BMM_PROOF_HF_MASK) != 0);
+}
+
+namespace {
+
+bool CheckBmmHeaderCommitments(
+    const int32_t version,
+    const uint256& proof_commitment,
+    const uint256& block_hash,
     const CBlockIndex* previous,
-    std::string& error)
+    std::string& error,
+    const bool allow_incomplete_candidate)
 {
     error.clear();
     if (!previous) return true;
     if (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_1 &&
-        block.GetHash() != PUBLIC_SIDECHAIN_BLOCK_2) {
+        block_hash != PUBLIC_SIDECHAIN_BLOCK_2) {
         error = "public-signet height 2 does not match its immutable checkpoint";
         return false;
     }
 
+    const bool has_bmm_proof =
+        (static_cast<uint32_t>(version) & CBlockHeader::BMM_PROOF_HF_MASK) != 0;
     const bool required = BmmProofRequiredAfter(previous);
-    if (required && !block.HasBmmProof()) {
+    if (required && !has_bmm_proof) {
         error = "public-signet descendant does not signal deterministic BMM proof";
         return false;
     }
-    if (!required && block.HasBmmProof()) {
+    if (required && proof_commitment.IsNull() && !allow_incomplete_candidate) {
+        error = "deterministic BMM header has no proof commitment";
+        return false;
+    }
+    if (!required && has_bmm_proof) {
         error = "deterministic BMM proof cannot activate outside the public-signet checkpoint";
         return false;
     }
     return true;
+}
+
+} // namespace
+
+bool CheckBmmHeader(
+    const CBlockHeader& block,
+    const CBlockIndex* previous,
+    std::string& error,
+    const bool allow_incomplete_candidate)
+{
+    return CheckBmmHeaderCommitments(
+        block.nVersion,
+        block.hashBmmProof,
+        block.GetHash(),
+        previous,
+        error,
+        allow_incomplete_candidate);
+}
+
+bool CheckBmmIndexHeader(
+    const CBlockIndex& index,
+    std::string& error)
+{
+    return CheckBmmHeaderCommitments(
+        index.nVersion,
+        index.hashBmmProof,
+        index.GetBlockHash(),
+        index.pprev,
+        error,
+        /* allow_incomplete_candidate */ false);
 }
 
 bool SerializeBmmProof(
@@ -714,6 +870,64 @@ bool AttachBmmProof(CBlock& block, const BmmProof& proof, std::string& error)
     block.hashBmmProof = BmmProofCommitment(block.m_bmm_proof);
     return true;
 }
+
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+bool BuildPrivateE2eBmmProof(
+    const BmmL1State& previous,
+    const uint256& critical_hash,
+    BmmProof& proof,
+    std::string& error)
+{
+    error.clear();
+    if (!PrivateE2eBmmEnabled()) {
+        error = "private BMM proof construction is disabled";
+        return false;
+    }
+    if (!ValidState(previous, PRIVATE_E2E_REGTEST_CONSENSUS, error)) return false;
+
+    Sidechain::Bitcoin::CMutableTransaction coinbase;
+    coinbase.nVersion = 2;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript() << static_cast<int64_t>(previous.height + 1);
+
+    std::vector<unsigned char> m8{
+        M8_MAGIC.begin(), M8_MAGIC.end()};
+    m8.push_back(static_cast<unsigned char>(BMM_SIDECHAIN_SLOT));
+    const std::vector<unsigned char> critical_bytes{ParseHex(critical_hash.GetHex())};
+    m8.insert(m8.end(), critical_bytes.begin(), critical_bytes.end());
+    coinbase.vout.emplace_back(0, CScript() << OP_RETURN << m8);
+
+    Sidechain::Bitcoin::CBlockHeader header;
+    header.nVersion = 0x20000000;
+    header.hashPrevBlock = previous.block_hash;
+    header.hashMerkleRoot = coinbase.GetHash();
+    header.nTime = std::max(previous.block_time + 1, MedianTimePast(previous.recent_times) + 1);
+    header.nBits = ExpectedNextBits(previous, header, PRIVATE_E2E_REGTEST_CONSENSUS);
+    arith_uint256 target;
+    target.SetCompact(header.nBits);
+    while (UintToArith256(header.GetHash()) > target) {
+        ++header.nNonce;
+    }
+
+    Sidechain::Bitcoin::CMerkleBlock merkle;
+    merkle.header = header;
+    merkle.txn = Sidechain::Bitcoin::CPartialMerkleTree(
+        {coinbase.GetHash()}, {true});
+    proof = BmmProof{};
+    proof.previous_state = previous;
+    proof.entries.push_back({SerializeValue(coinbase), SerializeValue(merkle)});
+
+    BmmL1State next;
+    return VerifyBmmProofEntries(
+        proof,
+        critical_hash,
+        previous.block_hash,
+        next,
+        error,
+        PRIVATE_E2E_REGTEST_CONSENSUS);
+}
+#endif
 
 bool VerifyBmmProofEntries(
     const BmmProof& proof,
@@ -774,7 +988,8 @@ bool VerifyBmmProofEntries(
             header.nBits != ExpectedNextBits(state, header, consensus) ||
             header.nTime <= MedianTimePast(state.recent_times) ||
             !CheckParentProofOfWork(header, consensus, error) ||
-            !CheckSignetSolution(coinbase, merkle_proof, consensus, error)) {
+            (consensus.require_signet_solution &&
+             !CheckSignetSolution(coinbase, merkle_proof, consensus, error))) {
             if (error.empty()) {
                 error = "BMM parent header does not extend the authenticated state";
             }
@@ -901,25 +1116,12 @@ bool GetEffectiveBmmState(
         state = LAYER_TWO_LABS_INITIAL_STATE;
         return true;
     }
-    // A chain activating at a configured boundary has no persisted state
-    // before its first proof; anchor that proof to the configured parent state.
-    if (previous) {
-        const std::optional<int> activation = BmmActivationHeight();
-        if (activation && previous->nHeight + 1 == *activation) {
-            const std::optional<BmmL1State> anchor = BmmAnchorState();
-            if (!anchor) {
-                error = "BMM activation height is configured but -drivechainbmmanchorstate is not set";
-                return false;
-            }
-            std::string anchor_error;
-            if (!ValidState(*anchor, LAYER_TWO_LABS_CONSENSUS, anchor_error)) {
-                error = "configured BMM anchor state is malformed: " + anchor_error;
-                return false;
-            }
-            state = *anchor;
-            return true;
-        }
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    if (PrivateE2eBmmEnabled()) {
+        state = PRIVATE_E2E_REPLAY_CHECKPOINT;
+        return true;
     }
+#endif
     error = "authenticated BMM parent-chain state is missing";
     return false;
 }
@@ -965,7 +1167,7 @@ bool ConnectBmmState(
             previous_state,
             next_state,
             error,
-            LAYER_TWO_LABS_CONSENSUS)) {
+            LayerTwoLabsBmmConsensus())) {
         return false;
     }
     SetBmmState(view, next_state, height);
@@ -1017,7 +1219,7 @@ bool DisconnectBmmState(
             parent_hash,
             expected_next,
             error,
-            LAYER_TWO_LABS_CONSENSUS) ||
+            LayerTwoLabsBmmConsensus()) ||
         !(current == expected_next)) {
         if (error.empty()) error = "BMM state is inconsistent during disconnect";
         return false;

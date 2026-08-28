@@ -33,7 +33,7 @@ uint256 CBlockHeader::GetBmmCriticalHash() const
 std::string CBlock::ToString() const
 {
     std::stringstream s;
-    s << strprintf("CBlock(hash=%s, critical=%s, ver=0x%08x, hashPrevBlock=%s, hashMerkleRoot=%s, hashWithdrawalBundle=%s, hashBmmProof=%s, hashExchangeStateRoot=%s, hashForcedInboxRoot=%s, hashDepositInboxRoot=%s, ecxParentHeight=%u, nTime=%u, nBits=%08x, nNonce=%u, proof=%u, vtx=%u)\n",
+    s << strprintf("CBlock(hash=%s, critical=%s, ver=0x%08x, hashPrevBlock=%s, hashMerkleRoot=%s, hashWithdrawalBundle=%s, hashBmmProof=%s, hashExchangeStateRoot=%s, hashForcedInboxRoot=%s, hashDepositInboxRoot=%s, ecxParentHeight=%u, forcedProcessedCursor=%llu, depositProcessedCursor=%llu, sourceBacklogOldestParentHeight=%llu, nTime=%u, nBits=%08x, nNonce=%u, proof=%u, vtx=%u)\n",
         GetHash().ToString(),
         GetBmmCriticalHash().ToString(),
         nVersion,
@@ -45,6 +45,9 @@ std::string CBlock::ToString() const
         hashForcedInboxRoot.ToString(),
         hashDepositInboxRoot.ToString(),
         ecxParentHeight,
+        static_cast<unsigned long long>(forcedProcessedCursor),
+        static_cast<unsigned long long>(depositProcessedCursor),
+        static_cast<unsigned long long>(sourceBacklogOldestParentHeight),
         nTime, nBits, nNonce, proof.ToString(),
         vtx.size());
     for (const auto& tx : vtx) {

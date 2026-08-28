@@ -9,10 +9,13 @@
 
 #include <consensus/validation.h>
 #include <coins.h>
+#include <ecx_exchange_state.h>
 #include <primitives/pak.h>
 #include <script/pegins.h>
 #include <span.h>
 #include <chainparams.h> // Peg-out enforcement
+
+#include <limits>
 
 // ELEMENTS:
 CAsset policyAsset;
@@ -95,7 +98,12 @@ bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType)
     return true;
 }
 
-bool IsStandardTx(const CTransaction& tx, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason)
+bool IsStandardTx(
+    const CTransaction& tx,
+    bool permit_bare_multisig,
+    const CFeeRate& dust_relay_fee,
+    std::string& reason,
+    const ecx::ExchangeConsensus* ecx_consensus)
 {
     if (tx.nVersion > TX_MAX_STANDARD_VERSION || tx.nVersion < 1) {
         reason = "version";
@@ -107,7 +115,24 @@ bool IsStandardTx(const CTransaction& tx, bool permit_bare_multisig, const CFeeR
     // computing signature hashes is O(ninputs*txsize). Limiting transactions
     // to MAX_STANDARD_TX_WEIGHT mitigates CPU exhaustion attacks.
     unsigned int sz = GetTransactionWeight(tx);
-    if (sz > MAX_STANDARD_TX_WEIGHT) {
+    std::string bond_inbox_error;
+    const bool maybe_bond_inbox_source = ecx_consensus != nullptr &&
+        std::any_of(tx.vout.begin(), tx.vout.end(), [](const CTxOut& output) {
+            static constexpr std::array<unsigned char, 4> magic{{'E','C','X','B'}};
+            return output.scriptPubKey.size() >= 8 && output.scriptPubKey[0] == OP_RETURN &&
+                std::search(
+                    output.scriptPubKey.begin() + 1, output.scriptPubKey.end(),
+                    magic.begin(), magic.end()) != output.scriptPubKey.end();
+        });
+    const bool canonical_bond_inbox_source = maybe_bond_inbox_source &&
+        ecx::IsCanonicalBondInboxSourceTransaction(
+            tx, bond_inbox_error, *ecx_consensus);
+    /* Bond-inbox bundles are encrypted availability data and are witness-
+     * discounted.  The only larger standard transaction is an exact,
+     * signature-valid, configuration-bound source capped at 768 KiB full
+     * serialization / 576 KiB witness and exactly one marker.  Up to eight
+     * distinct source transactions may be admitted by a block. */
+    if (sz > MAX_STANDARD_TX_WEIGHT && !canonical_bond_inbox_source) {
         reason = "tx-size";
         return false;
     }
@@ -135,10 +160,24 @@ bool IsStandardTx(const CTransaction& tx, bool permit_bare_multisig, const CFeeR
     CChainParams params = Params();
     unsigned int nDataOut = 0;
     TxoutType whichType;
-    for (const CTxOut& txout : tx.vout) {
+    for (size_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
+        const CTxOut& txout = tx.vout[output_index];
         if (!::IsStandard(txout.scriptPubKey, whichType)) {
-            reason = "scriptpubkey";
-            return false;
+            std::string ecx_error;
+            const bool drivechain_pegout = ecx_consensus != nullptr &&
+                txout.scriptPubKey.IsPegoutScript(Params().ParentGenesisBlockHash());
+            const bool forced_action = ecx_consensus != nullptr &&
+                ecx::IsCanonicalForcedActionOutput(
+                    tx, output_index, ecx_error, *ecx_consensus);
+            const bool bond_inbox_marker = canonical_bond_inbox_source &&
+                txout.scriptPubKey.size() == 507 &&
+                txout.scriptPubKey[0] == OP_RETURN &&
+                txout.scriptPubKey[1] == OP_PUSHDATA2;
+            if (!drivechain_pegout && !forced_action && !bond_inbox_marker) {
+                reason = "scriptpubkey";
+                return false;
+            }
+            whichType = TxoutType::NULL_DATA;
         }
 
         if (whichType == TxoutType::NULL_DATA) {
@@ -218,10 +257,18 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
     return true;
 }
 
-bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+bool IsWitnessStandard(
+    const CTransaction& tx,
+    const CCoinsViewCache& mapInputs,
+    const ecx::ExchangeConsensus* ecx_consensus)
 {
     if (tx.IsCoinBase())
         return true; // Coinbases are skipped
+
+    std::string bond_inbox_error;
+    const bool canonical_bond_inbox_source = ecx_consensus != nullptr &&
+        ecx::IsCanonicalBondInboxSourceTransaction(
+            tx, bond_inbox_error, *ecx_consensus);
 
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
@@ -281,24 +328,45 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
             }
             // Taproot spend (non-P2SH-wrapped, version 1, witness program size 32; see BIP 341)
             Span stack{tx.witness.vtxinwit[i].scriptWitness.stack};
-            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
-                // Annexes are nonstandard as long as no semantics are defined for them.
-                return false;
+            const bool has_annex = stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG;
+            if (has_annex) {
+                SpanPopBack(stack);
             }
             if (stack.size() >= 2) {
                 // Script path spend (2 or more stack elements after removing optional annex)
                 const auto& control_block = SpanPopBack(stack);
-                SpanPopBack(stack); // Ignore script
+                const auto& script = SpanPopBack(stack);
                 if (control_block.empty()) return false; // Empty control block is invalid
-                if ((control_block[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT) {
+                const uint8_t leaf_version = control_block[0] & TAPROOT_LEAF_MASK;
+                if (leaf_version == TAPROOT_LEAF_TAPSCRIPT) {
+                    // Annexes remain nonstandard for Tapscript.
+                    if (has_annex) return false;
                     // Leaf version 0xc0 (aka Tapscript, see BIP 342)
                     for (const auto& item : stack) {
                         if (item.size() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE) return false;
                     }
+                } else if (leaf_version == TAPROOT_LEAF_TAPSIMPLICITY) {
+                    // A TapSimplicity annex has application-defined semantics and is
+                    // committed to by the transaction.  Only admit the exact witness
+                    // shape consumed by the consensus interpreter: witness, program,
+                    // 32-byte CMR, control block, and an optional annex.
+                    if (stack.size() != 2 || script.size() != 32) return false;
+                } else if (has_annex) {
+                    // Annexes for key-path and unknown leaf-version spends retain the
+                    // existing nonstandard policy.
+                    return false;
                 }
             } else if (stack.size() == 1) {
                 // Key path spend (1 stack element after removing optional annex)
-                // (no policy rules apply)
+                // The sole annex exception is input zero of an already fully
+                // validated canonical bond-inbox source.  Its exact
+                // [64-byte SIGHASH_DEFAULT signature, ECXBIN2 annex] shape,
+                // marker, custody receipts, byte caps, and absence of every
+                // other annex are rechecked by that classifier.  No generic
+                // Taproot-annex policy relaxation is introduced.
+                if (has_annex && !(canonical_bond_inbox_source && i == 0)) {
+                    return false;
+                }
             } else {
                 // 0 stack elements; this is already invalid by consensus rules
                 return false;
@@ -329,6 +397,71 @@ bool IsIssuanceInMoneyRange(const CTransaction& tx)
 int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop)
 {
     return (std::max(nWeight, nSigOpCost * bytes_per_sigop) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
+}
+
+uint64_t GetSimplicityValidationMilliweight(const CTransaction& tx)
+{
+    uint64_t total{0};
+    for (const CTxInWitness& witness : tx.witness.vtxinwit) {
+        if (witness.scriptWitness.stack.size() < 4) continue;
+        const auto& stack = witness.scriptWitness.stack;
+        size_t control_index{stack.size() - 1};
+        // Taproot annex, when present, is the final stack item.
+        if (!stack[control_index].empty() && stack[control_index][0] == ANNEX_TAG) {
+            if (control_index == 0) continue;
+            --control_index;
+        }
+        if (control_index < 1) continue;
+        const auto& control = stack[control_index];
+        const auto& script_cmr = stack[control_index - 1];
+        if (control.empty() ||
+            (control[0] & TAPROOT_LEAF_MASK) != TAPROOT_LEAF_TAPSIMPLICITY ||
+            script_cmr.size() != 32) {
+            continue;
+        }
+        const uint64_t budget_wu{
+            static_cast<uint64_t>(::GetSerializeSize(stack, PROTOCOL_VERSION)) +
+            static_cast<uint64_t>(VALIDATION_WEIGHT_OFFSET)};
+        if (budget_wu > std::numeric_limits<uint64_t>::max() / 1000 ||
+            total > std::numeric_limits<uint64_t>::max() - budget_wu * 1000) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        total += budget_wu * 1000;
+    }
+    return total;
+}
+
+bool CalculateBmmWorkFeeQuote(
+    const CAmount collected_fees,
+    const uint64_t simplicity_milliweight,
+    const CAmount work_sats_per_kwu,
+    const CAmount producer_reserve,
+    BmmWorkFeeQuote& quote)
+{
+    quote = {};
+    if (collected_fees < 0 || work_sats_per_kwu < 0 || producer_reserve < 0 ||
+        !MoneyRange(collected_fees) || !MoneyRange(work_sats_per_kwu) ||
+        !MoneyRange(producer_reserve)) {
+        return false;
+    }
+    static constexpr uint64_t MILLIWEIGHT_PER_KWU{1'000'000};
+    const uint64_t rate{static_cast<uint64_t>(work_sats_per_kwu)};
+    if (rate != 0 && simplicity_milliweight >
+            (std::numeric_limits<uint64_t>::max() - (MILLIWEIGHT_PER_KWU - 1)) / rate) {
+        return false;
+    }
+    const uint64_t priced_work{
+        (simplicity_milliweight * rate + MILLIWEIGHT_PER_KWU - 1) /
+        MILLIWEIGHT_PER_KWU};
+    if (priced_work > static_cast<uint64_t>(MAX_MONEY)) return false;
+    quote.verification_fee = static_cast<CAmount>(priced_work);
+    quote.producer_reserve = producer_reserve;
+    if (quote.verification_fee > collected_fees ||
+        producer_reserve > collected_fees - quote.verification_fee) {
+        return false;
+    }
+    quote.bid = collected_fees - quote.verification_fee - producer_reserve;
+    return MoneyRange(quote.bid);
 }
 
 int64_t GetVirtualTransactionSize(const CTransaction& tx, int64_t nSigOpCost, unsigned int bytes_per_sigop)

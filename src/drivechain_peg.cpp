@@ -1089,6 +1089,11 @@ bool GetCtipState(const CCoinsViewCache& inputs, CtipState& state, std::string* 
     return true;
 }
 
+bool IsCtipStateInternalOutpoint(const COutPoint& outpoint)
+{
+    return outpoint == CTIP_STATE_OUTPOINT;
+}
+
 bool VerifyDeterministicDeposit(
     const CTransaction& tx,
     const size_t input_index,

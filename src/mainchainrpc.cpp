@@ -4,10 +4,8 @@
 #include <chainparamsbase.h>
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
-#include <drivechain_settings.h>
 #include <fs.h>
 #include <logging.h>
-#include <netbase.h>
 #include <pegins.h>
 #include <primitives/bitcoin/transaction.h>
 #include <primitives/bitcoin/block.h>
@@ -29,28 +27,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <chrono>
 #include <fstream>
-#include <functional>
-#include <limits>
 #include <optional>
-#include <set>
 #include <vector>
-
-#ifdef WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <cerrno>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
 
 /** Reply structure for request_done to fill in */
 struct HTTPReply
@@ -61,9 +40,6 @@ struct HTTPReply
     int error;
     std::string body;
 };
-
-static constexpr size_t MAX_MAINCHAIN_RPC_RESPONSE_SIZE{16U * 1024U * 1024U};
-static constexpr size_t MAX_MAINCHAIN_RPC_HEADER_SIZE{64U * 1024U};
 
 const char *http_errorstring(int code)
 {
@@ -125,27 +101,12 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params)
     std::string host = gArgs.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT);
     int port = gArgs.GetIntArg("-mainchainrpcport", BaseParams().MainchainRPCPort());
 
-    // Bitcoin Core's JSON-RPC protocol carries Basic credentials over HTTP.
-    // Never put those credentials on a routable network interface. Operators
-    // using a remote parent node must terminate an authenticated TLS tunnel on
-    // loopback and point this option at that local endpoint.
-    CNetAddr rpc_address;
-    if (host != "localhost" &&
-        (!LookupHost(host, rpc_address, /*fAllowLookup=*/false) ||
-         !rpc_address.IsLocal())) {
-        throw std::runtime_error(
-            "-mainchainrpchost must be a numeric loopback address or localhost; "
-            "use a local authenticated TLS tunnel for a remote parent-chain RPC server");
-    }
-
     // Obtain event base
     raii_event_base base = obtain_event_base();
 
     // Synchronously look up hostname
     raii_evhttp_connection evcon = obtain_evhttp_connection_base(base.get(), host, port);
     evhttp_connection_set_timeout(evcon.get(), gArgs.GetIntArg("-mainchainrpctimeout", DEFAULT_HTTP_CLIENT_TIMEOUT));
-    evhttp_connection_set_max_headers_size(evcon.get(), MAX_MAINCHAIN_RPC_HEADER_SIZE);
-    evhttp_connection_set_max_body_size(evcon.get(), MAX_MAINCHAIN_RPC_RESPONSE_SIZE);
 
     HTTPReply response;
     raii_evhttp_request req = obtain_evhttp_request(http_request_done, (void*)&response);
@@ -208,6 +169,169 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params)
     return reply;
 }
 
+bool CallDrivechainConnectJSON(
+    const std::string& endpoint,
+    const std::string& method,
+    const UniValue& request,
+    UniValue& response,
+    std::string* error)
+{
+    static constexpr uint16_t DEFAULT_DRIVECHAIN_CONNECT_PORT{50051};
+    static constexpr int DRIVECHAIN_CONNECT_TIMEOUT_SECONDS{30};
+    static constexpr size_t MAX_DRIVECHAIN_CONNECT_RESPONSE_BYTES{16U * 1024U * 1024U};
+
+    try {
+        uint16_t port{DEFAULT_DRIVECHAIN_CONNECT_PORT};
+        std::string host;
+        SplitHostPort(endpoint, port, host);
+        if (host.empty() || port == 0 || endpoint.find('\0') != std::string::npos ||
+            endpoint.find_first_of("/?#@\r\n") != std::string::npos) {
+            throw std::runtime_error("drivechain Connect endpoint must be a host[:port] authority");
+        }
+        if (method.empty() || method.front() == '/' ||
+            std::count(method.begin(), method.end(), '/') != 1 ||
+            !std::all_of(method.begin(), method.end(), [](const unsigned char c) {
+                return std::isalnum(c) || c == '.' || c == '_' || c == '/';
+            })) {
+            throw std::runtime_error("drivechain Connect method is not a canonical service/method path");
+        }
+        if (!request.isObject()) {
+            throw std::runtime_error("drivechain Connect request must be a JSON object");
+        }
+
+        raii_event_base base = obtain_event_base();
+        raii_evhttp_connection connection = obtain_evhttp_connection_base(base.get(), host, port);
+        evhttp_connection_set_timeout(connection.get(), DRIVECHAIN_CONNECT_TIMEOUT_SECONDS);
+        evhttp_connection_set_max_body_size(connection.get(), MAX_DRIVECHAIN_CONNECT_RESPONSE_BYTES);
+
+        HTTPReply http_response;
+        raii_evhttp_request http_request = obtain_evhttp_request(http_request_done, &http_response);
+        if (http_request == nullptr) {
+            throw std::runtime_error("create drivechain Connect request failed");
+        }
+#if LIBEVENT_VERSION_NUMBER >= 0x02010300
+        evhttp_request_set_error_cb(http_request.get(), http_error_cb);
+#endif
+
+        struct evkeyvalq* headers = evhttp_request_get_output_headers(http_request.get());
+        assert(headers);
+        evhttp_add_header(headers, "Host", endpoint.c_str());
+        evhttp_add_header(headers, "Connection", "close");
+        evhttp_add_header(headers, "Content-Type", "application/json");
+        evhttp_add_header(headers, "Accept", "application/json");
+        evhttp_add_header(headers, "Connect-Protocol-Version", "1");
+        const std::string auth_cookie_path{
+            gArgs.GetArg("-drivechainbmmconnectauthcookie", "")};
+        if (!auth_cookie_path.empty()) {
+            std::ifstream cookie_file(fs::PathFromString(auth_cookie_path));
+            std::string token;
+            if (!cookie_file.is_open() || !std::getline(cookie_file, token) || token.empty() ||
+                token.find_first_of("\r\n") != std::string::npos) {
+                throw std::runtime_error("cannot read canonical BitWindow Connect auth cookie");
+            }
+            const std::string authorization{"Bearer " + token};
+            evhttp_add_header(headers, "Authorization", authorization.c_str());
+        }
+
+        const std::string body = request.write();
+        struct evbuffer* output_buffer = evhttp_request_get_output_buffer(http_request.get());
+        assert(output_buffer);
+        if (evbuffer_add(output_buffer, body.data(), body.size()) != 0) {
+            throw std::runtime_error("buffer drivechain Connect request failed");
+        }
+
+        const std::string path = "/" + method;
+        if (evhttp_make_request(connection.get(), http_request.get(), EVHTTP_REQ_POST, path.c_str()) != 0) {
+            throw CConnectionFailed("send drivechain Connect request failed");
+        }
+        http_request.release(); // Ownership moved to connection.
+        event_base_dispatch(base.get());
+
+        if (http_response.status == 0) {
+            throw CConnectionFailed(strprintf(
+                "couldn't connect to drivechain enforcer: %s (code %d)",
+                http_errorstring(http_response.error),
+                http_response.error));
+        }
+        if (http_response.status != HTTP_OK) {
+            const std::string detail = http_response.body.substr(0, 4096);
+            throw std::runtime_error(strprintf(
+                "drivechain enforcer returned HTTP %d: %s",
+                http_response.status,
+                detail));
+        }
+        if (http_response.body.empty()) {
+            throw std::runtime_error("drivechain enforcer returned an empty response");
+        }
+        if (!response.read(http_response.body) || !response.isObject()) {
+            throw std::runtime_error("drivechain enforcer returned non-object JSON");
+        }
+        return true;
+    } catch (const std::exception& exception) {
+        if (error != nullptr) {
+            *error = exception.what();
+        }
+        return false;
+    }
+}
+
+bool SubmitDrivechainBmmBid(
+    const int sidechain_slot,
+    const uint64_t bid_sats,
+    const uint32_t parent_height,
+    const uint256& critical_hash,
+    const uint256& previous_parent_hash,
+    uint256& request_txid,
+    std::string* error)
+{
+    try {
+        if (sidechain_slot < 0 || sidechain_slot > 255) {
+            throw std::runtime_error("BMM sidechain slot is outside uint8 range");
+        }
+        if (bid_sats == 0) {
+            throw std::runtime_error("BMM bid must be positive");
+        }
+        if (parent_height == 0 || critical_hash.IsNull() || previous_parent_hash.IsNull()) {
+            throw std::runtime_error("BMM bid identity is incomplete");
+        }
+
+        UniValue request(UniValue::VOBJ);
+        request.pushKV("sidechainId", sidechain_slot);
+        // uint64 wrapper values are strings in canonical protobuf JSON.
+        request.pushKV("valueSats", std::to_string(bid_sats));
+        request.pushKV("height", static_cast<uint64_t>(parent_height));
+        UniValue critical(UniValue::VOBJ);
+        critical.pushKV("hex", critical_hash.GetHex());
+        request.pushKV("criticalHash", critical);
+        UniValue previous(UniValue::VOBJ);
+        previous.pushKV("hex", previous_parent_hash.GetHex());
+        request.pushKV("prevBytes", previous);
+
+        UniValue response;
+        if (!CallDrivechainConnectJSON(
+                gArgs.GetArg("-drivechainbmmwalletaddr", "127.0.0.1:30301"),
+                "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
+                request,
+                response,
+                error)) {
+            return false;
+        }
+        const UniValue& txid_value = find_value(response.get_obj(), "txid");
+        if (!txid_value.isObject()) {
+            throw std::runtime_error("BMM wallet response has no transaction id");
+        }
+        const UniValue& hex = find_value(txid_value.get_obj(), "hex");
+        if (!hex.isStr() || !IsHex(hex.get_str()) || hex.get_str().size() != 64) {
+            throw std::runtime_error("BMM wallet returned a malformed transaction id");
+        }
+        request_txid = uint256S(hex.get_str());
+        return true;
+    } catch (const std::exception& exception) {
+        if (error != nullptr) *error = exception.what();
+        return false;
+    }
+}
+
 static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
 {
     const UniValue reply = CallMainChainRPC(method, params);
@@ -220,774 +344,6 @@ static UniValue CallMainChainRPCChecked(const std::string& method, const UniValu
         throw std::runtime_error(strprintf("%s returned no result", method));
     }
     return result;
-}
-
-#ifdef WIN32
-namespace {
-
-std::wstring QuoteWindowsCommandLineArgument(const std::wstring& argument)
-{
-    if (argument.empty()) return L"\"\"";
-    if (argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
-        return argument;
-    }
-
-    std::wstring quoted{L'\"'};
-    size_t backslashes{0};
-    for (const wchar_t character : argument) {
-        if (character == L'\\') {
-            ++backslashes;
-            continue;
-        }
-        if (character == L'\"') {
-            quoted.append(backslashes * 2 + 1, L'\\');
-            quoted.push_back(character);
-            backslashes = 0;
-            continue;
-        }
-        quoted.append(backslashes, L'\\');
-        backslashes = 0;
-        quoted.push_back(character);
-    }
-    quoted.append(backslashes * 2, L'\\');
-    quoted.push_back(L'\"');
-    return quoted;
-}
-
-std::string WindowsProcessError(const std::string& action)
-{
-    return strprintf("%s (Windows error %u)", action, GetLastError());
-}
-
-std::wstring Utf8ToWindowsString(const std::string& value)
-{
-    if (value.empty()) return {};
-    if (value.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        throw std::runtime_error("child process argument is too large for Windows");
-    }
-    const int input_size = static_cast<int>(value.size());
-    const int output_size = MultiByteToWideChar(
-        CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), input_size, nullptr, 0);
-    if (output_size <= 0) {
-        throw std::runtime_error(
-            WindowsProcessError("child process argument is not valid UTF-8"));
-    }
-    std::wstring converted(output_size, L'\0');
-    if (MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            value.data(),
-            input_size,
-            converted.data(),
-            output_size) != output_size) {
-        throw std::runtime_error(
-            WindowsProcessError("failed to convert child process argument"));
-    }
-    return converted;
-}
-
-} // namespace
-#endif
-
-BoundedCommandResult RunBoundedCommand(
-    const std::vector<std::string>& argv,
-    const std::chrono::milliseconds timeout,
-    const size_t max_output,
-    const std::function<bool()>& should_cancel)
-{
-    BoundedCommandResult result;
-    if (argv.empty() || argv.front().empty()) {
-        result.error = "bounded command has no executable";
-        return result;
-    }
-    if (timeout <= std::chrono::milliseconds::zero() || max_output == 0) {
-        result.error = "bounded command requires positive timeout and output limit";
-        return result;
-    }
-
-#ifdef WIN32
-    HANDLE output_read{nullptr};
-    HANDLE output_write{nullptr};
-    HANDLE job{nullptr};
-    PROCESS_INFORMATION process{};
-    LPPROC_THREAD_ATTRIBUTE_LIST process_attributes{nullptr};
-    std::vector<unsigned char> process_attribute_storage;
-    const auto close_handle = [](HANDLE& handle) {
-        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
-        handle = nullptr;
-    };
-    const auto close_all = [&] {
-        if (process_attributes != nullptr) {
-            DeleteProcThreadAttributeList(process_attributes);
-            process_attributes = nullptr;
-        }
-        close_handle(process.hThread);
-        close_handle(process.hProcess);
-        close_handle(output_read);
-        close_handle(output_write);
-        close_handle(job);
-    };
-
-    try {
-        SECURITY_ATTRIBUTES security{};
-        security.nLength = sizeof(security);
-        security.bInheritHandle = TRUE;
-        if (!CreatePipe(&output_read, &output_write, &security, 0)) {
-            result.error = WindowsProcessError("failed to create child output pipe");
-            close_all();
-            return result;
-        }
-        if (!SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0)) {
-            result.error = WindowsProcessError("failed to secure child output pipe");
-            close_all();
-            return result;
-        }
-
-        job = CreateJobObjectW(nullptr, nullptr);
-        if (job == nullptr) {
-            result.error = WindowsProcessError("failed to create child process job");
-            close_all();
-            return result;
-        }
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_limits{};
-        job_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (!SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &job_limits,
-                sizeof(job_limits))) {
-            result.error = WindowsProcessError("failed to secure child process job");
-            close_all();
-            return result;
-        }
-
-        std::wstring command_line;
-        for (const std::string& argument : argv) {
-            if (!command_line.empty()) command_line.push_back(L' ');
-            command_line += QuoteWindowsCommandLineArgument(
-                Utf8ToWindowsString(argument));
-        }
-        if (command_line.size() >= 32767) {
-            result.error = "child process command line exceeds the Windows limit";
-            close_all();
-            return result;
-        }
-        std::vector<wchar_t> mutable_command_line(
-            command_line.begin(), command_line.end());
-        mutable_command_line.push_back(L'\0');
-
-        SIZE_T attribute_bytes{0};
-        (void)InitializeProcThreadAttributeList(
-            nullptr, 1, 0, &attribute_bytes);
-        if (attribute_bytes == 0) {
-            result.error = WindowsProcessError(
-                "failed to size child process handle restrictions");
-            close_all();
-            return result;
-        }
-        process_attribute_storage.resize(attribute_bytes);
-        process_attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
-            process_attribute_storage.data());
-        if (!InitializeProcThreadAttributeList(
-                process_attributes, 1, 0, &attribute_bytes)) {
-            result.error = WindowsProcessError(
-                "failed to initialize child process handle restrictions");
-            process_attributes = nullptr;
-            close_all();
-            return result;
-        }
-        HANDLE inherited_handles[]{output_write};
-        if (!UpdateProcThreadAttribute(
-                process_attributes,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                inherited_handles,
-                sizeof(inherited_handles),
-                nullptr,
-                nullptr)) {
-            result.error = WindowsProcessError(
-                "failed to restrict inherited child process handles");
-            close_all();
-            return result;
-        }
-
-        STARTUPINFOEXW startup{};
-        startup.StartupInfo.cb = sizeof(startup);
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-        startup.StartupInfo.hStdOutput = output_write;
-        startup.StartupInfo.hStdError = output_write;
-        startup.lpAttributeList = process_attributes;
-        const DWORD creation_flags =
-            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-        if (!CreateProcessW(
-                nullptr,
-                mutable_command_line.data(),
-                nullptr,
-                nullptr,
-                TRUE,
-                creation_flags,
-                nullptr,
-                nullptr,
-                &startup.StartupInfo,
-                &process)) {
-            result.error = WindowsProcessError("failed to create child process");
-            close_all();
-            return result;
-        }
-        DeleteProcThreadAttributeList(process_attributes);
-        process_attributes = nullptr;
-        result.started = true;
-        close_handle(output_write);
-
-        if (!AssignProcessToJobObject(job, process.hProcess)) {
-            result.error = WindowsProcessError("failed to assign child process to bounded job");
-            TerminateProcess(process.hProcess, 1);
-        } else if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
-            result.error = WindowsProcessError("failed to resume child process");
-            TerminateJobObject(job, 1);
-        }
-        close_handle(process.hThread);
-
-        bool terminate_child{!result.error.empty()};
-        bool process_exited{false};
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        const auto drain_output = [&] {
-            std::array<char, 4096> buffer;
-            for (;;) {
-                DWORD available{0};
-                if (!PeekNamedPipe(
-                        output_read, nullptr, 0, nullptr, &available, nullptr)) {
-                    if (GetLastError() == ERROR_BROKEN_PIPE) return true;
-                    if (result.error.empty()) {
-                        result.error = WindowsProcessError("failed reading child output");
-                    }
-                    return false;
-                }
-                if (available == 0) return true;
-
-                DWORD count{0};
-                const DWORD requested = std::min<DWORD>(
-                    available, static_cast<DWORD>(buffer.size()));
-                if (!ReadFile(
-                        output_read, buffer.data(), requested, &count, nullptr)) {
-                    if (GetLastError() == ERROR_BROKEN_PIPE) return true;
-                    if (result.error.empty()) {
-                        result.error = WindowsProcessError("failed reading child output");
-                    }
-                    return false;
-                }
-                const size_t remaining = max_output > result.output.size()
-                    ? max_output - result.output.size() : 0;
-                const size_t append = std::min<size_t>(remaining, count);
-                result.output.append(buffer.data(), append);
-                if (append != count) {
-                    result.output_truncated = true;
-                    return true;
-                }
-            }
-        };
-
-        while (!terminate_child && !process_exited) {
-            if (!drain_output()) {
-                terminate_child = true;
-                break;
-            }
-            if (result.output_truncated) {
-                terminate_child = true;
-                break;
-            }
-            if (should_cancel && should_cancel()) {
-                result.cancelled = true;
-                terminate_child = true;
-                break;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                result.timed_out = true;
-                terminate_child = true;
-                break;
-            }
-
-            const DWORD wait_result = WaitForSingleObject(process.hProcess, 10);
-            if (wait_result == WAIT_OBJECT_0) {
-                process_exited = true;
-            } else if (wait_result == WAIT_FAILED) {
-                result.error = WindowsProcessError("failed waiting for child process");
-                terminate_child = true;
-            }
-        }
-
-        if (terminate_child) {
-            if (!TerminateJobObject(job, 1) && result.error.empty()) {
-                result.error = WindowsProcessError("failed to terminate child process job");
-            }
-        }
-        const DWORD reap_result = WaitForSingleObject(process.hProcess, INFINITE);
-        if (reap_result == WAIT_OBJECT_0) {
-            process_exited = true;
-        } else if (reap_result == WAIT_FAILED && result.error.empty()) {
-            result.error = WindowsProcessError("failed to reap child process");
-        }
-        if (!result.output_truncated) (void)drain_output();
-
-        DWORD exit_code{0};
-        if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
-            if (result.error.empty()) {
-                result.error = WindowsProcessError("failed to read child exit code");
-            }
-        } else {
-            result.exit_code = static_cast<int>(exit_code);
-        }
-        result.exited = process_exited;
-        close_all();
-        return result;
-    } catch (const std::exception& error) {
-        if (process.hProcess != nullptr) {
-            if (job != nullptr) TerminateJobObject(job, 1);
-            else TerminateProcess(process.hProcess, 1);
-            WaitForSingleObject(process.hProcess, INFINITE);
-        }
-        result.error = "failed to prepare child process: " + std::string{error.what()};
-        close_all();
-        return result;
-    }
-#else
-    int output_pipe[2]{-1, -1};
-    if (pipe(output_pipe) != 0) {
-        result.error = strprintf("failed to create child output pipe (%d)", errno);
-        return result;
-    }
-    const auto close_pipe = [&] {
-        if (output_pipe[0] >= 0) close(output_pipe[0]);
-        if (output_pipe[1] >= 0) close(output_pipe[1]);
-        output_pipe[0] = output_pipe[1] = -1;
-    };
-    if (fcntl(output_pipe[0], F_SETFD, FD_CLOEXEC) == -1 ||
-        fcntl(output_pipe[1], F_SETFD, FD_CLOEXEC) == -1) {
-        result.error = strprintf("failed to secure child output pipe (%d)", errno);
-        close_pipe();
-        return result;
-    }
-
-    std::vector<char*> child_argv;
-    child_argv.reserve(argv.size() + 1);
-    for (const std::string& argument : argv) {
-        child_argv.push_back(const_cast<char*>(argument.c_str()));
-    }
-    child_argv.push_back(nullptr);
-
-    const pid_t child = fork();
-    if (child < 0) {
-        result.error = strprintf("failed to fork child process (%d)", errno);
-        close_pipe();
-        return result;
-    }
-    if (child == 0) {
-        setpgid(0, 0);
-        close(output_pipe[0]);
-        if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
-            dup2(output_pipe[1], STDERR_FILENO) == -1) {
-            _exit(126);
-        }
-        close(output_pipe[1]);
-        execvp(child_argv[0], child_argv.data());
-        static constexpr char EXEC_ERROR[] = "execvp failed\n";
-        (void)write(STDERR_FILENO, EXEC_ERROR, sizeof(EXEC_ERROR) - 1);
-        _exit(127);
-    }
-
-    result.started = true;
-    close(output_pipe[1]);
-    output_pipe[1] = -1;
-    (void)setpgid(child, child);
-    const int read_flags = fcntl(output_pipe[0], F_GETFL, 0);
-    const bool output_nonblocking = read_flags != -1 &&
-        fcntl(output_pipe[0], F_SETFL, read_flags | O_NONBLOCK) != -1;
-    if (!output_nonblocking) {
-        result.error = strprintf("failed to make child output nonblocking (%d)", errno);
-    }
-
-    int child_status{0};
-    bool child_reaped{false};
-    bool output_eof{false};
-    const auto reap_nonblocking = [&] {
-        if (child_reaped) return;
-        for (;;) {
-            const pid_t waited = waitpid(child, &child_status, WNOHANG);
-            if (waited == child) {
-                child_reaped = true;
-                return;
-            }
-            if (waited == 0) return;
-            if (waited < 0 && errno == EINTR) continue;
-            if (waited < 0 && errno == ECHILD) {
-                child_reaped = true;
-                return;
-            }
-            if (waited < 0 && result.error.empty()) {
-                result.error = strprintf("failed to reap child process (%d)", errno);
-            }
-            return;
-        }
-    };
-    const auto drain_output = [&] {
-        std::array<char, 4096> buffer;
-        for (;;) {
-            const ssize_t count = read(output_pipe[0], buffer.data(), buffer.size());
-            if (count > 0) {
-                const size_t available = max_output > result.output.size()
-                    ? max_output - result.output.size() : 0;
-                const size_t append = std::min<size_t>(available, static_cast<size_t>(count));
-                result.output.append(buffer.data(), append);
-                if (append != static_cast<size_t>(count)) {
-                    result.output_truncated = true;
-                    return true;
-                }
-                continue;
-            }
-            if (count == 0) {
-                output_eof = true;
-                return true;
-            }
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            if (result.error.empty()) {
-                result.error = strprintf("failed reading child output (%d)", errno);
-            }
-            return false;
-        }
-    };
-    const auto signal_group = [&](const int signal_number) {
-        (void)kill(-child, signal_number);
-        if (!child_reaped) (void)kill(child, signal_number);
-    };
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    bool terminate_child{!result.error.empty()};
-    while (!terminate_child) {
-        if (!drain_output()) {
-            terminate_child = true;
-            break;
-        }
-        reap_nonblocking();
-        if (result.output_truncated) {
-            terminate_child = true;
-            break;
-        }
-        if (should_cancel && should_cancel()) {
-            result.cancelled = true;
-            terminate_child = true;
-            break;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            result.timed_out = true;
-            terminate_child = true;
-            break;
-        }
-        if (child_reaped && output_eof) break;
-
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        const int poll_timeout = static_cast<int>(
-            std::max<int64_t>(1, std::min<int64_t>(25, remaining.count())));
-        pollfd descriptor{output_pipe[0], POLLIN | POLLHUP | POLLERR, 0};
-        const int poll_result = poll(&descriptor, 1, poll_timeout);
-        if (poll_result < 0 && errno != EINTR) {
-            result.error = strprintf("failed polling child output (%d)", errno);
-            terminate_child = true;
-        }
-    }
-
-    if (terminate_child) {
-        signal_group(SIGTERM);
-        const auto grace_deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds{250};
-        while (!child_reaped && std::chrono::steady_clock::now() < grace_deadline) {
-            reap_nonblocking();
-            if (child_reaped) break;
-            pollfd descriptor{output_pipe[0], POLLIN | POLLHUP | POLLERR, 0};
-            (void)poll(&descriptor, 1, 10);
-            if (output_nonblocking) (void)drain_output();
-        }
-        signal_group(SIGKILL);
-    }
-
-    if (!child_reaped) {
-        for (;;) {
-            const pid_t waited = waitpid(child, &child_status, 0);
-            if (waited == child) {
-                child_reaped = true;
-                break;
-            }
-            if (waited < 0 && errno == EINTR) continue;
-            if (waited < 0 && errno == ECHILD) {
-                child_reaped = true;
-                break;
-            }
-            if (waited < 0 && result.error.empty()) {
-                result.error = strprintf("failed to reap terminated child (%d)", errno);
-            }
-            break;
-        }
-    }
-    if (output_nonblocking) (void)drain_output();
-    close_pipe();
-
-    result.exited = child_reaped;
-    if (child_reaped) {
-        if (WIFEXITED(child_status)) {
-            result.exit_code = WEXITSTATUS(child_status);
-        } else if (WIFSIGNALED(child_status)) {
-            result.exit_code = 128 + WTERMSIG(child_status);
-        }
-    }
-    return result;
-#endif
-}
-
-static std::string ResolveDrivechainBmmGrpcurlPath(const ArgsManager& args)
-{
-    const std::string configured_path = args.GetArg("-drivechainbmmgrpcurl", "");
-    if (!configured_path.empty()) {
-        return configured_path;
-    }
-
-    const std::vector<fs::path> candidates{
-        args.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
-        args.GetDataDirBase().parent_path() / "bin" / "grpcurl",
-        fs::PathFromString("/opt/homebrew/bin/grpcurl"),
-        fs::PathFromString("/usr/local/bin/grpcurl"),
-        fs::PathFromString("/usr/bin/grpcurl"),
-    };
-    for (const fs::path& candidate : candidates) {
-        if (fs::exists(candidate)) {
-            return fs::PathToString(candidate);
-        }
-    }
-
-    return "grpcurl";
-}
-
-namespace {
-
-struct DrivechainGrpcTLSConfig {
-    std::string address;
-    fs::path ca_certificate;
-    fs::path client_certificate;
-    fs::path client_key;
-    std::string authority;
-};
-
-fs::path ResolveDrivechainGrpcCredentialPath(
-    const ArgsManager& args,
-    const std::string& argument,
-    const std::string& fallback)
-{
-    fs::path path = fs::PathFromString(args.GetArg(argument, fallback));
-    if (path.is_absolute()) return path;
-    return fsbridge::AbsPathJoin(args.GetDataDirNet(), path);
-}
-
-DrivechainGrpcTLSConfig GetDrivechainGrpcTLSConfig(const ArgsManager& args)
-{
-    const std::string shared_address = args.GetArg(
-        "-drivechainbmmgrpcaddr", DEFAULT_DRIVECHAIN_GRPC_ENDPOINT);
-    const std::string legacy_pegout_address = args.GetArg(
-        "-drivechainpegoutenforcer", "");
-    return {
-        legacy_pegout_address.empty() ? shared_address : legacy_pegout_address,
-        ResolveDrivechainGrpcCredentialPath(
-            args, "-drivechainbmmgrpcca", "enforcer-tls/ca.pem"),
-        ResolveDrivechainGrpcCredentialPath(
-            args, "-drivechainbmmgrpccert", "enforcer-tls/elements-client.pem"),
-        ResolveDrivechainGrpcCredentialPath(
-            args, "-drivechainbmmgrpckey", "enforcer-tls/elements-client-key.pem"),
-        args.GetArg("-drivechainbmmgrpcauthority", ""),
-    };
-}
-
-bool ValidateReadableRegularFile(
-    const fs::path& path,
-    const bool private_key,
-    std::string* error)
-{
-    if (!fs::exists(path) || !fs::is_regular_file(path)) {
-        if (error) {
-            *error = strprintf("required %s is not a regular file: %s",
-                private_key ? "mTLS client key" : "mTLS certificate",
-                fs::PathToString(path));
-        }
-        return false;
-    }
-    std::ifstream input(path);
-    if (!input.good()) {
-        if (error) {
-            *error = strprintf("required mTLS credential is not readable: %s",
-                fs::PathToString(path));
-        }
-        return false;
-    }
-#ifndef WIN32
-    struct stat metadata {};
-    const std::string native_path = fs::PathToString(path);
-    if (lstat(native_path.c_str(), &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
-        if (error) {
-            *error = strprintf(
-                "mTLS credential must be a non-symlink regular file: %s",
-                native_path);
-        }
-        return false;
-    }
-    if (metadata.st_uid != geteuid()) {
-        if (error) {
-            *error = strprintf(
-                "mTLS credential must be owned by the Elements process user: %s",
-                native_path);
-        }
-        return false;
-    }
-    const fs::path parent = path.parent_path();
-    struct stat parent_metadata {};
-    const std::string native_parent = fs::PathToString(parent);
-    if (parent.empty() || lstat(native_parent.c_str(), &parent_metadata) != 0 ||
-        !S_ISDIR(parent_metadata.st_mode) || parent_metadata.st_uid != geteuid() ||
-        (parent_metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-        if (error) {
-            *error = strprintf(
-                "mTLS credential directory must be owned by the Elements process user and deny group/other write access: %s",
-                native_parent);
-        }
-        return false;
-    }
-    const mode_t forbidden = private_key
-        ? (S_IRWXG | S_IRWXO)
-        : (S_IWGRP | S_IWOTH);
-    if ((metadata.st_mode & forbidden) != 0) {
-        if (error) {
-            *error = strprintf(
-                private_key
-                    ? "mTLS client key must deny all group and other access: %s"
-                    : "mTLS certificate must deny group and other write access: %s",
-                native_path);
-        }
-        return false;
-    }
-#endif
-    return true;
-}
-
-} // namespace
-
-std::string GetDrivechainGrpcAddress(const ArgsManager& args)
-{
-    return GetDrivechainGrpcTLSConfig(args).address;
-}
-
-bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error)
-{
-    if (error) error->clear();
-    if (args.IsArgSet("-drivechainpegoutenforcer") &&
-        args.IsArgSet("-drivechainbmmgrpcaddr") &&
-        args.GetArg("-drivechainpegoutenforcer", "") !=
-            args.GetArg("-drivechainbmmgrpcaddr", "")) {
-        if (error) {
-            *error = "-drivechainpegoutenforcer and -drivechainbmmgrpcaddr must name the same authenticated endpoint";
-        }
-        return false;
-    }
-    const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
-    if (config.address.empty() || config.address.find("://") != std::string::npos) {
-        if (error) {
-            *error = "-drivechainbmmgrpcaddr must be a host:port endpoint without a URL scheme";
-        }
-        return false;
-    }
-    if (config.address.size() > 512 ||
-        std::any_of(config.address.begin(), config.address.end(),
-            [](const unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
-        if (error) {
-            *error = "-drivechainbmmgrpcaddr contains whitespace, control characters, or excessive data";
-        }
-        return false;
-    }
-    uint16_t port{0};
-    std::string host;
-    SplitHostPort(config.address, port, host);
-    if (host.empty() || host.front() == '-' || port == 0) {
-        if (error) {
-            *error = "-drivechainbmmgrpcaddr must contain a non-empty host and nonzero port";
-        }
-        return false;
-    }
-    if (!config.authority.empty() &&
-        std::any_of(config.authority.begin(), config.authority.end(),
-            [](const unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
-        if (error) {
-            *error = "-drivechainbmmgrpcauthority contains whitespace or control characters";
-        }
-        return false;
-    }
-    return ValidateReadableRegularFile(config.ca_certificate, false, error) &&
-        ValidateReadableRegularFile(config.client_certificate, false, error) &&
-        ValidateReadableRegularFile(config.client_key, true, error);
-}
-
-BoundedCommandResult RunAuthenticatedDrivechainGrpc(
-    const ArgsManager& args,
-    const std::string& method,
-    const std::string& json_payload,
-    const std::chrono::milliseconds timeout,
-    const size_t max_output,
-    const std::function<bool()>& should_cancel)
-{
-    BoundedCommandResult failure;
-    static const std::set<std::string> ALLOWED_METHODS{
-        "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
-        "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
-        "cusf.mainchain.v1.ValidatorService/GetChainInfo",
-        "cusf.mainchain.v1.ValidatorService/GetChainTip",
-        "cusf.mainchain.v1.ValidatorService/GetSidechains",
-        "cusf.mainchain.v1.ValidatorService/GetCtip",
-        "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
-    };
-    if (ALLOWED_METHODS.count(method) == 0) {
-        failure.error = "refusing an unrecognized enforcer gRPC method";
-        return failure;
-    }
-    if (json_payload.empty() || json_payload.size() > (1U << 20)) {
-        failure.error = "enforcer gRPC payload must contain 1..1048576 bytes";
-        return failure;
-    }
-    UniValue parsed_payload;
-    if (!parsed_payload.read(json_payload) || !parsed_payload.isObject()) {
-        failure.error = "enforcer gRPC payload must be one JSON object";
-        return failure;
-    }
-    if (!ValidateDrivechainGrpcTLSConfig(args, &failure.error)) return failure;
-
-    const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
-    std::vector<std::string> argv{
-        ResolveDrivechainBmmGrpcurlPath(args),
-        "-cacert", fs::PathToString(config.ca_certificate),
-        "-cert", fs::PathToString(config.client_certificate),
-        "-key", fs::PathToString(config.client_key),
-    };
-    if (!config.authority.empty()) {
-        argv.push_back("-authority");
-        argv.push_back(config.authority);
-    }
-    argv.insert(argv.end(), {"-d", json_payload, config.address, method});
-    return RunBoundedCommand(argv, timeout, max_output, should_cancel);
-}
-
-BoundedCommandResult RunAuthenticatedDrivechainGrpc(
-    const std::string& method,
-    const std::string& json_payload,
-    const std::chrono::milliseconds timeout,
-    const size_t max_output,
-    const std::function<bool()>& should_cancel)
-{
-    return RunAuthenticatedDrivechainGrpc(
-        gArgs, method, json_payload, timeout, max_output, should_cancel);
 }
 
 static const UniValue& FindField(const UniValue& obj, const std::string& lower_camel, const std::string& snake_case)
@@ -1005,29 +361,19 @@ static bool GetDrivechainGrpcJSON(
     UniValue& response,
     std::string* error)
 {
-    static constexpr auto TIMEOUT{std::chrono::seconds{60}};
-    static constexpr size_t MAX_OUTPUT{16U * 1024U * 1024U};
-    const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
-        "cusf.mainchain.v1.ValidatorService/" + method,
-        request,
-        std::chrono::duration_cast<std::chrono::milliseconds>(TIMEOUT),
-        MAX_OUTPUT);
-    if (!child.started || !child.exited || child.exit_code != 0 ||
-        child.timed_out || child.cancelled || child.output_truncated ||
-        !child.error.empty()) {
-        if (error) {
-            *error = strprintf(
-                "authenticated enforcer request failed: %s%s",
-                child.error,
-                child.output.empty() ? "" : strprintf(" (%s)", child.output));
+    UniValue payload;
+    if (!payload.read(request) || !payload.isObject()) {
+        if (error != nullptr) {
+            *error = "internal drivechain request is not object JSON";
         }
         return false;
     }
-    if (!response.read(child.output) || !response.isObject()) {
-        if (error) *error = "authenticated enforcer returned malformed JSON";
-        return false;
-    }
-    return true;
+    return CallDrivechainConnectJSON(
+        gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051"),
+        "cusf.mainchain.v1.ValidatorService/" + method,
+        payload,
+        response,
+        error);
 }
 
 static bool GetDrivechainTwoWayPegDataAtTip(

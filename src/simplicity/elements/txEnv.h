@@ -181,6 +181,8 @@ typedef struct assetIssuance {
  * and 'pegin' contains the hash of the parent chain's genesis block.
  */
 typedef struct sigInput {
+  const unsigned char* annex;
+  uint_fast32_t annexLen;
   sha256_midstate annexHash;
   sha256_midstate pegin;
   sha256_midstate scriptSigHash;
@@ -265,10 +267,30 @@ typedef struct txEnv {
   bool priorActiveForcedInboxRootPresent;
   sha256_midstate priorActiveDepositInboxRoot;
   bool priorActiveDepositInboxRootPresent;
+  uint_fast64_t priorActiveForcedProcessedCursor;
+  uint_fast64_t priorActiveDepositProcessedCursor;
   sha256_midstate currentBmmParentBlockHash;
   uint_fast64_t currentBmmParentHeight;
   uint_fast64_t currentBmmParentMtp;
   bool currentBmmParentPresent;
+  sha256_midstate bondV2ConfigurationHash;
+  sha256_midstate bondV2AssetId;
+  sha256_midstate bondV2DeploymentCommitment;
+  sha256_midstate bondV2TransitionCmr;
+  sha256_midstate bondV2CollateralVaultScriptSha256;
+  sha256_midstate bondV2CollateralVaultCmr;
+  sha256_midstate bondV2InsuranceReserveScriptSha256;
+  sha256_midstate bondV2InsuranceReserveCmr;
+  bool bondV2IdentityPresent;
+  sha256_midstate bondV2IncrementalActivationCmr;
+  sha256_midstate incrementalSuccessorTransitionCmr;
+  bool bondV2IncrementalActivationIdentityPresent;
+  sha256_midstate priorActiveBondInboxRoot;
+  uint_fast64_t priorActiveBondInboxCount;
+  uint_fast64_t currentSidechainHeight;
+  bool bondV2ProjectionPresent;
+  ecx_sp1_groth16_verify_fn verifySp1Groth16;
+  void* verifySp1Groth16Context;
   uint_fast32_t ix;
 } txEnv;
 

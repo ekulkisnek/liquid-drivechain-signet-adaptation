@@ -154,6 +154,8 @@ private:
     uint64_t nBlockSigOpsCost;
     CAmount nFees;
     CTxMemPool::setEntries inBlock;
+    uint64_t m_ecx_source_append_budget{0};
+    uint64_t m_ecx_source_appends_selected{0};
 
     // Chain context for the block
     int nHeight;

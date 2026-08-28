@@ -46,7 +46,43 @@
 #include <walletinitinterface.h>
 
 #include <functional>
+#include <map>
 #include <stdexcept>
+#include <utility>
+
+class TestingSetupSettingsGuard
+{
+public:
+    explicit TestingSetupSettingsGuard(ArgsManager& args) : m_args{args}
+    {
+        m_args.LockSettings([this](util::Settings& settings) {
+            m_previous = settings;
+        });
+    }
+
+    ~TestingSetupSettingsGuard() noexcept
+    {
+        // BasicTestingSetup's destructor does not run when its constructor
+        // throws. Clear registered arguments here as well so a failed fixture
+        // cannot make the next SetupServerArgs call abort on duplicates, then
+        // restore every settings source. ArgsManager::ClearArgs only clears
+        // argument registrations; it does not clear parsed command-line
+        // options, which otherwise leak network/consensus flags into the next
+        // fixture.
+        m_args.ClearArgs();
+        m_args.LockSettings([this](util::Settings& settings) {
+            std::swap(settings, m_previous);
+        });
+        m_args.ClearPathCache();
+    }
+
+    TestingSetupSettingsGuard(const TestingSetupSettingsGuard&) = delete;
+    TestingSetupSettingsGuard& operator=(const TestingSetupSettingsGuard&) = delete;
+
+private:
+    ArgsManager& m_args;
+    util::Settings m_previous;
+};
 
 using node::BlockAssembler;
 using node::CalculateCacheSizes;
@@ -95,6 +131,12 @@ BasicTestingSetup::BasicTestingSetup(const std::string& chainName, const std::st
       m_path_root{fs::temp_directory_path() / "test_common_" PACKAGE_NAME / g_insecure_rand_ctx_temp_path.rand256().ToString()},
       m_args{}
 {
+    // Test fixtures parse command-line flags and use ForceSetArg/SoftSetArg for
+    // datadirs and chain overrides. Snapshot all settings before the fixture
+    // mutates gArgs and restore them on every exit, including constructor
+    // exceptions.
+    m_settings_guard = std::make_unique<TestingSetupSettingsGuard>(gArgs);
+
     // Hack to allow testing of fedpeg args
     if (!fedpegscript.empty()) {
         gArgs.SoftSetArg("-fedpegscript", fedpegscript);

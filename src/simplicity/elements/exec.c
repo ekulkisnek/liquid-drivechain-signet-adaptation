@@ -28,6 +28,53 @@ static bool valid_optional_bmm_parent(const ecx_prior_active_root_env* env) {
          0 != env->current_bmm_parent_height && 0 != env->current_bmm_parent_mtp;
 }
 
+static bool valid_optional_bond_v2_identity(const ecx_prior_active_root_env* env) {
+  static const unsigned char zero[32] = {0};
+  if (env->bond_v2_identity_present > 1) return false;
+  const bool config = 0 != memcmp(env->bond_v2_configuration_hash_wire, zero, sizeof(zero));
+  const bool asset = 0 != memcmp(env->bond_v2_asset_id_wire, zero, sizeof(zero));
+  const bool deployment = 0 != memcmp(env->bond_v2_deployment_commitment_wire, zero, sizeof(zero));
+  const bool cmr = 0 != memcmp(env->bond_v2_transition_cmr_wire, zero, sizeof(zero));
+  const bool insurance_script = 0 != memcmp(
+    env->bond_v2_insurance_reserve_script_sha256_wire, zero, sizeof(zero));
+  const bool insurance_cmr = 0 != memcmp(
+    env->bond_v2_insurance_reserve_cmr_wire, zero, sizeof(zero));
+  const bool collateral_script = 0 != memcmp(
+    env->bond_v2_collateral_vault_script_sha256_wire, zero, sizeof(zero));
+  const bool collateral_cmr = 0 != memcmp(
+    env->bond_v2_collateral_vault_cmr_wire, zero, sizeof(zero));
+  return env->bond_v2_identity_present
+    ? config && asset && deployment && cmr && insurance_script && insurance_cmr &&
+      collateral_script && collateral_cmr
+    : !config && !asset && !deployment && !cmr && !insurance_script && !insurance_cmr &&
+      !collateral_script && !collateral_cmr;
+}
+
+static bool valid_optional_bond_v2_projection(const ecx_prior_active_root_env* env) {
+  static const unsigned char zero[32] = {0};
+  if (env->bond_v2_projection_present > 1) return false;
+  const bool root = 0 != memcmp(
+    env->prior_active_bond_inbox_root_wire, zero, sizeof(zero));
+  return env->bond_v2_projection_present
+    ? root && 0 != env->current_sidechain_height
+    : !root && 0 == env->prior_active_bond_inbox_count &&
+      0 == env->current_sidechain_height;
+}
+
+static bool valid_optional_bond_v2_incremental_activation_identity(
+  const ecx_prior_active_root_env* env
+) {
+  static const unsigned char zero[32] = {0};
+  if (env->bond_v2_incremental_activation_identity_present > 1) return false;
+  const bool activation_cmr = 0 != memcmp(
+    env->bond_v2_incremental_activation_cmr_wire, zero, sizeof(zero));
+  const bool successor_cmr = 0 != memcmp(
+    env->incremental_successor_transition_cmr_wire, zero, sizeof(zero));
+  return env->bond_v2_incremental_activation_identity_present
+    ? env->bond_v2_identity_present && activation_cmr && successor_cmr
+    : !activation_cmr && !successor_cmr;
+}
+
 /* Deserialize a Simplicity 'program' with its 'witness' data and execute it in the environment of the 'ix'th input of 'tx' with `taproot`.
  *
  * If at any time malloc fails then '*error' is set to 'SIMPLICITY_ERR_MALLOC' and 'false' is returned,
@@ -80,7 +127,10 @@ extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* erro
   if (!valid_optional_ecx_root(ecxRoot->present, ecxRoot->root_wire) ||
       !valid_optional_ecx_root(ecxRoot->forced_inbox_present, ecxRoot->forced_inbox_root_wire) ||
       !valid_optional_ecx_root(ecxRoot->deposit_inbox_present, ecxRoot->deposit_inbox_root_wire) ||
-      !valid_optional_bmm_parent(ecxRoot)) {
+      !valid_optional_bmm_parent(ecxRoot) ||
+      !valid_optional_bond_v2_identity(ecxRoot) ||
+      !valid_optional_bond_v2_incremental_activation_identity(ecxRoot) ||
+      !valid_optional_bond_v2_projection(ecxRoot)) {
     *error = SIMPLICITY_ERR_DATA_OUT_OF_RANGE;
     return true;
   }

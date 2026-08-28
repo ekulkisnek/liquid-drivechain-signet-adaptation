@@ -154,6 +154,9 @@ bool DisconnectDepositState(
 /** Read the current authenticated slot-24 CTIP state from a coins view. */
 bool GetCtipState(const CCoinsViewCache& inputs, CtipState& state, std::string* error = nullptr);
 
+/** Prevent transactions from naming the synthetic slot-24 CTIP record. */
+bool IsCtipStateInternalOutpoint(const COutPoint& outpoint);
+
 } // namespace drivechain
 
 #endif // BITCOIN_DRIVECHAIN_PEG_H

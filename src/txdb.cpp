@@ -25,6 +25,8 @@ static constexpr uint8_t DB_COIN{'C'};
 static constexpr uint8_t DB_COINS{'c'};
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
 static constexpr uint8_t DB_BLOCK_INDEX{'b'};
+// Separate from CDiskBlockIndex to preserve every legacy block-index byte.
+static constexpr uint8_t DB_ECX_BOND_V2_CAPITAL{'E'};
 
 static constexpr uint8_t DB_BEST_BLOCK{'B'};
 static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
@@ -305,6 +307,13 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
     batch.Write(DB_LAST_BLOCK, nLastFile);
     for (std::vector<const CBlockIndex*>::const_iterator it=blockinfo.begin(); it != blockinfo.end(); it++) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, (*it)->GetBlockHash()), CDiskBlockIndex(*it));
+        const auto capital_key = std::make_pair(
+            DB_ECX_BOND_V2_CAPITAL, (*it)->GetBlockHash());
+        if ((*it)->ecxBondV2Capital.has_value()) {
+            batch.Write(capital_key, *(*it)->ecxBondV2Capital);
+        } else {
+            batch.Erase(capital_key);
+        }
     }
     return WriteBatch(batch, true);
 }
@@ -365,6 +374,11 @@ const CBlockIndex *CBlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTr
     pindexNew->hashForcedInboxRoot = pindexTrimmed->hashForcedInboxRoot;
     pindexNew->hashDepositInboxRoot = pindexTrimmed->hashDepositInboxRoot;
     pindexNew->ecxParentHeight = pindexTrimmed->ecxParentHeight;
+    pindexNew->forcedProcessedCursor = pindexTrimmed->forcedProcessedCursor;
+    pindexNew->depositProcessedCursor = pindexTrimmed->depositProcessedCursor;
+    pindexNew->sourceBacklogOldestParentHeight =
+        pindexTrimmed->sourceBacklogOldestParentHeight;
+    pindexNew->ecxBondV2Capital = pindexTrimmed->ecxBondV2Capital;
     pindexNew->nTime          = pindexTrimmed->nTime;
     pindexNew->nBits          = pindexTrimmed->nBits;
     pindexNew->nNonce         = pindexTrimmed->nNonce;
@@ -412,6 +426,10 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->hashForcedInboxRoot = diskindex.hashForcedInboxRoot;
                 pindexNew->hashDepositInboxRoot = diskindex.hashDepositInboxRoot;
                 pindexNew->ecxParentHeight = diskindex.ecxParentHeight;
+                pindexNew->forcedProcessedCursor = diskindex.forcedProcessedCursor;
+                pindexNew->depositProcessedCursor = diskindex.depositProcessedCursor;
+                pindexNew->sourceBacklogOldestParentHeight =
+                    diskindex.sourceBacklogOldestParentHeight;
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;
@@ -450,6 +468,32 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
     }
 
     LogPrintf("LoadBlockIndexGuts: loaded %d total / %d untrimmed (fully in-memory) headers\n", n_total, n_untrimmed);
+
+    // V2 projections are intentionally a disjoint database namespace.  This
+    // permits an old V1 index to load without reinterpretation while making a
+    // missing V2 projection fail closed at its RPC/activation boundary.
+    pcursor->Seek(std::make_pair(DB_ECX_BOND_V2_CAPITAL, uint256()));
+    size_t capital_entries{0};
+    while (pcursor->Valid()) {
+        std::pair<uint8_t, uint256> key;
+        if (!pcursor->GetKey(key) || key.first != DB_ECX_BOND_V2_CAPITAL) break;
+        ecx::BondV2CapitalSnapshot snapshot;
+        if (!pcursor->GetValue(snapshot)) {
+            return error("%s: failed to read ECX bond V2 capital projection", __func__);
+        }
+        CBlockIndex* index{insertBlockIndex(key.second)};
+        if (!index || index->GetBlockHash() != key.second ||
+            snapshot.exchange_state_root != index->hashExchangeStateRoot) {
+            return error(
+                "%s: ECX bond V2 projection is orphaned or root-mismatched for %s",
+                __func__, key.second.GetHex());
+        }
+        index->ecxBondV2Capital = std::move(snapshot);
+        ++capital_entries;
+        pcursor->Next();
+    }
+    LogPrintf("LoadBlockIndexGuts: loaded %u ECX bond V2 capital projections\n",
+        static_cast<unsigned int>(capital_entries));
     return true;
 }
 

@@ -58,6 +58,16 @@ class FedPegTest(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
 
+    def sidechain_extra_args(self, node_index):
+        """Allow focused fedpeg regressions to add sidechain-only arguments."""
+        return []
+
+    def sidechain_initial_free_coins(self, node_index):
+        return 0
+
+    def sidechain_connect_genesis_outputs(self, node_index):
+        return False
+
     def setup_network(self, split=False):
         if self.options.parent_bitcoin and self.options.parent_binpath == "":
             raise Exception("Can't run with --parent_bitcoin without specifying --parent_binpath")
@@ -115,7 +125,9 @@ class FedPegTest(BitcoinTestFramework):
                 '-fedpegscript=%s' % self.fedpeg_script,
                 '-minrelaytxfee=0',
                 '-blockmintxfee=0',
-                '-initialfreecoins=0',
+                '-initialfreecoins=%s' % self.sidechain_initial_free_coins(n),
+                '-con_connect_genesis_outputs=%s' % (
+                    1 if self.sidechain_connect_genesis_outputs(n) else 0),
                 '-peginconfirmationdepth=10',
                 '-mainchainrpchost=127.0.0.1',
                 '-mainchainrpcport=%s' % rpc_port(n),
@@ -140,6 +152,8 @@ class FedPegTest(BitcoinTestFramework):
             # Immediate activation of dynafed when requested versus "never" from conf
             if self.options.pre_transition or self.options.post_transition:
                 extra_args.extend(["-evbparams=dynafed:-1:::"])
+
+            extra_args.extend(self.sidechain_extra_args(n))
 
             # Use rpcuser auth only for first parent.
             if n==0:

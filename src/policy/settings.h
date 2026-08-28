@@ -6,6 +6,8 @@
 #ifndef BITCOIN_POLICY_SETTINGS_H
 #define BITCOIN_POLICY_SETTINGS_H
 
+#include <chainparams.h>
+#include <ecx_exchange_state.h>
 #include <policy/policy.h>
 
 class CFeeRate;
@@ -19,7 +21,16 @@ extern bool fIsBareMultisigStd;
 
 static inline bool IsStandardTx(const CTransaction& tx, std::string& reason)
 {
-    return IsStandardTx(tx, ::fIsBareMultisigStd, ::dustRelayFee, reason);
+    const ecx::ExchangeConsensus* ecx_consensus =
+        Params().GetConsensus().elements_mode
+        ? &ecx::LayerTwoLabsExchangeConsensus()
+        : nullptr;
+    return IsStandardTx(
+        tx,
+        ::fIsBareMultisigStd,
+        ::dustRelayFee,
+        reason,
+        ecx_consensus);
 }
 
 static inline int64_t GetVirtualTransactionSize(int64_t weight, int64_t sigop_cost)

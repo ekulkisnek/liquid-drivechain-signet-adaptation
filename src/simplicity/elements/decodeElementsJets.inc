@@ -132,5 +132,11 @@
         case 50: *result = TRANSACTION_ID; return SIMPLICITY_NO_ERROR;
       }
       break;
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+#include "ecxPrivateE2eDecodeElementsJets.inc"
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+#include "ecxDecodeElementsJets.inc"
+#endif
   }
 }

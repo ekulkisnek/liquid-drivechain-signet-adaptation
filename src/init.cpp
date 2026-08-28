@@ -40,9 +40,8 @@
 #include <node/caches.h>
 #include <node/chainstate.h>
 #include <node/context.h>
-#include <drivechain_settings.h>
 #include <node/drivechain_withdrawal_bundle.h>
-#include <node/drivechain_withdrawal_journal.h>
+#include <node/ecx_deployment_identity.h>
 #include <node/miner.h>
 #include <node/ui_interface.h>
 #include <policy/feerate.h>
@@ -156,41 +155,7 @@ static uint256 GetMainchainBlockHash(const int64_t height)
     return uint256S(CallMainChainRPCChecked("getblockhash", params).get_str());
 }
 
-static void SubmitDrivechainBmmGrpcRequest(const int sidechain_slot, const int64_t mainchain_tip_height, const uint256& mainchain_tip_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
-{
-    const std::string request = strprintf(
-        "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
-        sidechain_slot,
-        sidechain_fees,
-        mainchain_tip_height,
-        sidechain_block_hash.GetHex(),
-        mainchain_tip_hash.GetHex());
-    const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
-        "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
-        request,
-        std::chrono::seconds{10},
-        64U * 1024U,
-        [] { return ShutdownRequested(); });
-    if (!child.started || !child.exited || child.exit_code != 0 ||
-        child.timed_out || child.cancelled || child.output_truncated ||
-        !child.error.empty()) {
-        if (child.output.find("AlreadyExists") != std::string::npos ||
-            child.output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
-            LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
-                sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
-            return;
-        }
-        throw std::runtime_error(strprintf(
-            "authenticated BIP301 request failed: %s%s",
-            child.error,
-            child.output.empty() ? "" : strprintf(" (%s)", child.output)));
-    }
-    LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, sidechain block %s, fees %s, response %s\n",
-        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height,
-        sidechain_block_hash.GetHex(), FormatMoney(sidechain_fees), child.output);
-}
-
-static bool SubmitDrivechainBmm(const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount sidechain_fees)
+static bool SubmitDrivechainBmm(const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount bid)
 {
     const int64_t mainchain_tip_height = GetMainchainBlockHeight();
     const uint256 mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height);
@@ -200,13 +165,22 @@ static bool SubmitDrivechainBmm(const int sidechain_slot, const int64_t parent_h
         return false;
     }
 
-    try {
-        SubmitDrivechainBmmGrpcRequest(sidechain_slot, mainchain_tip_height, mainchain_tip_hash, sidechain_block_hash, sidechain_fees);
-        return true;
-    } catch (const std::exception& e) {
-        LogPrintf("drivechain L1 block sync: BIP301 gRPC request failed: %s\n", e.what());
+    uint256 request_txid;
+    std::string error;
+    if (!SubmitDrivechainBmmBid(
+            sidechain_slot,
+            static_cast<uint64_t>(bid),
+            static_cast<uint32_t>(mainchain_tip_height),
+            sidechain_block_hash,
+            mainchain_tip_hash,
+            request_txid,
+            &error)) {
+        LogPrintf("drivechain L1 block sync: BIP301 work bid failed: %s\n", error);
         return false;
     }
+    LogPrintf("drivechain L1 block sync: submitted funded BIP301 work bid %s for critical hash %s; parent request txid %s\n",
+        FormatMoney(bid), sidechain_block_hash.GetHex(), request_txid.GetHex());
+    return true;
 }
 
 static bool WaitForDrivechainBmmProof(
@@ -308,6 +282,11 @@ static bool AcceptPreparedDrivechainBlock(ChainstateManager& chainman, const CBl
 
 static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
 {
+    if (!Params().GetConsensus().elements_mode ||
+        !Params().GetConsensus().has_parent_chain) {
+        LogPrintf("drivechain L1 block sync: disabled outside an Elements parent-chain configuration\n");
+        return false;
+    }
     if (!node.chainman || !node.mempool) {
         LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n");
         return false;
@@ -355,6 +334,25 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
     }
 
     const CAmount sidechain_fees = -block_template->vTxFees[0];
+    uint64_t simplicity_milliweight{0};
+    for (const CTransactionRef& tx : block_template->block.vtx) {
+        const uint64_t tx_work{GetSimplicityValidationMilliweight(*tx)};
+        if (simplicity_milliweight > std::numeric_limits<uint64_t>::max() - tx_work) {
+            LogPrintf("drivechain L1 block sync: candidate Simplicity work accounting overflow\n");
+            return false;
+        }
+        simplicity_milliweight += tx_work;
+    }
+    BmmWorkFeeQuote fee_quote;
+    if (!CalculateBmmWorkFeeQuote(
+            sidechain_fees,
+            simplicity_milliweight,
+            gArgs.GetIntArg("-drivechainbmmworksatsperkwu", 1000),
+            gArgs.GetIntArg("-drivechainbmmproducerreserve", 0),
+            fee_quote) || fee_quote.bid <= 0) {
+        LogPrintf("drivechain L1 block sync: candidate fees cannot fund verification, reserve, and a positive BIP301 bid\n");
+        return false;
+    }
     const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
     if (sidechain_slot != drivechain::BMM_SIDECHAIN_SLOT) {
         LogPrintf("drivechain L1 block sync: deterministic BMM consensus is fixed to sidechain slot 24\n");
@@ -370,11 +368,15 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
         return false;
     }
     const uint256 critical_hash = block_template->block.GetBmmCriticalHash();
-    if (!SubmitDrivechainBmm(sidechain_slot, parent_height, parent_hash, critical_hash, sidechain_fees)) {
+    if (!SubmitDrivechainBmm(sidechain_slot, parent_height, parent_hash, critical_hash, fee_quote.bid)) {
         LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
             side_height, parent_height);
         return false;
     }
+    LogPrintf("drivechain L1 block sync: work-priced candidate fees=%s verification=%s reserve=%s bid=%s simplicity_milliweight=%u\n",
+        FormatMoney(sidechain_fees), FormatMoney(fee_quote.verification_fee),
+        FormatMoney(fee_quote.producer_reserve), FormatMoney(fee_quote.bid),
+        simplicity_milliweight);
 
     drivechain::BmmProof bmm_proof;
     if (!WaitForDrivechainBmmProof(
@@ -403,7 +405,10 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
 
 static void DrivechainL1BlockSyncTick(NodeContext& node)
 {
-    if (ShutdownRequested() || !gArgs.GetBoolArg("-drivechainl1blocksync", true)) {
+    if (ShutdownRequested() ||
+        !Params().GetConsensus().elements_mode ||
+        !Params().GetConsensus().has_parent_chain ||
+        !gArgs.GetBoolArg("-drivechainl1blocksync", true)) {
         return;
     }
 
@@ -792,6 +797,54 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-ecxdepositinboxdomain=<hex>", "Frozen distinct nonzero deposit inbox domain, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxcollateralvaultscript=<hex>", "Frozen raw collateral-vault script bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxcollateralvaultscripthash=<hex>", "SHA256 of the frozen raw collateral-vault script bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    argsman.AddArg("-ecxprivatebmmcheckpoint", "Use the compile-time private replay BMM checkpoint (private E2E build only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxprivatebmmactivationheight=<n>", "Require private replay BMM proofs beginning at sidechain height n (required with -ecxprivatebmmcheckpoint; private E2E build only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxprivatesimplicitycataloguesha256=<hex>", "Test-only hash of the private Simplicity catalogue exposed by getsimplicityinfo", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxprivatesimplicityprogramcmr=<hex>", "Test-only prediction-market program CMR exposed by getsimplicityinfo", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+#endif
+#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
+    argsman.AddArg("-ecxbondv2", "Enable exact two-transaction bond V2 activation on elementsregtest using the compiled reviewed catalogue", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2deploymenttx=<hex>", "Exact preauthorized fixed-supply bond issuance/inventory/token-burn transaction", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2genesistx=<hex>", "Exact preauthorized V2 genesis-singleton transaction spending the deployment authority output", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2issuanceinput=<n>", "Issuance input index in the exact bond deployment transaction", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2inventoryoutput=<n>", "Full confidential bond inventory output index", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2burnoutput=<n>", "Explicit unspendable reissuance-token output index", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2stateauthoritysourceoutput=<n>", "Exact deployment output spent by V2 genesis input zero", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    for (const char* name : {
+             "-ecxbondv2inventoryassetblinder=<hex>",
+             "-ecxbondv2inventoryvalueblinder=<hex>",
+             "-ecxbondv2transitionprogramid=<hex>",
+             "-ecxbondv2configurationhash=<hex>",
+             "-ecxbondv2publicstatedomain=<hex>",
+             "-ecxbondv2statenodedomain=<hex>",
+             "-ecxbondv2journaldomain=<hex>",
+             "-ecxbondv2transitioncmr=<hex>",
+             "-ecxbondv2incrementalactivationprogramid=<hex>",
+             "-ecxbondv2incrementalactivationconfigurationhash=<hex>",
+             "-ecxbondv2incrementalactivationcmr=<hex>",
+             "-ecxbondv2incrementalsuccessorprogramid=<hex>",
+             "-ecxbondv2incrementalsuccessorconfigurationhash=<hex>",
+             "-ecxbondv2incrementalsuccessortransitioncmr=<hex>",
+             "-ecxbondv2incrementalsuccessorstatenodedomain=<hex>",
+             "-ecxbondv2inventorycmr=<hex>",
+             "-ecxbondv2queuecmr=<hex>",
+             "-ecxbondv2ecxbtcprogramid=<hex>",
+             "-ecxbondv2ecxbtcredemptioncovenant=<hex>",
+             "-ecxbondv2ecxbtcsourcecheckpoint=<hex>",
+             "-ecxbondv2usddusdprogramid=<hex>",
+             "-ecxbondv2usddusdredemptioncovenant=<hex>",
+             "-ecxbondv2usddusdsourcecheckpoint=<hex>",
+             "-ecxbondv2matcherreceipt=<hex>",
+             "-ecxbondv2orderreceiptsroot=<hex>",
+             "-ecxbondv2availabilityroot=<hex>",
+             "-ecxbondv2usddasset=<hex>",
+             "-ecxbondv2keylessinternalkey=<hex>"}) {
+        argsman.AddArg(name, "Exact bond V2 activation identity (32 raw hex bytes)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    }
+    argsman.AddArg("-ecxbondv2configurationbytes=<hex>", "Exact canonical FrozenConfigurationV2 bytes whose tagged hash is authorized", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2genesismarkprice=<n>", "Exact positive genesis ECX/USDD mark price", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+#endif
     argsman.AddArg("-settings=<file>", strprintf("Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and not meant to be edited by users (use %s instead for custom settings). Relative paths will be prefixed by datadir location. (default: %s)", BITCOIN_CONF_FILENAME, BITCOIN_SETTINGS_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #if HAVE_SYSTEM
     argsman.AddArg("-startupnotify=<cmd>", "Execute command on startup.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -981,7 +1034,7 @@ void SetupServerArgs(ArgsManager& argsman)
 
     argsman.AddArg("-initialfreecoins", strprintf("The amount of OP_TRUE coins created in the genesis block. Primarily for testing. (default: %d)", 0), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatepegin", "Validate peg-in claims. An RPC connection will be attempted to the trusted mainchain daemon using the `mainchain*` settings below. All functionaries must run this enabled. (default: 1 if chain has federated peg)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpchost=<host>", "Loopback endpoint used to connect to the trusted parent-chain daemon. Remote nodes must be exposed through a local authenticated TLS tunnel because parent JSON-RPC uses HTTP Basic credentials. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpchost=<host>", "The address which the daemon will try to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: 127.0.0.1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcport=<n>", strprintf("The port which the daemon will try to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: %u)", defaultBaseParams->MainchainRPCPort()), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcuser=<user>", "The rpc username that the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcpassword=<pwd>", "The rpc password which the daemon will use to connect to the trusted mainchain daemon to validate peg-ins, if enabled. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
@@ -990,18 +1043,11 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used for mined BMM commitment enforcement. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "Mutually authenticated TLS endpoint used for every CUSF enforcer request. Point this at the local TLS proxy, not the enforcer plaintext port. (default: 127.0.0.1:55051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Path to grpcurl used for authenticated BIP300/301 requests. (default: grpcurl)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcca=<file>", "PEM CA certificate used to authenticate the enforcer TLS server. Relative paths are resolved under the network data directory. (default: enforcer-tls/ca.pem)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpccert=<file>", "PEM client certificate presented to the enforcer TLS endpoint. (default: enforcer-tls/elements-client.pem)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpckey=<file>", "PEM client private key for enforcer mutual TLS. It must be owner-only and may not be a symlink on POSIX. (default: enforcer-tls/elements-client-key.pem)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcauthority=<name>", "Optional TLS server name sent by grpcurl when the proxy certificate name differs from its address.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmactivationheight=<n>", "Sidechain height from which strict BMM enforcement is mandatory. Required on a chain that is not a descendant of the historical public-Signet checkpoint; every node must agree on the value. (default: unset)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmanchorstate=<hex>", "Hex-encoded parent-chain state anchoring the first BMM proof at -drivechainbmmactivationheight. (default: unset)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechaingenesisctip=<txid:vout:value_sats:sequence>", "Consensus bootstrap CTIP established by this sidechain's M1/M2 activation on the parent chain. Required before the first deposit on a newly activated chain; every node must be configured identically. (default: unset)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainsidechainslot=<n>", strprintf("BIP300 sidechain slot this node's peg-out path is bound to. (default: %d)", DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Compatibility alias for -drivechainbmmgrpcaddr. If both are set they must identify the same mutually authenticated TLS endpoint.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainpegoutmainfee=<sats>", strprintf("Satoshi reserved from each withdrawal to pay the M6 bundle's parent-chain fee. Must be positive; a bundle with no fee may never be mined. (default: %d)", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer Connect/JSON address used for BIP301 requests and mined commitment verification. Requests use bounded in-process HTTP and never launch an external command. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmwalletaddr=<host:port>", "BitWindow Connect/JSON wallet bridge used to fund BIP301 bids. (default: 127.0.0.1:30301)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmconnectauthcookie=<file>", "BitWindow local-auth cookie used as a bearer token for the wallet bridge. The token is read from this file and is never placed in process arguments.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmworksatsperkwu=<amount>", "Verification price in policy-asset satoshis per 1,000 units of deterministic Simplicity validation weight. (default: 1000)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmproducerreserve=<amount>", "Policy-asset satoshis retained by the candidate producer after verification cost and before funding its BIP301 bid. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainsidechainnetwork=<name>", "Sidechain network required for authenticated drivechain deposits. (default: liquid-signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainmainchainnetwork=<name>", "Mainchain network required for authenticated drivechain deposits. (default: signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainmainchainsignetchallenge=<hex>", "Signet challenge required for authenticated drivechain deposits. (default: LayerTwoLabs public signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -1718,6 +1764,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // ELEMENTS:
     policyAsset = CAsset(uint256S(gArgs.GetArg("-feeasset", chainparams.GetConsensus().pegged_asset.GetHex())));
 
+    // Reject a changed deployment identity before Step 7 can open, replay,
+    // wipe or reinterpret chainstate. This intentionally follows policyAsset
+    // initialization because the ECX source-marker rules consume that asset.
+    std::string ecx_identity_error;
+    if (!node::CheckEcxDeploymentIdentity(ecx_identity_error)) {
+        return InitError(Untranslated(strprintf(
+            "ECX consensus configuration error: %s",
+            ecx_identity_error)));
+    }
+
     /* Start the RPC server already.  It will be started in "warmup" mode
      * and not really process calls already (but it will signify connections
      * that the server is there and will be ready later).  Warmup mode will
@@ -1989,6 +2045,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             case ChainstateLoadingError::ERROR_GENERIC_BLOCKDB_OPEN_FAILED:
                 strLoadError = _("Error opening block database");
                 break;
+            case ChainstateLoadingError::ERROR_ECX_CONSENSUS_IDENTITY:
+                return InitError(Untranslated(
+                    "ECX consensus configuration cannot be bound to this data directory; "
+                    "see debug.log for the exact pre-activation requirement"));
             case ChainstateLoadingError::ERROR_BLOCKS_WITNESS_INSUFFICIENTLY_VALIDATED:
                 strLoadError = strprintf(_("Witness data for blocks after height %d requires validation. Please restart with -reindex."),
                                          chainparams.GetConsensus().SegwitHeight);
@@ -2348,8 +2408,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     RPCNotifyBlockChange(chainman.ActiveTip());
     SetRPCWarmupFinished();
 
-    // ELEMENTS:
-    if (gArgs.GetBoolArg("-validatepegin", Params().GetConsensus().has_parent_chain)) {
+    // Parent-chain RPC is meaningful only for an Elements chain that actually
+    // has a parent. A stray -validatepegin on a Bitcoin-mode chain must not
+    // turn an external RPC response into a startup dependency.
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (consensus.elements_mode && consensus.has_parent_chain &&
+        gArgs.GetBoolArg("-validatepegin", consensus.has_parent_chain)) {
         uiInterface.InitMessage(_("Awaiting mainchain RPC warmup").translated);
         if (!MainchainRPCCheck()) {
             const std::string err_msg = "ERROR: elements is set to verify peg-ins but cannot get a valid response from the mainchain daemon. Please check debug.log for more information.\n\nIf you haven't setup a bitcoind please get the latest stable version from https://bitcoincore.org/en/download/ or if you do not need to validate peg-ins set in your elements configuration validatepegin=0";
@@ -2404,55 +2468,18 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         client->start(*node.scheduler);
     }
 
-    node::WithdrawalJournalEntry withdrawal_journal;
-    std::string withdrawal_journal_error;
-    const node::WithdrawalJournalReadResult withdrawal_journal_result =
-        node::ReadWithdrawalJournal(
-            args.GetDataDirNet(), withdrawal_journal, &withdrawal_journal_error);
-    {
+    if (chainparams.GetConsensus().elements_mode &&
+        chainparams.GetConsensus().has_parent_chain) {
         LOCK(cs_main);
         const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
-        uint256 bundle_hash = tip == nullptr ? uint256::ZERO : tip->hashWithdrawalBundle;
-        LogPrintf("Restored drivechain withdrawal bundle state from sidechain tip: %s\n", bundle_hash.GetHex());
-
-        if (withdrawal_journal_result == node::WithdrawalJournalReadResult::CORRUPT) {
-            LogPrintf("ERROR: drivechain withdrawal journal is corrupt: %s. "
-                      "All withdrawal submission and recovery RPCs will fail closed until it is repaired.\n",
-                      withdrawal_journal_error);
-        } else if (withdrawal_journal_result == node::WithdrawalJournalReadResult::OK) {
-            const node::WithdrawalJournalState state = withdrawal_journal.GetState();
-            if (state == node::WithdrawalJournalState::BUNDLE_SUBMITTED) {
-                if (bundle_hash.IsNull() || bundle_hash == withdrawal_journal.m6id) {
-                    bundle_hash = withdrawal_journal.m6id;
-                    LogPrintf("Recovered in-flight drivechain withdrawal from journal: m6id=%s "
-                              "sidechain_txid=%s state=%d. Run `drivechainrecoverwithdrawal` to "
-                              "inspect or resubmit it.\n",
-                              withdrawal_journal.m6id.GetHex(),
-                              withdrawal_journal.sidechain_txid.GetHex(),
-                              int{withdrawal_journal.state});
-                } else {
-                    LogPrintf("WARNING: drivechain withdrawal journal (m6id=%s) disagrees with the "
-                              "sidechain tip (m6id=%s). Withdrawals will stay blocked until this is "
-                              "resolved with `drivechainrecoverwithdrawal`.\n",
-                              withdrawal_journal.m6id.GetHex(), bundle_hash.GetHex());
-                }
-            } else {
-                // The durable journal is authoritative across the window where
-                // the chain tip can still carry the previous bundle. RESERVED
-                // has not been accepted by the enforcer, FAILED needs an
-                // explicit retry, and SETTLED is terminal. None may resurrect
-                // or continue stamping any tip bundle after restart.
-                if (!bundle_hash.IsNull()) {
-                    LogPrintf("Drivechain withdrawal journal state %d is not active; "
-                              "cleared sidechain-tip m6id %s from block production "
-                              "(journal m6id=%s).\n",
-                              int{withdrawal_journal.state}, bundle_hash.GetHex(),
-                              withdrawal_journal.m6id.GetHex());
-                }
-                bundle_hash.SetNull();
-            }
-        }
+        const uint256 bundle_hash =
+            tip == nullptr ? uint256::ZERO : tip->hashWithdrawalBundle;
         node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle_hash);
+        LogPrintf(
+            "Restored drivechain withdrawal bundle state from sidechain tip: %s\n",
+            bundle_hash.GetHex());
+    } else {
+        node::RestoreCurrentDrivechainWithdrawalBundleHash(uint256::ZERO);
     }
 
     BanMan* banman = node.banman.get();
@@ -2460,7 +2487,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         banman->DumpBanlist();
     }, DUMP_BANS_INTERVAL);
 
-    if (args.GetBoolArg("-drivechainl1blocksync", true)) {
+    if (chainparams.GetConsensus().elements_mode &&
+        chainparams.GetConsensus().has_parent_chain &&
+        args.GetBoolArg("-drivechainl1blocksync", true)) {
         const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
         LogPrintf("Starting drivechain L1 block sync thread, interval %d seconds, mined BIP301 BMM enforcement, sidechain slot %d\n",
             interval_seconds,

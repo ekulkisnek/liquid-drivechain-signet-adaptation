@@ -637,9 +637,11 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nPeriod = 128; // test ability to change from default
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nThreshold = 128;
 
-        // Simplicity (YOLO: force active for the first 0xbe tx broadcast task)
+        // Simplicity is an Elements deployment and has no consensus meaning on
+        // the Bitcoin-compatible regtest chain. Local Simplicity testing uses
+        // the distinct elementsregtest custom chain below.
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit = 21;
-        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height = 0; // No activation delay
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nPeriod = 128; // test ability to change from default
@@ -661,22 +663,12 @@ public:
         pegin_minimum = PeginMinimum();
         consensus.has_parent_chain = false;
         g_signed_blocks = false;
-        // RedWallet's phone-local Liquid wallet uses Liquid Wallet Kit, which
-        // produces Elements transaction serialization. Keep local regtest on
-        // Elements semantics by default so real LWK transactions can be
-        // decoded, validated, mined, and indexed during device E2E runs.
-        g_con_elementsmode = args.GetBoolArg("-con_elementsmode", true);
+        // Keep the standard regtest network Bitcoin-compatible. Elements-mode
+        // local testing uses the distinct elementsregtest chain.
+        g_con_elementsmode = false;
         consensus.elements_mode = g_con_elementsmode;
         g_con_blockheightinheader = false;
         consensus.total_valid_epochs = 0;
-        if (g_con_elementsmode) {
-            std::vector<unsigned char> commit = CommitToArguments(consensus, strNetworkID);
-            uint256 entropy;
-            GenerateAssetEntropy(entropy, COutPoint(uint256(commit), 0), parentGenesisBlockHash);
-            CalculateAsset(consensus.pegged_asset, entropy);
-            consensus.subsidy_asset = consensus.pegged_asset;
-        }
-
         pchMessageStart[0] = 0xfa;
         pchMessageStart[1] = 0xbf;
         pchMessageStart[2] = 0xb5;
@@ -690,10 +682,8 @@ public:
 
         genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN, consensus);
         consensus.hashGenesisBlock = genesis.GetHash();
-        if (!g_con_elementsmode) {
-            assert(consensus.hashGenesisBlock == uint256S("0x0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"));
-            assert(genesis.hashMerkleRoot == uint256S("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
-        }
+        assert(consensus.hashGenesisBlock == uint256S("0x0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"));
+        assert(genesis.hashMerkleRoot == uint256S("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();
@@ -1704,6 +1694,29 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
     } else if (chain == CBaseChainParams::SIGNET) {
         return std::unique_ptr<CChainParams>(new SigNetParams(args));
     } else if (chain == CBaseChainParams::REGTEST) {
+        // CCustomParams derives from CRegTestParams, so this guard must live at
+        // the exact network-selection boundary instead of in the base
+        // constructor. Otherwise every custom Elements chain that explicitly
+        // enables Elements mode is rejected before its parameters are applied.
+        if (args.GetBoolArg("-con_elementsmode", false)) {
+            throw std::runtime_error(
+                "-con_elementsmode is not supported with -chain=regtest; "
+                "use -chain=elementsregtest for Elements/ECX testing");
+        }
+        for (const std::string& deployment : args.GetArgs("-vbparams")) {
+            const auto separator{deployment.find(':')};
+            const std::string deployment_name{deployment.substr(0, separator)};
+            if (deployment_name == "simplicity") {
+                throw std::runtime_error(
+                    "the Simplicity deployment is not supported with "
+                    "-chain=regtest; use an Elements-mode chain");
+            }
+            if (deployment_name == "dynafed") {
+                throw std::runtime_error(
+                    "the dynafed deployment is not supported with "
+                    "-chain=regtest; use an Elements-mode chain");
+            }
+        }
         return std::unique_ptr<CChainParams>(new CRegTestParams(args));
     } else if (chain == CBaseChainParams::LIQUID1) {
         return std::unique_ptr<CChainParams>(new CLiquidV1Params(args));

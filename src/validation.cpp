@@ -162,6 +162,36 @@ arith_uint256 nMinimumChainWork;
 
 CFeeRate minRelayTxFee = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
 
+static void ClearExchangeScriptContext(PrecomputedTransactionData& txdata)
+{
+    txdata.m_prior_active_exchange_state_root.reset();
+    txdata.m_prior_active_forced_inbox_root.reset();
+    txdata.m_prior_active_deposit_inbox_root.reset();
+    txdata.m_prior_active_forced_processed_cursor.reset();
+    txdata.m_prior_active_deposit_processed_cursor.reset();
+    txdata.m_current_bmm_parent_block_hash.reset();
+    txdata.m_current_bmm_parent_height.reset();
+    txdata.m_current_bmm_parent_mtp.reset();
+    txdata.m_bond_v2_configuration_hash.reset();
+    txdata.m_bond_v2_asset_id.reset();
+    txdata.m_bond_v2_deployment_commitment.reset();
+    txdata.m_bond_v2_transition_cmr.reset();
+    txdata.m_bond_v2_collateral_vault_script_sha256.reset();
+    txdata.m_bond_v2_collateral_vault_cmr.reset();
+    txdata.m_bond_v2_insurance_reserve_script_sha256.reset();
+    txdata.m_bond_v2_insurance_reserve_cmr.reset();
+    txdata.m_bond_v2_incremental_activation_program_id.reset();
+    txdata.m_bond_v2_incremental_activation_configuration_hash.reset();
+    txdata.m_bond_v2_incremental_activation_cmr.reset();
+    txdata.m_incremental_successor_program_id.reset();
+    txdata.m_bond_v2_incremental_successor_configuration_hash.reset();
+    txdata.m_incremental_successor_transition_cmr.reset();
+    txdata.m_incremental_successor_state_node_domain_sha256.reset();
+    txdata.m_prior_active_bond_inbox_root.reset();
+    txdata.m_prior_active_bond_inbox_count.reset();
+    txdata.m_current_sidechain_height.reset();
+}
+
 static void BindPriorActiveExchangeStateRoot(
     PrecomputedTransactionData& txdata,
     const CBlockIndex* previous,
@@ -170,17 +200,25 @@ static void BindPriorActiveExchangeStateRoot(
     uint256 exchange_root;
     uint256 forced_root;
     uint256 deposit_root;
+    uint64_t forced_cursor{0};
+    uint64_t deposit_cursor{0};
     std::string error;
     if (ecx::GetPriorActiveExchangeStateRoot(previous, exchange_root, error) &&
         ecx::GetPriorActiveForcedInboxRoot(previous, forced_root, error) &&
-        ecx::GetPriorActiveDepositInboxRoot(previous, deposit_root, error)) {
+        ecx::GetPriorActiveDepositInboxRoot(previous, deposit_root, error) &&
+        ecx::GetPriorActiveInboxCursors(
+            previous, forced_cursor, deposit_cursor, error)) {
         txdata.m_prior_active_exchange_state_root = exchange_root;
         txdata.m_prior_active_forced_inbox_root = forced_root;
         txdata.m_prior_active_deposit_inbox_root = deposit_root;
+        txdata.m_prior_active_forced_processed_cursor = forced_cursor;
+        txdata.m_prior_active_deposit_processed_cursor = deposit_cursor;
     } else {
         txdata.m_prior_active_exchange_state_root.reset();
         txdata.m_prior_active_forced_inbox_root.reset();
         txdata.m_prior_active_deposit_inbox_root.reset();
+        txdata.m_prior_active_forced_processed_cursor.reset();
+        txdata.m_prior_active_deposit_processed_cursor.reset();
     }
 
     drivechain::BmmParentContext parent;
@@ -194,13 +232,123 @@ static void BindPriorActiveExchangeStateRoot(
         txdata.m_current_bmm_parent_height.reset();
         txdata.m_current_bmm_parent_mtp.reset();
     }
+
+    const auto& frozen{ecx::LayerTwoLabsExchangeConsensus().bond_v2};
+    if (previous && previous->ecxBondV2Capital.has_value()) {
+        const auto& capital{*previous->ecxBondV2Capital};
+        uint64_t prior_bond_inbox_count{0};
+        const bool finite_identity{
+            capital.configuration_hash == frozen.configuration_hash &&
+            capital.transition_program_id == frozen.transition_program_id &&
+            capital.transition_cmr == frozen.transition_cmr};
+        const bool successor_identity{
+            capital.configuration_hash == frozen.incremental_successor_configuration_hash &&
+            capital.transition_program_id == frozen.incremental_successor_program_id &&
+            capital.transition_cmr == frozen.incremental_successor_transition_cmr};
+        if (frozen.activation_enabled && frozen.identities_frozen &&
+            (finite_identity || successor_identity) &&
+            capital.bond_asset_id == frozen.bond_asset_id &&
+            capital.bond_deployment_commitment ==
+                frozen.bond_deployment_commitment &&
+            capital.node_bond_inbox_entry_count.ToU64(prior_bond_inbox_count) &&
+             !frozen.insurance_reserve_script_sha256.IsNull() &&
+             !frozen.insurance_reserve_covenant_cmr.IsNull() &&
+             !frozen.collateral_vault_covenant_cmr.IsNull() &&
+             !frozen.incremental_activation_program_id.IsNull() &&
+             !frozen.incremental_activation_configuration_hash.IsNull() &&
+             !frozen.incremental_activation_cmr.IsNull() &&
+             !frozen.incremental_successor_program_id.IsNull() &&
+             !frozen.incremental_successor_configuration_hash.IsNull() &&
+             !frozen.incremental_successor_transition_cmr.IsNull() &&
+             !frozen.incremental_successor_state_node_domain_sha256.IsNull()) {
+            txdata.m_bond_v2_configuration_hash = frozen.configuration_hash;
+            txdata.m_bond_v2_asset_id = frozen.bond_asset_id;
+            txdata.m_bond_v2_deployment_commitment =
+                frozen.bond_deployment_commitment;
+            txdata.m_bond_v2_transition_cmr = frozen.transition_cmr;
+            txdata.m_bond_v2_collateral_vault_script_sha256 =
+                ecx::LayerTwoLabsExchangeConsensus().collateral_vault_script_hash;
+            txdata.m_bond_v2_collateral_vault_cmr =
+                frozen.collateral_vault_covenant_cmr;
+            txdata.m_bond_v2_insurance_reserve_script_sha256 =
+                frozen.insurance_reserve_script_sha256;
+            txdata.m_bond_v2_insurance_reserve_cmr =
+                frozen.insurance_reserve_covenant_cmr;
+            txdata.m_bond_v2_incremental_activation_program_id =
+                frozen.incremental_activation_program_id;
+            txdata.m_bond_v2_incremental_activation_configuration_hash =
+                frozen.incremental_activation_configuration_hash;
+            txdata.m_bond_v2_incremental_activation_cmr =
+                frozen.incremental_activation_cmr;
+            txdata.m_incremental_successor_program_id =
+                frozen.incremental_successor_program_id;
+            txdata.m_bond_v2_incremental_successor_configuration_hash =
+                frozen.incremental_successor_configuration_hash;
+            txdata.m_incremental_successor_transition_cmr =
+                frozen.incremental_successor_transition_cmr;
+            txdata.m_incremental_successor_state_node_domain_sha256 =
+                frozen.incremental_successor_state_node_domain_sha256;
+            txdata.m_prior_active_bond_inbox_root =
+                capital.node_bond_inbox_head_root;
+            txdata.m_prior_active_bond_inbox_count =
+                prior_bond_inbox_count;
+            txdata.m_current_sidechain_height =
+                static_cast<uint64_t>(previous->nHeight) + 1;
+        } else {
+            txdata.m_bond_v2_configuration_hash.reset();
+            txdata.m_bond_v2_asset_id.reset();
+            txdata.m_bond_v2_deployment_commitment.reset();
+            txdata.m_bond_v2_transition_cmr.reset();
+            txdata.m_bond_v2_collateral_vault_script_sha256.reset();
+            txdata.m_bond_v2_collateral_vault_cmr.reset();
+            txdata.m_bond_v2_insurance_reserve_script_sha256.reset();
+            txdata.m_bond_v2_insurance_reserve_cmr.reset();
+            txdata.m_bond_v2_incremental_activation_program_id.reset();
+            txdata.m_bond_v2_incremental_activation_configuration_hash.reset();
+            txdata.m_bond_v2_incremental_activation_cmr.reset();
+            txdata.m_incremental_successor_program_id.reset();
+            txdata.m_bond_v2_incremental_successor_configuration_hash.reset();
+            txdata.m_incremental_successor_transition_cmr.reset();
+            txdata.m_incremental_successor_state_node_domain_sha256.reset();
+            txdata.m_prior_active_bond_inbox_root.reset();
+            txdata.m_prior_active_bond_inbox_count.reset();
+            txdata.m_current_sidechain_height.reset();
+        }
+    } else {
+        txdata.m_bond_v2_configuration_hash.reset();
+        txdata.m_bond_v2_asset_id.reset();
+        txdata.m_bond_v2_deployment_commitment.reset();
+        txdata.m_bond_v2_transition_cmr.reset();
+        txdata.m_bond_v2_collateral_vault_script_sha256.reset();
+        txdata.m_bond_v2_collateral_vault_cmr.reset();
+        txdata.m_bond_v2_insurance_reserve_script_sha256.reset();
+        txdata.m_bond_v2_insurance_reserve_cmr.reset();
+        txdata.m_bond_v2_incremental_activation_program_id.reset();
+        txdata.m_bond_v2_incremental_activation_configuration_hash.reset();
+        txdata.m_bond_v2_incremental_activation_cmr.reset();
+        txdata.m_incremental_successor_program_id.reset();
+        txdata.m_bond_v2_incremental_successor_configuration_hash.reset();
+        txdata.m_incremental_successor_transition_cmr.reset();
+        txdata.m_incremental_successor_state_node_domain_sha256.reset();
+        txdata.m_prior_active_bond_inbox_root.reset();
+        txdata.m_prior_active_bond_inbox_count.reset();
+        txdata.m_current_sidechain_height.reset();
+    }
 }
 
 static void BindPriorActiveExchangeStateRootFromView(
     PrecomputedTransactionData& txdata,
     const CBlockIndex* previous,
-    const CCoinsViewCache& view)
+    const CCoinsViewCache& view,
+    const bool elements_mode)
 {
+    if (!elements_mode) {
+        // Reserved ECX/BMM outpoints and header bits have no meaning on a
+        // Bitcoin-mode chain. This explicit reset also prevents a reused
+        // precomputation object from retaining an Elements script context.
+        ClearExchangeScriptContext(txdata);
+        return;
+    }
     drivechain::BmmL1State prior_bmm_state;
     std::string error;
     const bool have_bmm_state{drivechain::GetEffectiveBmmState(
@@ -787,7 +935,9 @@ private:
                 }
 
                 // get the parent transaction fee, to calculate the fee rate
-                if (gArgs.GetBoolArg("-validatepegin", Params().GetConsensus().has_parent_chain)) {
+                const Consensus::Params& consensus = Params().GetConsensus();
+                if (consensus.elements_mode && consensus.has_parent_chain &&
+                    gArgs.GetBoolArg("-validatepegin", consensus.has_parent_chain)) {
                     UniValue params(UniValue::VARR);
                     params.push_back(txid.GetHex());
                     params.push_back(2);
@@ -900,6 +1050,19 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx.IsCoinBase())
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
+
+    if (chainparams.GetConsensus().elements_mode) {
+        std::string ecx_source_error;
+        if (!ecx::CheckSourceTransactionPolicy(
+                tx,
+                m_active_chainstate.m_chain.Height() + 1,
+                ecx_source_error)) {
+            return state.Invalid(
+                TxValidationResult::TX_NOT_STANDARD,
+                "ecx-source-policy",
+                ecx_source_error);
+        }
+    }
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
@@ -1075,7 +1238,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // Check for non-standard witnesses.
-    if (tx.HasWitness() && fRequireStandard && !IsWitnessStandard(tx, m_view))
+    if (tx.HasWitness() && fRequireStandard && !IsWitnessStandard(
+            tx,
+            m_view,
+            chainparams.GetConsensus().elements_mode
+                ? &ecx::LayerTwoLabsExchangeConsensus()
+                : nullptr))
         return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-witness-nonstandard");
 
     int64_t nSigOpsCost = GetTransactionSigOpCost(tx, m_view, STANDARD_SCRIPT_VERIFY_FLAGS);
@@ -1267,12 +1435,14 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     BindPriorActiveExchangeStateRootFromView(
         ws.m_precomputed_txdata,
         m_active_chainstate.m_chain.Tip(),
-        m_active_chainstate.CoinsTip());
+        m_active_chainstate.CoinsTip(),
+        args.m_chainparams.GetConsensus().elements_mode);
 
     // Temporarily add additional script flags based on the activation of
     // Dynamic Federations. This can be included in the
     // STANDARD_LOCKTIME_VERIFY_FLAGS in a release post-activation.
-    if (DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), args.m_chainparams.GetConsensus(), Consensus::DEPLOYMENT_DYNA_FED)) {
+    if (args.m_chainparams.GetConsensus().elements_mode &&
+        DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), args.m_chainparams.GetConsensus(), Consensus::DEPLOYMENT_DYNA_FED)) {
         scriptVerifyFlags |= SCRIPT_SIGHASH_RANGEPROOF;
     }
 
@@ -1306,7 +1476,8 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     BindPriorActiveExchangeStateRootFromView(
         ws.m_precomputed_txdata,
         m_active_chainstate.m_chain.Tip(),
-        m_active_chainstate.CoinsTip());
+        m_active_chainstate.CoinsTip(),
+        chainparams.GetConsensus().elements_mode);
 
     // Check again against the current block tip's script verification
     // flags to cache our script execution flags. This is, of course,
@@ -1964,7 +2135,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     CSHA256 hasher = g_scriptExecutionCacheHasher;
     static const uint256 ecx_cache_domain = [] {
         static constexpr unsigned char tag[]{
-            'E','C','X','/','S','i','m','p','l','i','c','i','t','y','-','c','a','c','h','e','/','v','3'};
+             'E','C','X','/','S','i','m','p','l','i','c','i','t','y','-','c','a','c','h','e','/','v','1','0'};
         uint256 digest;
         CSHA256().Write(tag, sizeof(tag)).Finalize(digest.begin());
         return digest;
@@ -1973,8 +2144,12 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         static_cast<unsigned char>(ecx::EXCHANGE_SCRIPT_CACHE_REVISION >> 8),
         static_cast<unsigned char>(ecx::EXCHANGE_SCRIPT_CACHE_REVISION)}};
     const unsigned char present = txdata.m_prior_active_exchange_state_root.has_value() ? 1 : 0;
-    const unsigned char forced_present = txdata.m_prior_active_forced_inbox_root.has_value() ? 1 : 0;
-    const unsigned char deposit_present = txdata.m_prior_active_deposit_inbox_root.has_value() ? 1 : 0;
+    const bool forced_root_present{
+        txdata.m_prior_active_forced_inbox_root.has_value()};
+    const unsigned char forced_present{txdata.EcxForcedInboxPresence()};
+    const bool deposit_root_present{
+        txdata.m_prior_active_deposit_inbox_root.has_value()};
+    const unsigned char deposit_present{txdata.EcxDepositInboxPresence()};
     const bool bmm_hash_present{
         txdata.m_current_bmm_parent_block_hash.has_value()};
     const bool bmm_height_present{txdata.m_current_bmm_parent_height.has_value()};
@@ -1984,6 +2159,12 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         bmm_hash_present == bmm_mtp_present
         ? (bmm_hash_present ? 1 : 0)
         : 2;
+    const unsigned char bond_v2_identity_present{
+        txdata.EcxBondV2IdentityPresence()};
+    const unsigned char bond_v2_projection_present{
+        txdata.EcxBondV2ProjectionPresence()};
+    const unsigned char bond_v2_incremental_activation_identity_present{
+        txdata.EcxBondV2IncrementalActivationIdentityPresence()};
     const auto encode_u64_be = [](uint64_t value) {
         std::array<unsigned char, 8> bytes{};
         for (int index = 7; index >= 0; --index) {
@@ -1996,18 +2177,90 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         txdata.m_current_bmm_parent_height.value_or(0))};
     const std::array<unsigned char, 8> bmm_mtp{encode_u64_be(
         txdata.m_current_bmm_parent_mtp.value_or(0))};
+    const std::array<unsigned char, 8> forced_cursor{encode_u64_be(
+        txdata.m_prior_active_forced_processed_cursor.value_or(0))};
+    const std::array<unsigned char, 8> deposit_cursor{encode_u64_be(
+        txdata.m_prior_active_deposit_processed_cursor.value_or(0))};
+    const std::array<unsigned char, 8> bond_inbox_count{encode_u64_be(
+        txdata.m_prior_active_bond_inbox_count.value_or(0))};
+    const std::array<unsigned char, 8> current_sidechain_height{encode_u64_be(
+        txdata.m_current_sidechain_height.value_or(0))};
     const std::array<unsigned char, 32> absent{};
     const unsigned char* root = present
         ? txdata.m_prior_active_exchange_state_root->begin()
         : absent.data();
-    const unsigned char* forced_root = forced_present
+    const unsigned char* forced_root = forced_root_present
         ? txdata.m_prior_active_forced_inbox_root->begin()
         : absent.data();
-    const unsigned char* deposit_root = deposit_present
+    const unsigned char* deposit_root = deposit_root_present
         ? txdata.m_prior_active_deposit_inbox_root->begin()
         : absent.data();
     const unsigned char* bmm_block_hash = bmm_hash_present
         ? txdata.m_current_bmm_parent_block_hash->begin()
+        : absent.data();
+    const unsigned char* bond_v2_configuration_hash =
+        txdata.m_bond_v2_configuration_hash.has_value()
+        ? txdata.m_bond_v2_configuration_hash->begin()
+        : absent.data();
+    const unsigned char* bond_v2_asset_id =
+        txdata.m_bond_v2_asset_id.has_value()
+        ? txdata.m_bond_v2_asset_id->begin()
+        : absent.data();
+    const unsigned char* bond_v2_deployment_commitment =
+        txdata.m_bond_v2_deployment_commitment.has_value()
+        ? txdata.m_bond_v2_deployment_commitment->begin()
+        : absent.data();
+    const unsigned char* bond_v2_transition_cmr =
+        txdata.m_bond_v2_transition_cmr.has_value()
+        ? txdata.m_bond_v2_transition_cmr->begin()
+        : absent.data();
+    const unsigned char* bond_v2_insurance_reserve_script_sha256 =
+        txdata.m_bond_v2_insurance_reserve_script_sha256.has_value()
+        ? txdata.m_bond_v2_insurance_reserve_script_sha256->begin()
+        : absent.data();
+    const unsigned char* bond_v2_insurance_reserve_cmr =
+        txdata.m_bond_v2_insurance_reserve_cmr.has_value()
+        ? txdata.m_bond_v2_insurance_reserve_cmr->begin()
+        : absent.data();
+    const unsigned char* bond_v2_collateral_vault_script_sha256 =
+        txdata.m_bond_v2_collateral_vault_script_sha256.has_value()
+        ? txdata.m_bond_v2_collateral_vault_script_sha256->begin()
+        : absent.data();
+    const unsigned char* bond_v2_collateral_vault_cmr =
+        txdata.m_bond_v2_collateral_vault_cmr.has_value()
+        ? txdata.m_bond_v2_collateral_vault_cmr->begin()
+        : absent.data();
+    const unsigned char* bond_v2_incremental_activation_program_id =
+        txdata.m_bond_v2_incremental_activation_program_id.has_value()
+        ? txdata.m_bond_v2_incremental_activation_program_id->begin()
+        : absent.data();
+    const unsigned char* bond_v2_incremental_activation_configuration_hash =
+        txdata.m_bond_v2_incremental_activation_configuration_hash.has_value()
+        ? txdata.m_bond_v2_incremental_activation_configuration_hash->begin()
+        : absent.data();
+    const unsigned char* bond_v2_incremental_activation_cmr =
+        txdata.m_bond_v2_incremental_activation_cmr.has_value()
+        ? txdata.m_bond_v2_incremental_activation_cmr->begin()
+        : absent.data();
+    const unsigned char* incremental_successor_program_id =
+        txdata.m_incremental_successor_program_id.has_value()
+        ? txdata.m_incremental_successor_program_id->begin()
+        : absent.data();
+    const unsigned char* bond_v2_incremental_successor_configuration_hash =
+        txdata.m_bond_v2_incremental_successor_configuration_hash.has_value()
+        ? txdata.m_bond_v2_incremental_successor_configuration_hash->begin()
+        : absent.data();
+    const unsigned char* incremental_successor_transition_cmr =
+        txdata.m_incremental_successor_transition_cmr.has_value()
+        ? txdata.m_incremental_successor_transition_cmr->begin()
+        : absent.data();
+    const unsigned char* incremental_successor_state_node_domain_sha256 =
+        txdata.m_incremental_successor_state_node_domain_sha256.has_value()
+        ? txdata.m_incremental_successor_state_node_domain_sha256->begin()
+        : absent.data();
+    const unsigned char* prior_active_bond_inbox_root =
+        txdata.m_prior_active_bond_inbox_root.has_value()
+        ? txdata.m_prior_active_bond_inbox_root->begin()
         : absent.data();
     hasher.Write(tx.GetWitnessHash().begin(), 32)
         .Write((unsigned char*)&flags, sizeof(flags))
@@ -2023,6 +2276,29 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         .Write(bmm_block_hash, 32)
         .Write(bmm_height.data(), bmm_height.size())
         .Write(bmm_mtp.data(), bmm_mtp.size())
+        .Write(forced_cursor.data(), forced_cursor.size())
+        .Write(deposit_cursor.data(), deposit_cursor.size())
+        .Write(&bond_v2_identity_present, 1)
+        .Write(bond_v2_configuration_hash, 32)
+        .Write(bond_v2_asset_id, 32)
+        .Write(bond_v2_deployment_commitment, 32)
+        .Write(bond_v2_transition_cmr, 32)
+        .Write(bond_v2_collateral_vault_script_sha256, 32)
+        .Write(bond_v2_collateral_vault_cmr, 32)
+        .Write(bond_v2_insurance_reserve_script_sha256, 32)
+        .Write(bond_v2_insurance_reserve_cmr, 32)
+        .Write(&bond_v2_incremental_activation_identity_present, 1)
+        .Write(bond_v2_incremental_activation_program_id, 32)
+        .Write(bond_v2_incremental_activation_configuration_hash, 32)
+        .Write(bond_v2_incremental_activation_cmr, 32)
+        .Write(incremental_successor_program_id, 32)
+        .Write(bond_v2_incremental_successor_configuration_hash, 32)
+        .Write(incremental_successor_transition_cmr, 32)
+        .Write(incremental_successor_state_node_domain_sha256, 32)
+        .Write(&bond_v2_projection_present, 1)
+        .Write(prior_active_bond_inbox_root, 32)
+        .Write(bond_inbox_count.data(), bond_inbox_count.size())
+        .Write(current_sidechain_height.data(), current_sidechain_height.size())
         .Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (g_scriptExecutionCache.contains(hashCacheEntry, !cacheFullScriptStore)) {
@@ -2234,28 +2510,30 @@ DisconnectResult CChainState::DisconnectBlock(const CBlock& block, const CBlockI
             // At this point, all of txundo.vprevout should have been moved out.
         }
     }
-    std::string exchange_error;
-    if (!ecx::DisconnectExchangeState(
-            block,
-            pindex->pprev,
-            view,
-            pindex->nHeight,
-            exchange_error)) {
-        error(
-            "DisconnectBlock(): cannot restore ECX exchange state: %s",
-            exchange_error);
-        return DISCONNECT_FAILED;
-    }
+    if (m_params.GetConsensus().elements_mode) {
+        std::string exchange_error;
+        if (!ecx::DisconnectExchangeState(
+                block,
+                pindex->pprev,
+                view,
+                pindex->nHeight,
+                exchange_error)) {
+            error(
+                "DisconnectBlock(): cannot restore ECX exchange state: %s",
+                exchange_error);
+            return DISCONNECT_FAILED;
+        }
 
-    std::string bmm_error;
-    if (!drivechain::DisconnectBmmState(
-            block,
-            pindex->pprev,
-            view,
-            pindex->nHeight,
-            bmm_error)) {
-        error("DisconnectBlock(): cannot restore deterministic BMM state: %s", bmm_error);
-        return DISCONNECT_FAILED;
+        std::string bmm_error;
+        if (!drivechain::DisconnectBmmState(
+                block,
+                pindex->pprev,
+                view,
+                pindex->nHeight,
+                bmm_error)) {
+            error("DisconnectBlock(): cannot restore deterministic BMM state: %s", bmm_error);
+            return DISCONNECT_FAILED;
+        }
     }
 
     // move best block pointer to prevout block
@@ -2345,11 +2623,13 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
         flags |= SCRIPT_VERIFY_NULLDUMMY;
     }
 
-    if (DeploymentActiveAfter(pindex->pprev, consensusparams, Consensus::DEPLOYMENT_DYNA_FED)) {
+    if (consensusparams.elements_mode &&
+        DeploymentActiveAfter(pindex->pprev, consensusparams, Consensus::DEPLOYMENT_DYNA_FED)) {
         flags |= SCRIPT_SIGHASH_RANGEPROOF;
     }
 
-    if (DeploymentActiveAfter(pindex->pprev, consensusparams, Consensus::DEPLOYMENT_SIMPLICITY)) {
+    if (consensusparams.elements_mode &&
+        DeploymentActiveAfter(pindex->pprev, consensusparams, Consensus::DEPLOYMENT_SIMPLICITY)) {
         flags |= SCRIPT_VERIFY_SIMPLICITY;
     }
 
@@ -2396,7 +2676,8 @@ bool CheckPeginRipeness(const CBlock& block, const std::vector<std::pair<CScript
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                  CCoinsViewCache& view, std::set<std::pair<uint256, COutPoint>>* setPeginsSpent, bool fJustCheck)
+                              CCoinsViewCache& view, std::set<std::pair<uint256, COutPoint>>* setPeginsSpent,
+                              bool fJustCheck, bool allow_incomplete_candidate)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -2453,44 +2734,61 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
     // BMM proof advances chainstate. Simplicity deliberately receives this
     // known prior context, never the future successor that approved the block.
     std::optional<drivechain::BmmL1State> prior_bmm_state;
-    drivechain::BmmL1State prior_bmm_candidate;
-    std::string prior_bmm_error;
-    if (drivechain::GetEffectiveBmmState(
-            view,
-            pindex->pprev,
-            prior_bmm_candidate,
-            prior_bmm_error)) {
-        prior_bmm_state = std::move(prior_bmm_candidate);
-    }
+    if (m_params.GetConsensus().elements_mode) {
+        drivechain::BmmL1State prior_bmm_candidate;
+        std::string prior_bmm_error;
+        if (drivechain::GetEffectiveBmmState(
+                view,
+                pindex->pprev,
+                prior_bmm_candidate,
+                prior_bmm_error)) {
+            prior_bmm_state = std::move(prior_bmm_candidate);
+        }
 
-    std::string bmm_error;
-    if (!drivechain::CheckBmmHeader(block, pindex->pprev, bmm_error) ||
-        !drivechain::ConnectBmmState(
-            block,
-            pindex->pprev,
-            view,
-            pindex->nHeight,
-            fJustCheck,
-            bmm_error)) {
-        return state.Invalid(
-            BlockValidationResult::BLOCK_CONSENSUS,
-            "bad-drivechain-bmm-proof",
-            bmm_error);
-    }
-    std::string exchange_error;
-    if (!ecx::ConnectExchangeState(
-            block,
-            pindex->pprev,
-            view,
-            pindex->nHeight,
-            exchange_error,
-            ecx::LayerTwoLabsExchangeConsensus(),
-            std::nullopt,
-            fJustCheck)) {
-        return state.Invalid(
-            BlockValidationResult::BLOCK_CONSENSUS,
-            "bad-ecx-exchange-state",
-            exchange_error);
+        std::string bmm_error;
+        if (!drivechain::CheckBmmHeader(
+                block,
+                pindex->pprev,
+                bmm_error,
+                allow_incomplete_candidate) ||
+            !drivechain::ConnectBmmState(
+                block,
+                pindex->pprev,
+                view,
+                pindex->nHeight,
+                allow_incomplete_candidate,
+                bmm_error)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bad-drivechain-bmm-proof",
+                bmm_error);
+        }
+        std::string exchange_error;
+        if (!ecx::ConnectExchangeState(
+                block,
+                pindex->pprev,
+                view,
+                pindex->nHeight,
+                exchange_error,
+                ecx::LayerTwoLabsExchangeConsensus(),
+                std::nullopt,
+                allow_incomplete_candidate)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bad-ecx-exchange-state",
+                exchange_error);
+        }
+        if (!ecx::CheckWithdrawalBundleEnvelope(
+                block,
+                pindex->pprev,
+                pindex->nHeight,
+                exchange_error,
+                ecx::LayerTwoLabsExchangeConsensus())) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bad-ecx-withdrawal-bundle",
+                exchange_error);
+        }
     }
 
     nBlocksTotal++;
@@ -2652,10 +2950,14 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
     std::vector<PrecomputedTransactionData> txsdata;
     for (unsigned int i = 0; i< block.vtx.size(); i++ ){
         txsdata.push_back(PrecomputedTransactionData(m_params.HashGenesisBlock()));
-        BindPriorActiveExchangeStateRoot(
-            txsdata.back(),
-            pindex->pprev,
-            prior_bmm_state ? &*prior_bmm_state : nullptr);
+        if (m_params.GetConsensus().elements_mode) {
+            BindPriorActiveExchangeStateRoot(
+                txsdata.back(),
+                pindex->pprev,
+                prior_bmm_state ? &*prior_bmm_state : nullptr);
+        } else {
+            ClearExchangeScriptContext(txsdata.back());
+        }
     }
 
     std::vector<int> prevheights;
@@ -2823,6 +3125,47 @@ bool CChainState::ConnectBlock(const CBlock& block, BlockValidationState& state,
     if (!control.Wait()) {
         LogPrintf("ERROR: %s: CheckQueue failed\n", __func__);
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "block-validation-failed");
+    }
+
+    // Capital is projected only after every potentially parallel Simplicity
+    // input and its SP1 verifier have succeeded. It is never derived from an
+    // RPC/operator summary. The per-block record follows the block index, so a
+    // reorg selects the corresponding already-verified predecessor snapshot.
+    const ecx::ExchangeConsensus& exchange_consensus{
+        ecx::LayerTwoLabsExchangeConsensus()};
+    if (exchange_consensus.bond_v2.activation_enabled) {
+        drivechain::BmmParentContext prior_parent;
+        std::string capital_error;
+        if (!prior_bmm_state || !drivechain::GetBmmParentContext(
+                *prior_bmm_state, prior_parent, capital_error)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bad-ecx-bond-v2-parent-context",
+                capital_error.empty()
+                    ? "ECX bond V2 requires authenticated prior BMM state"
+                    : capital_error);
+        }
+        ecx::BondV2CapitalSnapshot capital;
+        if (!ecx::DeriveBondV2CapitalProjectionAfterScripts(
+                block,
+                pindex->pprev,
+                view,
+                pindex->nHeight,
+                prior_parent.block_hash,
+                prior_parent.height,
+                prior_parent.median_time_past,
+                capital,
+                capital_error,
+                exchange_consensus)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_CONSENSUS,
+                "bad-ecx-bond-v2-capital",
+                capital_error);
+        }
+        if (!fJustCheck) {
+            pindex->ecxBondV2Capital = std::move(capital);
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
     }
     int64_t nTime4 = GetTimeMicros(); nTimeVerify += nTime4 - nTime2;
     LogPrint(BCLog::BENCH, "    - Verify %u txins: %.2fms (%.3fms/txin) [%.2fs (%.2fms/blk)]\n", nInputs - 1, MILLI * (nTime4 - nTime2), nInputs <= 1 ? 0 : MILLI * (nTime4 - nTime2) / (nInputs-1), nTimeVerify * MICRO, nTimeVerify * MILLI / nBlocksTotal);
@@ -4101,6 +4444,10 @@ std::vector<unsigned char> GenerateCoinbaseCommitment(CBlock& block, const CBloc
 
 static bool ContextualCheckDynaFedHeader(const CBlockHeader& block, BlockValidationState& state, const CChainParams& params, const CBlockIndex* pindexPrev)
 {
+    if (!params.GetConsensus().elements_mode) {
+        return true;
+    }
+
     // When not active, it's a NOP
     if (!DeploymentActiveAfter(pindexPrev, params.GetConsensus(), Consensus::DEPLOYMENT_DYNA_FED)) {
         return true;
@@ -4190,7 +4537,7 @@ static bool ContextualCheckDynaFedHeader(const CBlockHeader& block, BlockValidat
  *  in ConnectBlock().
  *  Note that -reindex-chainstate skips the validation that happens here!
  */
-static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockManager& blockman, const CChainParams& params, const CBlockIndex* pindexPrev, int64_t nAdjustedTime) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, BlockManager& blockman, const CChainParams& params, const CBlockIndex* pindexPrev, int64_t nAdjustedTime, bool allow_incomplete_candidate = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
     AssertLockHeld(::cs_main);
     assert(pindexPrev != nullptr);
@@ -4198,7 +4545,9 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 
     // Check proof of work target or non-dynamic signblockscript if necessary
     const Consensus::Params& consensusParams = params.GetConsensus();
-    if (!DeploymentActiveAfter(pindexPrev, consensusParams, Consensus::DEPLOYMENT_DYNA_FED) && !CheckChallenge(block, *pindexPrev, consensusParams))
+    const bool dynafed_active = consensusParams.elements_mode &&
+        DeploymentActiveAfter(pindexPrev, consensusParams, Consensus::DEPLOYMENT_DYNA_FED);
+    if (!dynafed_active && !CheckChallenge(block, *pindexPrev, consensusParams))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-diffbits", "incorrect proof of work");
 
     // Check against checkpoints
@@ -4239,12 +4588,30 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         return false;
     }
 
-    std::string bmm_error;
-    if (!drivechain::CheckBmmHeader(block, pindexPrev, bmm_error)) {
-        return state.Invalid(
-            BlockValidationResult::BLOCK_INVALID_HEADER,
-            "bad-drivechain-bmm-header",
-            bmm_error);
+    if (consensusParams.elements_mode) {
+        std::string bmm_error;
+        if (!drivechain::CheckBmmHeader(
+                block,
+                pindexPrev,
+                bmm_error,
+                allow_incomplete_candidate)) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_INVALID_HEADER,
+                "bad-drivechain-bmm-header",
+                bmm_error);
+        }
+
+        std::string exchange_error;
+        if (!ecx::CheckExchangeStateHeader(
+                block,
+                nHeight,
+                exchange_error,
+                ecx::LayerTwoLabsExchangeConsensus())) {
+            return state.Invalid(
+                BlockValidationResult::BLOCK_INVALID_HEADER,
+                "bad-ecx-exchange-header",
+                exchange_error);
+        }
     }
 
     return true;
@@ -4626,7 +4993,8 @@ bool TestBlockValidity(BlockValidationState& state,
                        const CBlock& block,
                        CBlockIndex* pindexPrev,
                        bool fCheckPOW,
-                       bool fCheckMerkleRoot)
+                       bool fCheckMerkleRoot,
+                       bool allow_incomplete_candidate)
 {
     AssertLockHeld(cs_main);
     assert(pindexPrev && pindexPrev == chainstate.m_chain.Tip());
@@ -4638,13 +5006,27 @@ bool TestBlockValidity(BlockValidationState& state,
     indexDummy.phashBlock = &block_hash;
 
     // NOTE: CheckBlockHeader is called by CheckBlock
-    if (!ContextualCheckBlockHeader(block, state, chainstate.m_blockman, chainparams, pindexPrev, GetAdjustedTime()))
+    if (!ContextualCheckBlockHeader(
+            block,
+            state,
+            chainstate.m_blockman,
+            chainparams,
+            pindexPrev,
+            GetAdjustedTime(),
+            allow_incomplete_candidate))
         return error("%s: Consensus::ContextualCheckBlockHeader: %s", __func__, state.ToString());
     if (!CheckBlock(block, state, chainparams.GetConsensus(), fCheckPOW, fCheckMerkleRoot))
         return error("%s: Consensus::CheckBlock: %s", __func__, state.ToString());
     if (!ContextualCheckBlock(block, state, chainparams.GetConsensus(), pindexPrev))
         return error("%s: Consensus::ContextualCheckBlock: %s", __func__, state.ToString());
-    if (!chainstate.ConnectBlock(block, state, &indexDummy, viewNew, NULL, true)) {
+    if (!chainstate.ConnectBlock(
+            block,
+            state,
+            &indexDummy,
+            viewNew,
+            nullptr,
+            true,
+            allow_incomplete_candidate)) {
         return false;
     }
     assert(state.IsValid());
@@ -4848,6 +5230,84 @@ bool CChainState::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& i
     return true;
 }
 
+static bool BranchRequiresValidatedReplay(
+    const CBlockIndex* tip,
+    const CBlockIndex* fork,
+    const Consensus::Params& consensus,
+    bool& requires_validated_replay)
+{
+    requires_validated_replay = false;
+    constexpr uint32_t state_mask{
+        CBlockHeader::BMM_PROOF_HF_MASK |
+        CBlockHeader::EXCHANGE_STATE_HF_MASK |
+        CBlockHeader::FORCED_INBOX_HF_MASK |
+        CBlockHeader::DEPOSIT_INBOX_HF_MASK |
+        CBlockHeader::INBOX_CURSOR_HF_MASK};
+    for (const CBlockIndex* cursor = tip; cursor && cursor != fork;
+         cursor = cursor->pprev) {
+        CBlock block;
+        if (!ReadBlockFromDisk(block, cursor, consensus)) {
+            return error(
+                "ReplayBlocks(): cannot inspect block %s (%d) for "
+                "consensus-derived state",
+                cursor->GetBlockHash().ToString(),
+                cursor->nHeight);
+        }
+        if (consensus.elements_mode &&
+            ((static_cast<uint32_t>(cursor->nVersion) & state_mask) != 0 ||
+             (static_cast<uint32_t>(block.nVersion) & state_mask) != 0 ||
+             cursor->GetBlockHash() ==
+                 drivechain::LayerTwoLabsPublicSidechainBlock2() ||
+             block.GetHash() == drivechain::LayerTwoLabsPublicSidechainBlock2())) {
+            requires_validated_replay = true;
+            return true;
+        }
+        for (const CTransactionRef& transaction : block.vtx) {
+            if (std::any_of(
+                    transaction->vin.begin(),
+                    transaction->vin.end(),
+                    [&consensus](const CTxIn& input) {
+                        return input.m_is_pegin ||
+                            (consensus.elements_mode &&
+                             (ecx::IsExchangeStateInternalOutpoint(input.prevout) ||
+                              drivechain::IsBmmStateInternalOutpoint(input.prevout) ||
+                              drivechain::IsCtipStateInternalOutpoint(input.prevout)));
+                    })) {
+                // The generic rollforward path neither restores the Elements
+                // pegin-spent set nor derived state trackers. It must also
+                // not preserve a synthetic-state spend accepted by an older
+                // or assumevalid configuration.
+                requires_validated_replay = true;
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * Find the common ancestor of two database head markers without assuming that
+ * both markers belong to the same block-index tree.  ReplayBlocks consumes
+ * crash-recovery metadata from disk, so the normal LastCommonAncestor helper's
+ * same-genesis assertion is not an appropriate validation boundary here.
+ */
+static const CBlockIndex* ReplayCommonAncestor(
+    const CBlockIndex* first,
+    const CBlockIndex* second)
+{
+    while (first && second && first->nHeight > second->nHeight) {
+        first = first->pprev;
+    }
+    while (first && second && second->nHeight > first->nHeight) {
+        second = second->pprev;
+    }
+    while (first && second && first != second) {
+        first = first->pprev;
+        second = second->pprev;
+    }
+    return first == second ? first : nullptr;
+}
+
 bool CChainState::ReplayBlocks()
 {
     LOCK(cs_main);
@@ -4876,8 +5336,43 @@ bool CChainState::ReplayBlocks()
             return error("ReplayBlocks(): reorganization from unknown block requested");
         }
         pindexOld = m_blockman.m_block_index[hashHeads[1]];
-        pindexFork = LastCommonAncestor(pindexOld, pindexNew);
-        assert(pindexFork != nullptr);
+        pindexFork = ReplayCommonAncestor(pindexOld, pindexNew);
+        if (!pindexFork) {
+            return error(
+                "ReplayBlocks(): interrupted flush heads have no common ancestor");
+        }
+    }
+
+    // The legacy replay algorithm below is intentionally idempotent only for
+    // ordinary transaction outputs. ECX and BMM trackers are synthetic UTXOs
+    // derived by ConnectBlock, and a crash may leave any subset of them from
+    // either side of the interrupted flush. Replaying only transaction inputs
+    // and outputs could therefore commit a best-block marker with stale or
+    // missing consensus state. Refuse that unsafe repair before touching the
+    // database; -reindex-chainstate rebuilds every tracker through the normal
+    // fully validated ConnectBlock path.
+    bool old_requires_validated_replay{false};
+    bool new_requires_validated_replay{false};
+    if (!BranchRequiresValidatedReplay(
+            pindexOld,
+            pindexFork,
+            m_params.GetConsensus(),
+            old_requires_validated_replay) ||
+        !BranchRequiresValidatedReplay(
+            pindexNew,
+            pindexFork,
+            m_params.GetConsensus(),
+            new_requires_validated_replay)) {
+        return false;
+    }
+    if ((m_params.GetConsensus().elements_mode &&
+         (ecx::HasPersistedExchangeConsensusState(db) ||
+          drivechain::HasPersistedBmmConsensusState(db))) ||
+        old_requires_validated_replay ||
+        new_requires_validated_replay) {
+        return error(
+            "ReplayBlocks(): interrupted flush touches ECX/BMM/pegin consensus state; "
+            "restart with -reindex-chainstate");
     }
 
     // Rollback along the old branch.
@@ -4910,7 +5405,9 @@ bool CChainState::ReplayBlocks()
     }
 
     cache.SetBestBlock(pindexNew->GetBlockHash());
-    cache.Flush();
+    if (!cache.Flush()) {
+        return error("ReplayBlocks(): failed to commit repaired chainstate");
+    }
     uiInterface.ShowProgress("", 100, false);
     return true;
 }

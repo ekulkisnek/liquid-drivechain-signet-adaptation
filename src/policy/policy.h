@@ -115,7 +115,13 @@ static constexpr decltype(CTransaction::nVersion) TX_MAX_STANDARD_VERSION{2};
 * Check for standard transaction types
 * @return True if all outputs (scriptPubKeys) use only standard transaction forms
 */
-bool IsStandardTx(const CTransaction& tx, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason);
+namespace ecx { struct ExchangeConsensus; }
+bool IsStandardTx(
+    const CTransaction& tx,
+    bool permit_bare_multisig,
+    const CFeeRate& dust_relay_fee,
+    std::string& reason,
+    const ecx::ExchangeConsensus* ecx_consensus = nullptr);
 /**
 * Check for standard transaction types
 * @param[in] mapInputs       Map of previous transactions that have outputs we're spending
@@ -128,8 +134,12 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 * These limits are adequate for multisignatures up to n-of-100 using OP_CHECKSIG, OP_ADD, and OP_EQUAL.
 *
 * Also enforce a maximum stack item size limit and no annexes for tapscript spends.
+* TapSimplicity spends may use an annex when their witness has the exact consensus shape.
 */
-bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs);
+bool IsWitnessStandard(
+    const CTransaction& tx,
+    const CCoinsViewCache& mapInputs,
+    const ecx::ExchangeConsensus* ecx_consensus = nullptr);
 
 /* ELEMENTS
 * Check if unblinded issuance/reissuance is in MoneyRange
@@ -139,6 +149,25 @@ bool IsIssuanceInMoneyRange(const CTransaction& tx);
 /** Compute the virtual transaction size (weight reinterpreted as bytes). */
 int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned int bytes_per_sigop);
 int64_t GetVirtualTransactionSize(const CTransaction& tx, int64_t nSigOpCost, unsigned int bytes_per_sigop);
+/**
+ * Return the consensus-authorized TapSimplicity verification budget in
+ * milliweight. This is an upper bound on work a peer may be required to do and
+ * is therefore the resource quantity used for fee quoting.
+ */
+uint64_t GetSimplicityValidationMilliweight(const CTransaction& tx);
+
+struct BmmWorkFeeQuote {
+    CAmount verification_fee{0};
+    CAmount producer_reserve{0};
+    CAmount bid{0};
+};
+
+bool CalculateBmmWorkFeeQuote(
+    CAmount collected_fees,
+    uint64_t simplicity_milliweight,
+    CAmount work_sats_per_kwu,
+    CAmount producer_reserve,
+    BmmWorkFeeQuote& quote);
 int64_t GetVirtualTransactionInputSize(const CTransaction& tx, const size_t nIn, int64_t nSigOpCost, unsigned int bytes_per_sigop);
 
 static inline int64_t GetVirtualTransactionSize(const CTransaction& tx)

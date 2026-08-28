@@ -15,6 +15,27 @@
 extern "C" {
 #include <simplicity/elements/env.h>
 #include <simplicity/elements/exec.h>
+
+#ifdef ECX_ENABLE_SP1_GROTH16_VERIFIER
+extern "C" bool ecx_sp1_6_3_1_verify_groth16_sha256(
+    void* context,
+    const unsigned char* proof,
+    size_t proof_len,
+    const uint32_t* program_id_words,
+    const unsigned char* public_values_sha256);
+
+static bool VerifyEcxSp1Groth16(
+    void* context,
+    const unsigned char* proof,
+    size_t proof_len,
+    const uint32_t* program_id_words,
+    const unsigned char* public_values_sha256)
+{
+    if (context != nullptr) return false;
+    return ecx_sp1_6_3_1_verify_groth16_sha256(
+        nullptr, proof, proof_len, program_id_words, public_values_sha256);
+}
+#endif
 #include <simplicity/errorCodes.h>
 }
 
@@ -3232,6 +3253,10 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
     assert(txdata->m_simplicity_tx_data);
     assert(simplicityTapEnv);
     ecx_prior_active_root_env ecx_root{};
+#ifdef ECX_ENABLE_SP1_GROTH16_VERIFIER
+    ecx_root.verify_sp1_groth16 = VerifyEcxSp1Groth16;
+    ecx_root.verify_sp1_groth16_context = nullptr;
+#endif
     if (txdata->m_prior_active_exchange_state_root.has_value()) {
         ecx_root.present = 1;
         std::copy(
@@ -3239,19 +3264,27 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
             txdata->m_prior_active_exchange_state_root->end(),
             ecx_root.root_wire);
     }
+    ecx_root.forced_inbox_present = txdata->EcxForcedInboxPresence();
     if (txdata->m_prior_active_forced_inbox_root.has_value()) {
-        ecx_root.forced_inbox_present = 1;
         std::copy(
             txdata->m_prior_active_forced_inbox_root->begin(),
             txdata->m_prior_active_forced_inbox_root->end(),
             ecx_root.forced_inbox_root_wire);
+        if (txdata->m_prior_active_forced_processed_cursor.has_value()) {
+            ecx_root.forced_processed_cursor =
+                *txdata->m_prior_active_forced_processed_cursor;
+        }
     }
+    ecx_root.deposit_inbox_present = txdata->EcxDepositInboxPresence();
     if (txdata->m_prior_active_deposit_inbox_root.has_value()) {
-        ecx_root.deposit_inbox_present = 1;
         std::copy(
             txdata->m_prior_active_deposit_inbox_root->begin(),
             txdata->m_prior_active_deposit_inbox_root->end(),
             ecx_root.deposit_inbox_root_wire);
+        if (txdata->m_prior_active_deposit_processed_cursor.has_value()) {
+            ecx_root.deposit_processed_cursor =
+                *txdata->m_prior_active_deposit_processed_cursor;
+        }
     }
     const bool bmm_hash_present{
         txdata->m_current_bmm_parent_block_hash.has_value()};
@@ -3270,6 +3303,85 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
         ecx_root.current_bmm_parent_height =
             *txdata->m_current_bmm_parent_height;
         ecx_root.current_bmm_parent_mtp = *txdata->m_current_bmm_parent_mtp;
+    }
+    ecx_root.bond_v2_identity_present = txdata->EcxBondV2IdentityPresence();
+    if (txdata->m_bond_v2_configuration_hash.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_configuration_hash->begin(),
+            txdata->m_bond_v2_configuration_hash->end(),
+            ecx_root.bond_v2_configuration_hash_wire);
+    }
+    if (txdata->m_bond_v2_asset_id.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_asset_id->begin(),
+            txdata->m_bond_v2_asset_id->end(),
+            ecx_root.bond_v2_asset_id_wire);
+    }
+    if (txdata->m_bond_v2_deployment_commitment.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_deployment_commitment->begin(),
+            txdata->m_bond_v2_deployment_commitment->end(),
+            ecx_root.bond_v2_deployment_commitment_wire);
+    }
+    if (txdata->m_bond_v2_transition_cmr.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_transition_cmr->begin(),
+            txdata->m_bond_v2_transition_cmr->end(),
+            ecx_root.bond_v2_transition_cmr_wire);
+    }
+    if (txdata->m_bond_v2_collateral_vault_script_sha256.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_collateral_vault_script_sha256->begin(),
+            txdata->m_bond_v2_collateral_vault_script_sha256->end(),
+            ecx_root.bond_v2_collateral_vault_script_sha256_wire);
+    }
+    if (txdata->m_bond_v2_collateral_vault_cmr.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_collateral_vault_cmr->begin(),
+            txdata->m_bond_v2_collateral_vault_cmr->end(),
+            ecx_root.bond_v2_collateral_vault_cmr_wire);
+    }
+    if (txdata->m_bond_v2_insurance_reserve_script_sha256.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_insurance_reserve_script_sha256->begin(),
+            txdata->m_bond_v2_insurance_reserve_script_sha256->end(),
+            ecx_root.bond_v2_insurance_reserve_script_sha256_wire);
+    }
+    if (txdata->m_bond_v2_insurance_reserve_cmr.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_insurance_reserve_cmr->begin(),
+            txdata->m_bond_v2_insurance_reserve_cmr->end(),
+            ecx_root.bond_v2_insurance_reserve_cmr_wire);
+    }
+    ecx_root.bond_v2_incremental_activation_identity_present =
+        txdata->EcxBondV2IncrementalActivationIdentityPresence();
+    if (txdata->m_bond_v2_incremental_activation_cmr.has_value()) {
+        std::copy(
+            txdata->m_bond_v2_incremental_activation_cmr->begin(),
+            txdata->m_bond_v2_incremental_activation_cmr->end(),
+            ecx_root.bond_v2_incremental_activation_cmr_wire);
+    }
+    if (txdata->m_incremental_successor_transition_cmr.has_value()) {
+        std::copy(
+            txdata->m_incremental_successor_transition_cmr->begin(),
+            txdata->m_incremental_successor_transition_cmr->end(),
+            ecx_root.incremental_successor_transition_cmr_wire);
+    }
+    ecx_root.bond_v2_projection_present =
+        txdata->EcxBondV2ProjectionPresence();
+    if (txdata->m_prior_active_bond_inbox_root.has_value()) {
+        std::copy(
+            txdata->m_prior_active_bond_inbox_root->begin(),
+            txdata->m_prior_active_bond_inbox_root->end(),
+            ecx_root.prior_active_bond_inbox_root_wire);
+    }
+    if (txdata->m_prior_active_bond_inbox_count.has_value()) {
+        ecx_root.prior_active_bond_inbox_count =
+            *txdata->m_prior_active_bond_inbox_count;
+    }
+    if (txdata->m_current_sidechain_height.has_value()) {
+        ecx_root.current_sidechain_height =
+            *txdata->m_current_sidechain_height;
     }
     if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &ecx_root, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
         assert(!"simplicity_elements_execSimplicity internal error");

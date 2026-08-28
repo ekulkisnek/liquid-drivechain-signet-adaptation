@@ -8,6 +8,7 @@
 
 #include <arith_uint256.h>
 #include <consensus/params.h>
+#include <ecx_bond_v2.h>
 #include <flatfile.h>
 #include <primitives/block.h>
 #include <sync.h>
@@ -212,6 +213,11 @@ public:
     uint256 hashForcedInboxRoot{};
     uint256 hashDepositInboxRoot{};
     uint32_t ecxParentHeight{0};
+    uint64_t forcedProcessedCursor{0};
+    uint64_t depositProcessedCursor{0};
+    uint64_t sourceBacklogOldestParentHeight{0};
+    //! Verified V2 public capital projection; never part of the block header.
+    std::optional<ecx::BondV2CapitalSnapshot> ecxBondV2Capital{};
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
@@ -304,6 +310,9 @@ public:
           hashForcedInboxRoot{block.hashForcedInboxRoot},
           hashDepositInboxRoot{block.hashDepositInboxRoot},
           ecxParentHeight{block.ecxParentHeight},
+          forcedProcessedCursor{block.forcedProcessedCursor},
+          depositProcessedCursor{block.depositProcessedCursor},
+          sourceBacklogOldestParentHeight{block.sourceBacklogOldestParentHeight},
           nTime{block.nTime},
           nBits{block.nBits},
           nNonce{block.nNonce},
@@ -349,6 +358,9 @@ public:
         block.hashForcedInboxRoot = hashForcedInboxRoot;
         block.hashDepositInboxRoot = hashDepositInboxRoot;
         block.ecxParentHeight = ecxParentHeight;
+        block.forcedProcessedCursor = forcedProcessedCursor;
+        block.depositProcessedCursor = depositProcessedCursor;
+        block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;
@@ -486,6 +498,7 @@ public:
     //  right one. We cannot inline them since the body of SERIALIZE_METHODS will be
     //  called with a const object during serialization. See Core #17850 and followups.
     bool RemoveDynaFedMaskOnSerialize(bool for_read) {
+        if (!g_con_elementsmode) return false;
         if (for_read) {
             bool is_dyna = nVersion < 0;
             nVersion = (int32_t) (~CBlockHeader::DYNAFED_HF_MASK & (uint32_t)nVersion);
@@ -496,10 +509,11 @@ public:
     }
     bool RemoveDynaFedMaskOnSerialize(bool for_read) const {
         assert(!for_read);
-        return is_dynafed_block();
+        return g_con_elementsmode && is_dynafed_block();
     }
 
     bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) {
+        if (!g_con_elementsmode) return false;
         if (for_read) {
             bool has_withdrawal_bundle_hash = ((uint32_t)nVersion & CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK) != 0;
             nVersion = (int32_t) (~CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK & (uint32_t)nVersion);
@@ -510,7 +524,7 @@ public:
     }
     bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) const {
         assert(!for_read);
-        return !hashWithdrawalBundle.IsNull();
+        return g_con_elementsmode && !hashWithdrawalBundle.IsNull();
     }
 
     SERIALIZE_METHODS(CDiskBlockIndex, obj)
@@ -534,10 +548,16 @@ public:
             READWRITE(obj.nVersion);
         } else {
             int32_t nVersion = obj.nVersion;
-            if (obj.is_dynafed_block()) {
+            if (g_con_elementsmode) {
+                nVersion = static_cast<int32_t>(
+                    static_cast<uint32_t>(nVersion) &
+                    ~(CBlockHeader::DYNAFED_HF_MASK |
+                      CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK));
+            }
+            if (g_con_elementsmode && obj.is_dynafed_block()) {
                 nVersion |= (int32_t)CBlockHeader::DYNAFED_HF_MASK;
             }
-            if (!obj.hashWithdrawalBundle.IsNull()) {
+            if (g_con_elementsmode && !obj.hashWithdrawalBundle.IsNull()) {
                 nVersion |= (int32_t)CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
             }
             READWRITE(nVersion);
@@ -552,31 +572,46 @@ public:
         } else {
             SER_READ(obj, obj.hashWithdrawalBundle.SetNull());
         }
-        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) {
+        if (g_con_elementsmode &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) {
             READWRITE(obj.hashBmmProof);
         } else {
             SER_READ(obj, obj.hashBmmProof.SetNull());
         }
-        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::EXCHANGE_STATE_HF_MASK) != 0) {
+        if (g_con_elementsmode &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::EXCHANGE_STATE_HF_MASK) != 0) {
             READWRITE(obj.hashExchangeStateRoot);
         } else {
             SER_READ(obj, obj.hashExchangeStateRoot.SetNull());
         }
-        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0) {
+        if (g_con_elementsmode &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0) {
             READWRITE(obj.hashForcedInboxRoot);
         } else {
             SER_READ(obj, obj.hashForcedInboxRoot.SetNull());
         }
-        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
+        if (g_con_elementsmode &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
             READWRITE(obj.hashDepositInboxRoot);
         } else {
             SER_READ(obj, obj.hashDepositInboxRoot.SetNull());
         }
-        if ((static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0 &&
+        if (g_con_elementsmode &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0 &&
             (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
             READWRITE(obj.ecxParentHeight);
         } else {
             SER_READ(obj, obj.ecxParentHeight = 0);
+        }
+        if (g_con_elementsmode &&
+            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::INBOX_CURSOR_HF_MASK) != 0) {
+            READWRITE(obj.forcedProcessedCursor);
+            READWRITE(obj.depositProcessedCursor);
+            READWRITE(obj.sourceBacklogOldestParentHeight);
+        } else {
+            SER_READ(obj, obj.forcedProcessedCursor = 0);
+            SER_READ(obj, obj.depositProcessedCursor = 0);
+            SER_READ(obj, obj.sourceBacklogOldestParentHeight = 0);
         }
         READWRITE(obj.nTime);
 
@@ -618,6 +653,9 @@ public:
         block.hashForcedInboxRoot = hashForcedInboxRoot;
         block.hashDepositInboxRoot = hashDepositInboxRoot;
         block.ecxParentHeight = ecxParentHeight;
+        block.forcedProcessedCursor = forcedProcessedCursor;
+        block.depositProcessedCursor = depositProcessedCursor;
+        block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
         block.nTime = nTime;
         if (g_con_blockheightinheader) {
             block.block_height = nHeight;

@@ -354,6 +354,16 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
   if (SIZE_MAX - allocationSize < totalNullDataCodes * sizeof(opcode)) return NULL;
   allocationSize += (size_t)totalNullDataCodes * sizeof(opcode);
 
+  size_t totalAnnexBytes = 0;
+  for (uint_fast32_t i = 0; i < rawTx->numInputs; ++i) {
+    if (rawTx->input[i].annex) {
+      if (SIZE_MAX - totalAnnexBytes < rawTx->input[i].annex->len) return NULL;
+      totalAnnexBytes += rawTx->input[i].annex->len;
+    }
+  }
+  if (SIZE_MAX - allocationSize < totalAnnexBytes) return NULL;
+  allocationSize += totalAnnexBytes;
+
   char *allocation = simplicity_malloc(allocationSize);
   if (!allocation) return NULL;
 
@@ -374,6 +384,8 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
 
   opcode* ops = (opcode*)(void*)allocation;
   size_t opsLen = (size_t)totalNullDataCodes;
+  allocation += (size_t)totalNullDataCodes * sizeof(opcode);
+  unsigned char* annexBytes = (unsigned char*)(void*)allocation;
 
   /* In C++ an assignment from (sigOutput**) to (const sigOutput * const *) is allowed,
      but C forgoes the complicated specification of C++.  Therefore we must make an explicit cast of feeOutputs in C.
@@ -406,6 +418,12 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
     sha256_context ctx_issuancesHash = sha256_init(tx->issuancesHash.s);
     for (uint_fast32_t i = 0; i < tx->numInputs; ++i) {
       copyInput(&input[i], &rawTx->input[i]);
+      if (rawTx->input[i].annex) {
+        input[i].annex = annexBytes;
+        input[i].annexLen = rawTx->input[i].annex->len;
+        memcpy(annexBytes, rawTx->input[i].annex->buf, input[i].annexLen);
+        annexBytes += input[i].annexLen;
+      }
       if (input[i].sequence < 0xffffffff) { tx->isFinal = false; }
       if (input[i].sequence < 0x80000000) {
         const uint_fast16_t maskedSequence = input[i].sequence & 0xffff;

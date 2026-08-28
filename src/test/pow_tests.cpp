@@ -170,6 +170,42 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_sanity)
 BOOST_AUTO_TEST_CASE(ChainParams_REGTEST_sanity)
 {
     sanity_check_chainparams(*m_node.args, CBaseChainParams::REGTEST);
+    const auto chain_params =
+        CreateChainParams(*m_node.args, CBaseChainParams::REGTEST);
+    BOOST_CHECK(!chain_params->GetConsensus().elements_mode);
+    BOOST_CHECK_EQUAL(
+        chain_params->GetConsensus()
+            .vDeployments[Consensus::DEPLOYMENT_SIMPLICITY]
+            .nStartTime,
+        Consensus::BIP9Deployment::NEVER_ACTIVE);
+    BOOST_CHECK_EQUAL(
+        chain_params->GetConsensus()
+            .vDeployments[Consensus::DEPLOYMENT_DYNA_FED]
+            .nStartTime,
+        Consensus::BIP9Deployment::NEVER_ACTIVE);
+    BOOST_CHECK_EQUAL(
+        chain_params->GetConsensus().hashGenesisBlock,
+        uint256S("0x0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"));
+
+    ArgsManager elements_args;
+    elements_args.ForceSetArg("-con_elementsmode", "1");
+    BOOST_CHECK_THROW(
+        CreateChainParams(elements_args, CBaseChainParams::REGTEST),
+        std::runtime_error);
+
+    ArgsManager simplicity_args;
+    simplicity_args.ForceSetArg(
+        "-vbparams", "simplicity:0:999999999999");
+    BOOST_CHECK_THROW(
+        CreateChainParams(simplicity_args, CBaseChainParams::REGTEST),
+        std::runtime_error);
+
+    ArgsManager dynafed_args;
+    dynafed_args.ForceSetArg(
+        "-vbparams", "dynafed:0:999999999999");
+    BOOST_CHECK_THROW(
+        CreateChainParams(dynafed_args, CBaseChainParams::REGTEST),
+        std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET_sanity)

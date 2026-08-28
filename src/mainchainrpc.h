@@ -89,6 +89,34 @@ BoundedCommandResult RunAuthenticatedDrivechainGrpc(
 std::string GetDrivechainGrpcAddress(const ArgsManager& args);
 
 UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
+/**
+ * Call a unary CUSF Connect RPC over bounded in-process HTTP/JSON.
+ *
+ * The endpoint is a host[:port] authority (no URL scheme) and method is the
+ * fully-qualified service/method path without a leading slash. This function
+ * never invokes a shell or external executable.
+ */
+bool CallDrivechainConnectJSON(
+    const std::string& endpoint,
+    const std::string& method,
+    const UniValue& request,
+    UniValue& response,
+    std::string* error = nullptr);
+/**
+ * Submit a BIP301 M8 bid through the BitWindow/CUSF enforcer wallet.
+ *
+ * The bid is paid on the parent chain. The committed critical hash identifies
+ * the Elements candidate whose policy-asset fees are collected by its
+ * coinbase destination.
+ */
+bool SubmitDrivechainBmmBid(
+    int sidechain_slot,
+    uint64_t bid_sats,
+    uint32_t parent_height,
+    const uint256& critical_hash,
+    const uint256& previous_parent_hash,
+    uint256& request_txid,
+    std::string* error = nullptr);
 bool GetDrivechainTwoWayPegData(int sidechain_slot, UniValue& response, std::string* error = nullptr);
 bool VerifyDrivechainDeposit(
     const CTransaction& tx,

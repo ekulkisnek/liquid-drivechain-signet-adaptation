@@ -20,6 +20,7 @@
 #include <util/vector.h>
 
 #include <functional>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -28,6 +29,8 @@ extern const std::function<void(const std::string&)> G_TEST_LOG_FUN;
 
 /** Retrieve the command line arguments. */
 extern const std::function<std::vector<const char*>()> G_TEST_COMMAND_LINE_ARGUMENTS;
+
+class TestingSetupSettingsGuard;
 
 // Enable BOOST_CHECK_EQUAL for enum class types
 namespace std {
@@ -81,6 +84,9 @@ static constexpr CAmount CENT{1000000};
  * This just configures logging, data dir and chain parameters.
  */
 struct BasicTestingSetup {
+    // Declared first so it restores gArgs after every other fixture member has
+    // finished destruction.
+    std::unique_ptr<TestingSetupSettingsGuard> m_settings_guard;
     ECCVerifyHandle globalVerifyHandle;
     node::NodeContext m_node;
 

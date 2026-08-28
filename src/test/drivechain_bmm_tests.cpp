@@ -22,6 +22,13 @@
 
 namespace {
 
+struct ElementsTestingSetup : BasicTestingSetup {
+    ElementsTestingSetup()
+        : BasicTestingSetup("elementsregtest")
+    {
+    }
+};
+
 template <typename T>
 std::vector<unsigned char> SerializeValue(const T& value)
 {
@@ -77,7 +84,8 @@ drivechain::BmmConsensus EasyConsensus()
         CScript() << OP_TRUE,
         drivechain::BMM_SIDECHAIN_SLOT,
         8,
-        100'000};
+        100'000,
+        true};
 }
 
 drivechain::BmmL1State EasyState()
@@ -193,10 +201,11 @@ Sidechain::Bitcoin::CMerkleBlock DecodeMerkleProof(
 
 } // namespace
 
-BOOST_FIXTURE_TEST_SUITE(drivechain_bmm_tests, BasicTestingSetup)
+BOOST_FIXTURE_TEST_SUITE(drivechain_bmm_tests, ElementsTestingSetup)
 
 BOOST_AUTO_TEST_CASE(verifies_authentic_layer_two_labs_successor)
 {
+    BOOST_CHECK(drivechain::LayerTwoLabsBmmConsensus().require_signet_solution);
     const drivechain::BmmProof proof{AuthenticProof6400()};
     drivechain::BmmL1State next;
     std::string error;
@@ -415,6 +424,35 @@ BOOST_AUTO_TEST_CASE(rejects_mismatches_replays_and_corruption)
         error,
         wrong_signet));
     BOOST_CHECK(error.find("signet solution is invalid") != std::string::npos);
+
+    drivechain::BmmConsensus explicit_no_signet{wrong_signet};
+    explicit_no_signet.require_signet_solution = false;
+    drivechain::BmmL1State no_signet_next;
+    BOOST_REQUIRE_MESSAGE(
+        drivechain::VerifyBmmProofEntries(
+            proof,
+            critical_hash,
+            previous.block_hash,
+            no_signet_next,
+            error,
+            explicit_no_signet),
+        error);
+    BOOST_CHECK_EQUAL(no_signet_next.height, previous.height + 1);
+
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+    // The verifier result is a property of the explicit consensus object. A
+    // process-global private-E2E flag must not weaken a public/signet check.
+    gArgs.ForceSetArg("-ecxprivatebmmcheckpoint", "1");
+    gArgs.ForceSetArg("-ecxprivatebmmactivationheight", "110");
+    BOOST_CHECK(!drivechain::VerifyBmmProofEntries(
+        proof,
+        critical_hash,
+        previous.block_hash,
+        next,
+        error,
+        wrong_signet));
+    BOOST_CHECK(error.find("signet solution is invalid") != std::string::npos);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(two_verifiers_converge_from_serialized_evidence)
@@ -484,6 +522,14 @@ BOOST_AUTO_TEST_CASE(enforces_public_checkpoint_activation)
             &public_height_one,
             error),
         error);
+    CBlockIndex persisted_height_two{height_two};
+    persisted_height_two.pprev = &public_height_one;
+    persisted_height_two.nHeight = 2;
+    const uint256 persisted_height_two_hash{height_two.GetHash()};
+    persisted_height_two.phashBlock = &persisted_height_two_hash;
+    BOOST_CHECK_MESSAGE(
+        drivechain::CheckBmmIndexHeader(persisted_height_two, error),
+        error);
 
     CBlockHeader alternate_height_two{height_two};
     ++alternate_height_two.nTime;
@@ -491,6 +537,13 @@ BOOST_AUTO_TEST_CASE(enforces_public_checkpoint_activation)
         alternate_height_two,
         &public_height_one,
         error));
+    BOOST_CHECK(error.find("immutable checkpoint") != std::string::npos);
+    CBlockIndex persisted_alternate{alternate_height_two};
+    persisted_alternate.pprev = &public_height_one;
+    persisted_alternate.nHeight = 2;
+    const uint256 persisted_alternate_hash{alternate_height_two.GetHash()};
+    persisted_alternate.phashBlock = &persisted_alternate_hash;
+    BOOST_CHECK(!drivechain::CheckBmmIndexHeader(persisted_alternate, error));
     BOOST_CHECK(error.find("immutable checkpoint") != std::string::npos);
 
     CBlockIndex public_tip;
@@ -504,6 +557,19 @@ BOOST_AUTO_TEST_CASE(enforces_public_checkpoint_activation)
     BOOST_CHECK(error.find("does not signal") != std::string::npos);
 
     child.nVersion |= CBlockHeader::BMM_PROOF_HF_MASK;
+    BOOST_CHECK(!drivechain::CheckBmmHeader(child, &public_tip, error));
+    BOOST_CHECK(error.find("no proof commitment") != std::string::npos);
+    BOOST_CHECK_MESSAGE(
+        drivechain::CheckBmmHeader(child, &public_tip, error, true),
+        error);
+    CBlockIndex persisted_child{child};
+    persisted_child.pprev = &public_tip;
+    persisted_child.nHeight = 3;
+    const uint256 persisted_child_hash{child.GetHash()};
+    persisted_child.phashBlock = &persisted_child_hash;
+    BOOST_CHECK(!drivechain::CheckBmmIndexHeader(persisted_child, error));
+    BOOST_CHECK(error.find("no proof commitment") != std::string::npos);
+    child.hashBmmProof = uint256S("02");
     BOOST_CHECK_MESSAGE(
         drivechain::CheckBmmHeader(child, &public_tip, error),
         error);
@@ -514,5 +580,34 @@ BOOST_AUTO_TEST_CASE(enforces_public_checkpoint_activation)
     BOOST_CHECK(!drivechain::CheckBmmHeader(child, &unrelated, error));
     BOOST_CHECK(error.find("cannot activate") != std::string::npos);
 }
+
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+BOOST_AUTO_TEST_CASE(private_activation_height_does_not_invalidate_history)
+{
+    gArgs.ForceSetArg("-ecxprivatebmmcheckpoint", "1");
+    gArgs.ForceSetArg("-ecxprivatebmmactivationheight", "110");
+    BOOST_CHECK(!drivechain::LayerTwoLabsBmmConsensus().require_signet_solution);
+
+    CBlockIndex previous;
+    const uint256 previous_hash{uint256S("03")};
+    previous.phashBlock = &previous_hash;
+    previous.nHeight = 108;
+    CBlockHeader legacy;
+    legacy.nVersion = 0x20000000;
+    std::string error;
+    BOOST_CHECK_MESSAGE(drivechain::CheckBmmHeader(legacy, &previous, error), error);
+
+    previous.nHeight = 109;
+    BOOST_CHECK(!drivechain::CheckBmmHeader(legacy, &previous, error));
+    BOOST_CHECK(error.find("does not signal") != std::string::npos);
+    legacy.nVersion |= CBlockHeader::BMM_PROOF_HF_MASK;
+    BOOST_CHECK_MESSAGE(
+        drivechain::CheckBmmHeader(legacy, &previous, error, true),
+        error);
+    legacy.hashBmmProof = uint256S("04");
+    BOOST_CHECK_MESSAGE(drivechain::CheckBmmHeader(legacy, &previous, error), error);
+
+}
+#endif
 
 BOOST_AUTO_TEST_SUITE_END()

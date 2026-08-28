@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
+#include <drivechain_bmm.h>
 #include <drivechain_peg.h>
 #include <ecx_exchange_state.h>
 #include <pegins.h>
@@ -196,12 +197,22 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
 
 bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmountMap& fee_map, std::set<std::pair<uint256, COutPoint>>& setPeginsSpent, std::vector<CCheck*> *pvChecks, const bool cacheStore, bool fScriptChecks, const std::vector<std::pair<CScript, CScript>>& fedpegscripts)
 {
-    for (const CTxIn& input : tx.vin) {
-        if (!input.m_is_pegin && ecx::IsExchangeStateInternalOutpoint(input.prevout)) {
-            return state.Invalid(
-                TxValidationResult::TX_CONSENSUS,
-                "bad-ecx-internal-state-spend",
-                "transaction attempted to spend the reserved ECX chainstate record");
+    if (g_con_elementsmode) {
+        for (const CTxIn& input : tx.vin) {
+            if (!input.m_is_pegin && ecx::IsExchangeStateInternalOutpoint(input.prevout)) {
+                return state.Invalid(
+                    TxValidationResult::TX_CONSENSUS,
+                    "bad-ecx-internal-state-spend",
+                    "transaction attempted to spend the reserved ECX chainstate record");
+            }
+            if (!input.m_is_pegin &&
+                (drivechain::IsBmmStateInternalOutpoint(input.prevout) ||
+                 drivechain::IsCtipStateInternalOutpoint(input.prevout))) {
+                return state.Invalid(
+                    TxValidationResult::TX_CONSENSUS,
+                    "bad-drivechain-internal-state-spend",
+                    "transaction attempted to spend a reserved drivechain chainstate record");
+            }
         }
     }
     // are the actual inputs available?
