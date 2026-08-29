@@ -1,4 +1,4 @@
-/* Frozen ECX catalogue; generated. */
+/* Test-only operator-risk ECX catalogue; nonactivating. */
 case 5:
   code = simplicity_decodeUptoMaxInt(stream);
   if (code < 0) return (simplicity_err)code;
@@ -28,7 +28,49 @@ case 5:
       *result = ECX_CURRENT_BMM_PARENT_MTP_REQUIRED;
       return SIMPLICITY_NO_ERROR;
     case 9:
+      *result = ECX_BOND_V2_CONFIGURATION_HASH_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 10:
+      *result = ECX_BOND_V2_ASSET_ID_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 11:
+      *result = ECX_BOND_V2_DEPLOYMENT_COMMITMENT_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 12:
+      *result = ECX_BOND_V2_TRANSITION_CMR_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 13:
       *result = ECX_VERIFY_SP1_GROTH16_SHA256;
+      return SIMPLICITY_NO_ERROR;
+    case 14:
+      *result = ECX_VERIFY_SP1_GROTH16_V3_PUBLIC_VALUES_V4_SHA256;
+      return SIMPLICITY_NO_ERROR;
+    case 15:
+      *result = ECX_VERIFY_SP1_GROTH16_V4_PUBLIC_VALUES_V5_SHA256;
+      return SIMPLICITY_NO_ERROR;
+    case 16:
+      *result = ECX_PRIOR_ACTIVE_BOND_INBOX_ROOT_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 17:
+      *result = ECX_PRIOR_ACTIVE_BOND_INBOX_COUNT_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 18:
+      *result = ECX_CURRENT_SIDECHAIN_HEIGHT_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 19:
+      *result = ECX_BOND_V2_INSURANCE_RESERVE_INPUT_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 20:
+      *result = ECX_BOND_V2_COLLATERAL_VAULT_INPUT_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 21:
+      *result = ECX_BOND_V2_INCREMENTAL_ACTIVATION_CMR_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 22:
+      *result = ECX_INCREMENTAL_SUCCESSOR_TRANSITION_CMR_REQUIRED;
+      return SIMPLICITY_NO_ERROR;
+    case 23:
+      *result = ECX_VERIFY_SP1_GROTH16_V5_INCREMENTAL_ACTIVATION_SHA256;
       return SIMPLICITY_NO_ERROR;
   }
   break;
