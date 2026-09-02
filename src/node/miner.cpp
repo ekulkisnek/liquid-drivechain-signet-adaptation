@@ -17,12 +17,13 @@
 #include <drivechain_bmm.h>
 #include <ecx_exchange_state.h>
 #include <node/drivechain_withdrawal_bundle.h>
+#include <pegins.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <pow.h>
 #include <primitives/transaction.h>
-#include <sync.h>
 #include <timedata.h>
+#include <usdd_sp1_resources.h>
 #include <util/moneystr.h>
 #include <util/system.h>
 #include <validation.h>
@@ -194,6 +195,7 @@ void BlockAssembler::resetBlock()
     // These counters do not include coinbase tx
     nBlockTx = 0;
     nFees = 0;
+    m_usdd_sp1_namespace_annexes = 0;
 }
 
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, std::chrono::seconds min_tx_age, DynaFedParamEntry* proposed_entry, const std::vector<CScript>* commit_scripts, std::optional<uint64_t> authenticated_parent_height)
@@ -220,6 +222,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     CBlockIndex* pindexPrev = m_chainstate.m_chain.Tip();
     assert(pindexPrev != nullptr);
     nHeight = pindexPrev->nHeight + 1;
+    m_include_drivechain_pegins =
+        m_chainstate.IsDrivechainMempoolCurrentForMining();
 
     const ecx::ExchangeConsensus& ecx_consensus = ecx::LayerTwoLabsExchangeConsensus();
     m_ecx_source_append_budget = 0;
@@ -388,16 +392,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     pblocktemplate->vTxSigOpsCost[0] = WITNESS_SCALE_FACTOR * GetLegacySigOpCount(*pblock->vtx[0]);
 
     BlockValidationState state;
-    if (!TestBlockValidity(
-            state,
-            chainparams,
-            m_chainstate,
-            *pblock,
-            pindexPrev,
-            false,
-            false,
-            true)) {
-        throw std::runtime_error(strprintf("%s: TestBlockValidity failed: %s", __func__, state.ToString()));
+    // The replay cache can publish a replacement generation without taking
+    // cs_main or the mempool lock. Never return a template containing a peg-in
+    // if that publication raced assembly; the next template fences deposits
+    // until the mempool sweep completes.
+    if (m_include_drivechain_pegins &&
+        !m_chainstate.IsDrivechainMempoolCurrentForMining() &&
+        std::any_of(pblock->vtx.begin(), pblock->vtx.end(),
+                    [](const CTransactionRef& tx) {
+                        return std::any_of(
+                            tx->vin.begin(), tx->vin.end(),
+                            [](const CTxIn& input) {
+                                return input.m_is_pegin;
+                            });
+                    })) {
+        throw std::runtime_error(
+            "authenticated parent replay changed during block assembly");
+    }
+    if (!TestBlockCandidateValidity(state, chainparams, m_chainstate, *pblock, pindexPrev, false, false)) {
+        throw std::runtime_error(strprintf("%s: TestBlockCandidateValidity failed: %s", __func__, state.ToString()));
     }
     int64_t nTime2 = GetTimeMicros();
 
@@ -436,12 +449,36 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 //   segwit activation)
 bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package) const
 {
+    size_t usdd_sp1_namespace_annexes = m_usdd_sp1_namespace_annexes;
     for (CTxMemPool::txiter it : package) {
+        if (!m_include_drivechain_pegins &&
+            std::any_of(it->GetTx().vin.begin(), it->GetTx().vin.end(),
+                        [](const CTxIn& input) {
+                            return input.m_is_pegin;
+                        })) {
+            return false;
+        }
         if (!IsFinalTx(it->GetTx(), nHeight, m_lock_time_cutoff)) {
             return false;
         }
         if (!fIncludeWitness && it->GetTx().HasWitness()) {
             return false;
+        }
+        if (chainparams.GetConsensus().enable_usdd_sp1_annex) {
+            const usdd::Sp1AnnexResourceUsage usage =
+                usdd::GetUsddSp1AnnexResourceUsage(it->GetTx());
+            if (usage.oversized || usage.malformed ||
+                usage.wrong_spend_shape || usage.wrong_controller_cmr ||
+                usage.wrong_guest_program_id ||
+                usage.malformed_public_values ||
+                usage.deployment_unconfigured ||
+                usage.wrong_inbound_mint_domain ||
+                usdd::ExceedsUsddSp1AnnexLane(
+                                       usdd_sp1_namespace_annexes,
+                                       usage.namespace_annexes)) {
+                return false;
+            }
+            usdd_sp1_namespace_annexes += usage.namespace_annexes;
         }
     }
     return true;
@@ -449,6 +486,21 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
 
 void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
 {
+    if (chainparams.GetConsensus().enable_usdd_sp1_annex) {
+        const usdd::Sp1AnnexResourceUsage usage =
+            usdd::GetUsddSp1AnnexResourceUsage(iter->GetTx());
+        assert(!usage.oversized);
+        assert(!usage.malformed);
+        assert(!usage.wrong_spend_shape);
+        assert(!usage.wrong_controller_cmr);
+        assert(!usage.wrong_guest_program_id);
+        assert(!usage.malformed_public_values);
+        assert(!usage.deployment_unconfigured);
+        assert(!usage.wrong_inbound_mint_domain);
+        assert(!usdd::ExceedsUsddSp1AnnexLane(
+            m_usdd_sp1_namespace_annexes, usage.namespace_annexes));
+        m_usdd_sp1_namespace_annexes += usage.namespace_annexes;
+    }
     pblocktemplate->block.vtx.emplace_back(iter->GetSharedTx());
     pblocktemplate->vTxFees.push_back(iter->GetFee());
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());
@@ -538,6 +590,34 @@ void BlockAssembler::SortForBlock(const CTxMemPool::setEntries& package, std::ve
 void BlockAssembler::addPackageTxs(int& nPackagesSelected, int& nDescendantsUpdated, std::chrono::seconds min_tx_age)
 {
     AssertLockHeld(m_mempool.cs);
+
+    // A native BIP300 deposit gives the sidechain its entire backing value to
+    // one committed recipient, so its one-input/one-output canonical form has
+    // no room to pay an Elements fee. Include only that exact standalone form
+    // before ordinary feerate selection. Requiring no mempool parents or
+    // children prevents this exception from subsidizing any package.
+    if (chainparams.GetConsensus().drivechain_slot.has_value()) {
+        for (auto iter = m_mempool.mapTx.begin(); iter != m_mempool.mapTx.end(); ++iter) {
+            if (iter->GetFee() != 0 ||
+                iter->GetCountWithAncestors() != 1 ||
+                iter->GetCountWithDescendants() != 1 ||
+                !iter->GetMemPoolParentsConst().empty() ||
+                !iter->GetMemPoolChildrenConst().empty() ||
+                !IsCanonicalFeeFreeDrivechainDeposit(iter->GetTx()) ||
+                (min_tx_age > std::chrono::seconds(0) &&
+                 iter->GetTime() > GetTime<std::chrono::seconds>() - min_tx_age)) {
+                continue;
+            }
+
+            CTxMemPool::setEntries singleton{iter};
+            if (!TestPackage(iter->GetTxSize(), iter->GetSigOpCost()) ||
+                !TestPackageTransactions(singleton)) {
+                continue;
+            }
+            AddToBlock(iter);
+            ++nPackagesSelected;
+        }
+    }
 
     // mapModifiedTx will store sorted packages after they are modified
     // because some of their txs are already in the block

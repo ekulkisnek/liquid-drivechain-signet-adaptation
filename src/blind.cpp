@@ -12,6 +12,8 @@
 #include <random.h>
 #include <util/system.h>
 
+#include <array>
+
 secp256k1_context* secp256k1_blind_context = NULL;
 
 class Blind_ECC_Init {
@@ -475,8 +477,11 @@ int BlindTransaction(std::vector<uint256 >& input_value_blinding_factors, const 
     //Running total of newly blinded outputs
     static const unsigned char diff_zero[32] = {0};
     assert(num_to_blind <= 10000); // More than 10k outputs? Stop spamming.
-    unsigned char blind[10000][32];
-    unsigned char asset_blind[10000][32];
+    // Keep these buffers off the stack. Together the former fixed arrays used
+    // 640 KiB, which exceeds the default stack of macOS RPC worker threads and
+    // made ordinary confidential wallet sends terminate the node.
+    std::vector<std::array<unsigned char, 32>> blind(10000);
+    std::vector<std::array<unsigned char, 32>> asset_blind(10000);
     secp256k1_pedersen_commitment value_commit;
     secp256k1_generator asset_gen;
     CAsset asset;

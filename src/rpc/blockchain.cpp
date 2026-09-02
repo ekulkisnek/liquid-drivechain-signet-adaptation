@@ -18,10 +18,12 @@
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
 #include <ecx_exchange_state.h>
+#include <drivechain_withdrawal.h>
 #include <fs.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
+#include <init.h>
 #include <logging/timer.h>
 #include <mainchainrpc.h>
 #include <net.h>
@@ -29,6 +31,7 @@
 #include <node/blockstorage.h>
 #include <node/coinstats.h>
 #include <node/context.h>
+#include <node/transaction.h>
 #include <node/utxo_snapshot.h>
 #include <policy/feerate.h>
 #include <policy/fees.h>
@@ -49,6 +52,7 @@
 #include <util/string.h>
 #include <util/system.h>
 #include <util/translation.h>
+#include <usdd_withdrawal_accumulator.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
@@ -60,6 +64,7 @@
 
 #include <univalue.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <algorithm>
 #include <array>
@@ -85,6 +90,7 @@ struct CUpdatedBlock
 
 static Mutex cs_blockchange;
 static std::condition_variable cond_blockchange;
+static std::mutex g_usdd_withdrawal_proof_mutex;
 static CUpdatedBlock latestblock GUARDED_BY(cs_blockchange);
 
 /* Calculate the difficulty for a given block index.
@@ -2313,7 +2319,7 @@ RPCHelpMan getblockchaininfo()
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
                     {
-                        {RPCResult::Type::STR, "chain", "current network name (main, test, signet, regtest, liquidv1, liquidv1test, liquidtestnet)"},
+                        {RPCResult::Type::STR, "chain", "current network name (always elements in production)"},
                         {RPCResult::Type::NUM, "blocks", "the height of the most-work fully-validated chain. The genesis block has height 0"},
                         {RPCResult::Type::NUM, "headers", "the current number of headers we have validated"},
                         {RPCResult::Type::STR, "bestblockhash", "the hash of the currently best block"},
@@ -3952,6 +3958,698 @@ static RPCHelpMan getsidechaininfo()
     };
 }
 
+namespace {
+
+struct AuthenticatedNativeWithdrawal
+{
+    uint256 txid;
+    uint32_t vout{0};
+    uint256 block_hash;
+    int block_height{0};
+    int confirmations{0};
+    drivechain::NativeWithdrawal withdrawal;
+    drivechain::NativeWithdrawalM6 m6;
+    std::optional<DrivechainSuccessfulWithdrawal> successful_parent_withdrawal;
+};
+
+bool IsSupportedNativeWithdrawalDestination(const CScript& script)
+{
+    TxoutType type;
+    if (!IsStandard(script, type)) return false;
+    switch (type) {
+    case TxoutType::PUBKEY:
+    case TxoutType::PUBKEYHASH:
+    case TxoutType::SCRIPTHASH:
+    case TxoutType::MULTISIG:
+    case TxoutType::WITNESS_V0_SCRIPTHASH:
+    case TxoutType::WITNESS_V0_KEYHASH:
+    case TxoutType::WITNESS_V1_TAPROOT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+CAmount NativeWithdrawalParentDustThreshold(const CScript& script)
+{
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    const bool witness = script.IsWitnessProgram(
+        witness_version, witness_program);
+    const size_t output_size = ::GetSerializeSize(
+        Sidechain::Bitcoin::CTxOut(0, script), PROTOCOL_VERSION);
+    return CFeeRate(DUST_RELAY_TX_FEE_BITCOIN).GetFee(
+        static_cast<uint32_t>(output_size) + (witness ? 67 : 148));
+}
+
+AuthenticatedNativeWithdrawal LoadNativeWithdrawal(
+    ChainstateManager& chainman,
+    const uint256& txid,
+    const uint32_t vout,
+    const uint256& block_hash,
+    const int min_confirmations)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (!consensus.drivechain_slot.has_value() ||
+        !consensus.DrivechainWithdrawalValidationEnabled()) {
+        throw JSONRPCError(
+            RPC_METHOD_NOT_FOUND,
+            "Native BIP300 withdrawals are not enabled on this network");
+    }
+    if (min_confirmations < 1 || min_confirmations > 100000) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "minconfirmations must be between 1 and 100000");
+    }
+
+    const CBlockIndex* block_index{nullptr};
+    int confirmations{0};
+    {
+        LOCK(cs_main);
+        block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
+        const CChain& active = chainman.ActiveChain();
+        if (!block_index || !active.Contains(block_index)) {
+            throw JSONRPCError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                "Confirming block is not in the active Elements chain");
+        }
+        if (!(block_index->nStatus & BLOCK_HAVE_DATA)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "Confirming block data is unavailable on this pruned node");
+        }
+        confirmations = active.Height() - block_index->nHeight + 1;
+        if (confirmations < min_confirmations) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                strprintf("Native withdrawal burn has %d confirmation(s); %d required",
+                          confirmations, min_confirmations));
+        }
+    }
+
+    CBlock block;
+    if (!ReadBlockFromDisk(block, block_index, consensus)) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "Unable to read the confirming Elements block");
+    }
+    BlockValidationState block_state;
+    if (!CheckBlock(block, block_state, consensus,
+                    /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true)) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            strprintf("Confirming Elements block body failed context-free validation: %s",
+                      block_state.ToString()));
+    }
+    CTransactionRef transaction;
+    for (const CTransactionRef& candidate : block.vtx) {
+        if (candidate && candidate->GetHash() == txid) {
+            if (transaction) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "Confirming block contains the withdrawal txid more than once");
+            }
+            transaction = candidate;
+        }
+    }
+    if (!transaction) {
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Withdrawal transaction is not in the specified confirming block");
+    }
+    if (vout >= transaction->vout.size()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "Withdrawal vout is outside the transaction");
+    }
+
+    // A native V1 withdrawal is exactly one canonical parent-genesis peg-out
+    // output in its transaction. Its explicit pegged-asset value is destroyed
+    // by ordinary Elements consensus because OP_RETURN is never added to the
+    // UTXO set. Nothing in this RPC can turn the burn back into a spendable
+    // output.
+    std::optional<uint32_t> canonical_vout;
+    drivechain::NativeWithdrawal withdrawal;
+    for (uint32_t index = 0; index < transaction->vout.size(); ++index) {
+        const CTxOut& output = transaction->vout[index];
+        if (!output.scriptPubKey.IsPegoutScript(
+                Params().ParentGenesisBlockHash())) {
+            continue;
+        }
+        const CTxOutWitness* output_witness =
+            index < transaction->witness.vtxoutwit.size()
+            ? &transaction->witness.vtxoutwit[index]
+            : nullptr;
+        drivechain::NativeWithdrawal parsed;
+        std::string parse_error;
+        if (!drivechain::ParseNativeWithdrawalOutput(
+                output, output_witness, consensus.pegged_asset,
+                Params().ParentGenesisBlockHash(), parsed, &parse_error)) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                strprintf("Malformed native withdrawal output %u: %s",
+                          index, parse_error));
+        }
+        if (canonical_vout.has_value()) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                "Native withdrawal V1 permits exactly one withdrawal burn per Elements transaction");
+        }
+        canonical_vout = index;
+        withdrawal = std::move(parsed);
+    }
+    if (!canonical_vout.has_value() || *canonical_vout != vout) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            "Requested outpoint is not the transaction's sole canonical native withdrawal burn");
+    }
+    if (!transaction->vout[vout].scriptPubKey.IsUnspendable()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Canonical native withdrawal output is unexpectedly spendable");
+    }
+    if (!IsSupportedNativeWithdrawalDestination(withdrawal.destination)) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            "Native withdrawal Bitcoin destination is not a recognized, currently spendable standard script");
+    }
+    if (withdrawal.payout_amount <
+        NativeWithdrawalParentDustThreshold(withdrawal.destination)) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            "Native withdrawal Bitcoin payout is dust for its destination");
+    }
+
+    drivechain::NativeWithdrawalM6 m6;
+    std::string m6_error;
+    if (!drivechain::BuildNativeWithdrawalM6(
+            consensus.hashGenesisBlock,
+            static_cast<uint8_t>(*consensus.drivechain_slot),
+            txid, vout, withdrawal, m6, &m6_error)) {
+        throw JSONRPCError(RPC_VERIFY_ERROR, m6_error);
+    }
+    drivechain::NativeWithdrawalM6 reparsed_m6;
+    if (!drivechain::ParseNativeWithdrawalM6(
+            m6.blinded_transaction, consensus.hashGenesisBlock,
+            static_cast<uint8_t>(*consensus.drivechain_slot), txid, vout,
+            reparsed_m6, &m6_error) ||
+        reparsed_m6.m6id != m6.m6id ||
+        reparsed_m6.legacy_serialization != m6.legacy_serialization) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            m6_error.empty()
+                ? "Internally generated native withdrawal M6 failed canonical round-trip"
+                : m6_error);
+    }
+
+    // Close the disk-read/reorg race immediately before returning an object
+    // that may be submitted to the enforcer.
+    {
+        LOCK(cs_main);
+        const CChain& active = chainman.ActiveChain();
+        if (!active.Contains(block_index) ||
+            block_index->GetBlockHash() != block_hash) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                "Confirming block left the active Elements chain while the withdrawal was authenticated");
+        }
+        confirmations = active.Height() - block_index->nHeight + 1;
+        if (confirmations < min_confirmations) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                "Withdrawal no longer has the required active-chain depth");
+        }
+    }
+
+    AuthenticatedNativeWithdrawal result;
+    result.txid = txid;
+    result.vout = vout;
+    result.block_hash = block_hash;
+    result.block_height = block_index->nHeight;
+    result.confirmations = confirmations;
+    result.withdrawal = std::move(withdrawal);
+    result.m6 = std::move(m6);
+    std::string parent_error;
+    if (!GetDrivechainSuccessfulWithdrawal(
+            *consensus.drivechain_slot, result.m6.m6id,
+            result.successful_parent_withdrawal, &parent_error)) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            strprintf("Unable to authenticate completed BIP300 withdrawals on the active parent chain: %s",
+                      parent_error));
+    }
+
+    // Parent replay can be slow on a cold node. Recheck the Elements anchor
+    // after that work so an orphaned burn is never reported as valid.
+    {
+        LOCK(cs_main);
+        const CChain& active = chainman.ActiveChain();
+        if (!active.Contains(block_index) ||
+            block_index->GetBlockHash() != block_hash) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                "Confirming block left the active Elements chain during parent withdrawal replay");
+        }
+        result.confirmations = active.Height() - block_index->nHeight + 1;
+        if (result.confirmations < min_confirmations) {
+            throw JSONRPCError(
+                RPC_VERIFY_ERROR,
+                "Withdrawal lost the required active-chain depth during parent withdrawal replay");
+        }
+    }
+    return result;
+}
+
+UniValue NativeWithdrawalToJSON(const AuthenticatedNativeWithdrawal& claim)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("txid", claim.txid.GetHex());
+    result.pushKV("vout", static_cast<uint64_t>(claim.vout));
+    result.pushKV("blockhash", claim.block_hash.GetHex());
+    result.pushKV("blockheight", claim.block_height);
+    result.pushKV("confirmations", claim.confirmations);
+    result.pushKV("burn_amount", ValueFromAmount(claim.withdrawal.burn_amount));
+    result.pushKV("payout_amount", ValueFromAmount(claim.withdrawal.payout_amount));
+    result.pushKV("mainchain_fee", ValueFromAmount(claim.withdrawal.parent_fee));
+    result.pushKV("bitcoin_script_pub_key", HexStr(claim.withdrawal.destination));
+    result.pushKV("burn_commitment", HexStr(claim.m6.burn_commitment));
+    result.pushKV("m6id", claim.m6.m6id.GetHex());
+    result.pushKV("blinded_m6", HexStr(claim.m6.legacy_serialization));
+    result.pushKV("burn_is_unspendable", true);
+    const bool paid = claim.successful_parent_withdrawal.has_value();
+    result.pushKV("paid_on_parent_chain", paid);
+    if (paid) {
+        result.pushKV(
+            "parent_payment_blockhash",
+            claim.successful_parent_withdrawal->block_hash.GetHex());
+        result.pushKV(
+            "parent_payment_blockheight",
+            static_cast<uint64_t>(
+                claim.successful_parent_withdrawal->block_height));
+    }
+    result.pushKV(
+        "conservation",
+        "burn_amount = payout_amount + mainchain_fee");
+    return result;
+}
+
+void RejectPaidNativeWithdrawal(const AuthenticatedNativeWithdrawal& claim)
+{
+    if (!claim.successful_parent_withdrawal.has_value()) return;
+    throw JSONRPCError(
+        RPC_VERIFY_ALREADY_IN_CHAIN,
+        strprintf("Native withdrawal M6 %s was already paid in parent block %s at height %u",
+                  claim.m6.m6id.GetHex(),
+                  claim.successful_parent_withdrawal->block_hash.GetHex(),
+                  claim.successful_parent_withdrawal->block_height));
+}
+
+uint32_t ParseWithdrawalVout(const UniValue& value)
+{
+    const int64_t parsed = value.get_int64();
+    if (parsed < 0 ||
+        parsed >= static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "vout is outside the canonical uint32 range");
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
+} // namespace
+
+static RPCHelpMan getdrivechainwithdrawalbundle()
+{
+    return RPCHelpMan{"getdrivechainwithdrawalbundle",
+                "Authenticates a confirmed native pegged-asset burn and deterministically derives its blinded BIP300 M6. This call does not submit anything.\n",
+                {
+                    {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Elements burn transaction id"},
+                    {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Canonical burn output index"},
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Active-chain block containing the burn"},
+                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{1}, "Required active Elements confirmations"},
+                },
+                RPCResult{RPCResult::Type::OBJ, "", "Authenticated burn and exact blinded M6"},
+                RPCExamples{
+                    HelpExampleCli("getdrivechainwithdrawalbundle", "\"<txid>\" 0 \"<blockhash>\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const int min_confirmations = request.params[3].isNull()
+        ? 1
+        : request.params[3].get_int();
+    return NativeWithdrawalToJSON(LoadNativeWithdrawal(
+        chainman,
+        ParseHashV(request.params[0], "txid"),
+        ParseWithdrawalVout(request.params[1]),
+        ParseHashV(request.params[2], "blockhash"),
+        min_confirmations));
+},
+    };
+}
+
+static RPCHelpMan submitdrivechainwithdrawal()
+{
+    return RPCHelpMan{"submitdrivechainwithdrawal",
+                "Authenticates a confirmed native pegged-asset burn, derives its unique blinded M6, and submits it idempotently to the configured BIP300 enforcer.\n",
+                {
+                    {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Elements burn transaction id"},
+                    {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Canonical burn output index"},
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Active-chain block containing the burn"},
+                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{6}, "Required active Elements confirmations before proposing the M6"},
+                },
+                RPCResult{RPCResult::Type::OBJ, "", "Authenticated burn, exact blinded M6, and enforcer submission result"},
+                RPCExamples{
+                    HelpExampleCli("submitdrivechainwithdrawal", "\"<txid>\" 0 \"<blockhash>\" 6")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const int min_confirmations = request.params[3].isNull()
+        ? 6
+        : request.params[3].get_int();
+    AuthenticatedNativeWithdrawal claim = LoadNativeWithdrawal(
+        chainman,
+        ParseHashV(request.params[0], "txid"),
+        ParseWithdrawalVout(request.params[1]),
+        ParseHashV(request.params[2], "blockhash"),
+        min_confirmations);
+    RejectPaidNativeWithdrawal(claim);
+
+    std::string response;
+    std::string submission_error;
+    if (!SubmitDrivechainWithdrawalBundle(
+            *Params().GetConsensus().drivechain_slot,
+            claim.m6.legacy_serialization, &response, &submission_error)) {
+        throw JSONRPCError(RPC_MISC_ERROR, submission_error);
+    }
+
+    UniValue result = NativeWithdrawalToJSON(claim);
+    result.pushKV("submitted", true);
+    result.pushKV("enforcer_response", response);
+    result.pushKV(
+        "security_model",
+        "burn authenticated by this Elements node; M6 authorization follows BIP300 miner voting");
+    return result;
+},
+    };
+}
+
+static RPCHelpMan verifydrivechainwithdrawalbundle()
+{
+    return RPCHelpMan{"verifydrivechainwithdrawalbundle",
+                "Verifies that an externally proposed blinded BIP300 M6 is the unique canonical bundle for a confirmed native pegged-asset burn. This call does not submit anything.\n"
+                "Miners and operators can use this RPC to reject fabricated or altered native withdrawal proposals before voting.\n",
+                {
+                    {"blinded_m6", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact legacy zero-input blinded M6 serialization"},
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Active Elements block containing the burn referenced by the M6"},
+                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{6}, "Required active Elements confirmations"},
+                },
+                RPCResult{RPCResult::Type::OBJ, "", "Verified burn and exact blinded M6"},
+                RPCExamples{
+                    HelpExampleCli("verifydrivechainwithdrawalbundle", "\"<blinded_m6_hex>\" \"<blockhash>\" 6")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::string encoded = request.params[0].get_str();
+    if (!IsHex(encoded)) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                           "blinded_m6 must be canonical hexadecimal");
+    }
+    std::vector<unsigned char> serialized = ParseHex(encoded);
+    if (serialized.empty() ||
+        serialized.size() >
+            drivechain::NATIVE_WITHDRAWAL_MAX_M6_LEGACY_SIZE) {
+        throw JSONRPCError(
+            RPC_DESERIALIZATION_ERROR,
+            "blinded_m6 exceeds the canonical native-withdrawal serialization bound");
+    }
+
+    Sidechain::Bitcoin::CMutableTransaction proposed;
+    std::string parse_error;
+    if (!drivechain::DeserializeNativeWithdrawalM6Legacy(
+            serialized, proposed, &parse_error)) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, parse_error);
+    }
+    if (proposed.vout.size() < 2) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            "blinded M6 has no native withdrawal burn reference output");
+    }
+
+    uint256 referenced_genesis;
+    uint8_t referenced_slot{0};
+    uint256 burn_txid;
+    uint32_t burn_vout{0};
+    if (!drivechain::ParseNativeWithdrawalM6Commitment(
+            proposed.vout[1].scriptPubKey, referenced_genesis,
+            referenced_slot, burn_txid, burn_vout, &parse_error)) {
+        throw JSONRPCError(RPC_VERIFY_ERROR, parse_error);
+    }
+
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (!consensus.drivechain_slot.has_value() ||
+        referenced_genesis != consensus.hashGenesisBlock ||
+        referenced_slot != static_cast<uint8_t>(*consensus.drivechain_slot)) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            "blinded M6 references a different Elements chain or sidechain slot");
+    }
+
+    drivechain::NativeWithdrawalM6 structurally_valid;
+    if (!drivechain::ParseNativeWithdrawalM6(
+            proposed, referenced_genesis, referenced_slot,
+            burn_txid, burn_vout, structurally_valid, &parse_error)) {
+        throw JSONRPCError(RPC_VERIFY_ERROR, parse_error);
+    }
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const int min_confirmations = request.params[2].isNull()
+        ? 6
+        : request.params[2].get_int();
+    AuthenticatedNativeWithdrawal claim = LoadNativeWithdrawal(
+        chainman, burn_txid, burn_vout,
+        ParseHashV(request.params[1], "blockhash"), min_confirmations);
+    if (claim.m6.legacy_serialization != serialized ||
+        claim.m6.m6id != drivechain::ComputeNativeWithdrawalM6Id(proposed)) {
+        throw JSONRPCError(
+            RPC_VERIFY_ERROR,
+            "blinded M6 payout, fee, reference, or canonical encoding does not match the confirmed Elements burn");
+    }
+    RejectPaidNativeWithdrawal(claim);
+
+    UniValue result = NativeWithdrawalToJSON(claim);
+    result.pushKV("valid", true);
+    result.pushKV(
+        "security_model",
+        "verified against the active Elements chain; BIP300 payout still requires miner approval");
+    return result;
+},
+    };
+}
+
+static RPCHelpMan getusddwithdrawalaccumulator()
+{
+    return RPCHelpMan{"getusddwithdrawalaccumulator",
+                "Returns the deterministic canonical Ethereum-withdrawal accumulator at an active-chain block.\n"
+                "This generic index binds each leaf's actual asset and vault but is not, by itself, an authorizing\n"
+                "USDD root. The immutable external deployment manifest and vault must enforce their exact IDs.\n",
+                {
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"chain tip"}, "Optional active-chain block hash"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR_HEX, "blockhash", "Block whose derived state is returned"},
+                        {RPCResult::Type::NUM, "height", "Block height"},
+                        {RPCResult::Type::NUM, "count", "Cumulative canonical withdrawal-leaf count"},
+                        {RPCResult::Type::STR_HEX, "root", "Depth-64 SHA-256 sparse-Merkle root"},
+                        {RPCResult::Type::BOOL, "authorizing", "Always false: the node cannot authenticate an external USDD deployment"},
+                        {RPCResult::Type::STR, "scope", "Exact scope of the generic accumulator"},
+                    }},
+                RPCExamples{
+                    HelpExampleCli("getusddwithdrawalaccumulator", "")
+                    + HelpExampleRpc("getusddwithdrawalaccumulator", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const CBlockIndex* blockindex{nullptr};
+    usdd::WithdrawalAccumulatorState accumulator;
+    {
+        LOCK(cs_main);
+        const CChain& active = chainman.ActiveChain();
+        blockindex = request.params[0].isNull()
+            ? active.Tip()
+            : chainman.m_blockman.LookupBlockIndex(ParseHashV(request.params[0], "blockhash"));
+        if (!blockindex || !active.Contains(blockindex)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
+        }
+        if (!blockindex->m_usdd_withdrawal_accumulator.has_value()) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Withdrawal accumulator unavailable; reindex required");
+        }
+        accumulator = *blockindex->m_usdd_withdrawal_accumulator;
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("blockhash", blockindex->GetBlockHash().GetHex());
+    result.pushKV("height", blockindex->nHeight);
+    result.pushKV("count", accumulator.count);
+    result.pushKV("root", HexStr(accumulator.root));
+    result.pushKV("authorizing", false);
+    result.pushKV("scope", "generic exact USDD-v1-shaped burns; leaf binds actual asset and vault");
+    return result;
+},
+    };
+}
+
+static RPCHelpMan getusddwithdrawalproof()
+{
+    return RPCHelpMan{"getusddwithdrawalproof",
+                "Reconstructs a canonical withdrawal inclusion proof from retained active-chain blocks.\n"
+                "Proof reconstruction requires unpruned blocks containing withdrawals, is single-flight,\n"
+                "and is limited to 10,000 leaves and a ten-second work budget per call.\n",
+                {
+                    {"index", RPCArg::Type::NUM, RPCArg::Optional::NO, "Zero-based cumulative claim index"},
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"chain tip"}, "Optional active-chain block hash"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "Withdrawal claim and bottom-up 64-sibling branch",
+                    {
+                        {RPCResult::Type::NUM, "index", "Claim index"},
+                        {RPCResult::Type::STR_HEX, "root", "Accumulator root"},
+                        {RPCResult::Type::NUM, "count", "Accumulator leaf count"},
+                        {RPCResult::Type::STR_HEX, "leaf", "Canonical Solidity-compatible leaf"},
+                        {RPCResult::Type::STR_HEX, "burn_id", "Canonical burn identity"},
+                        {RPCResult::Type::STR_HEX, "txid", "Elements burn transaction ID in display order"},
+                        {RPCResult::Type::NUM, "vout", "Burn output index"},
+                        {RPCResult::Type::STR_HEX, "asset", "Explicit burned asset ID"},
+                        {RPCResult::Type::STR_HEX, "vault_id", "Vault ID from the burn payload"},
+                        {RPCResult::Type::STR_HEX, "recipient", "Fixed Ethereum recipient"},
+                        {RPCResult::Type::NUM, "amount_usdt_micro", "Six-decimal USDT amount"},
+                        {RPCResult::Type::ARR, "siblings", "64 sibling hashes, bottom-up",
+                            {{RPCResult::Type::STR_HEX, "hash", "Sibling hash"}}},
+                        {RPCResult::Type::BOOL, "authorizing", "Always false: the node cannot authenticate an external USDD deployment"},
+                    }},
+                RPCExamples{
+                    HelpExampleCli("getusddwithdrawalproof", "0")
+                    + HelpExampleRpc("getusddwithdrawalproof", "0")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const int64_t requested_index = request.params[0].get_int64();
+    if (requested_index < 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Withdrawal index must not be negative");
+    }
+    const uint64_t index = static_cast<uint64_t>(requested_index);
+    static constexpr uint64_t MAX_RECONSTRUCTION_LEAVES{10'000};
+    static constexpr auto MAX_RECONSTRUCTION_TIME{std::chrono::seconds{10}};
+    std::unique_lock<std::mutex> proof_lock(
+        g_usdd_withdrawal_proof_mutex, std::defer_lock);
+    if (!proof_lock.try_lock()) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR, "A withdrawal-proof reconstruction is already running");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + MAX_RECONSTRUCTION_TIME;
+    const auto interruption_point = [&] {
+        RpcInterruptionPoint();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR, "Withdrawal-proof reconstruction work budget exhausted");
+        }
+    };
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const CBlockIndex* target{nullptr};
+    usdd::WithdrawalAccumulatorState accumulator;
+    std::vector<const CBlockIndex*> blocks_with_withdrawals;
+    {
+        LOCK(cs_main);
+        const CChain& active = chainman.ActiveChain();
+        target = request.params[1].isNull()
+            ? active.Tip()
+            : chainman.m_blockman.LookupBlockIndex(ParseHashV(request.params[1], "blockhash"));
+        if (!target || !active.Contains(target)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
+        }
+        if (!target->m_usdd_withdrawal_accumulator.has_value()) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Withdrawal accumulator unavailable; reindex required");
+        }
+        accumulator = *target->m_usdd_withdrawal_accumulator;
+        if (index >= accumulator.count) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Withdrawal index is outside this accumulator");
+        }
+        if (accumulator.count > MAX_RECONSTRUCTION_LEAVES) {
+            throw JSONRPCError(RPC_MISC_ERROR,
+                "Proof reconstruction exceeds the safe RPC limit; use a dedicated permissionless indexer");
+        }
+        uint64_t prior_count{0};
+        for (int height = 1; height <= target->nHeight; ++height) {
+            if ((height & 0x0fff) == 0) interruption_point();
+            const CBlockIndex* cursor = active[height];
+            if (!cursor->m_usdd_withdrawal_accumulator.has_value()) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Discontinuous withdrawal accumulator; reindex required");
+            }
+            const uint64_t count = cursor->m_usdd_withdrawal_accumulator->count;
+            if (count < prior_count) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Nonmonotonic withdrawal accumulator; reindex required");
+            }
+            if (count != prior_count) blocks_with_withdrawals.push_back(cursor);
+            prior_count = count;
+        }
+    }
+
+    std::vector<usdd::EthereumWithdrawalClaim> claims;
+    claims.reserve(static_cast<size_t>(accumulator.count));
+    for (const CBlockIndex* blockindex : blocks_with_withdrawals) {
+        interruption_point();
+        CBlock block;
+        if (!ReadBlockFromDisk(block, blockindex, Params().GetConsensus())) {
+            throw JSONRPCError(RPC_MISC_ERROR,
+                "A withdrawal-containing block is pruned or unreadable; use an archival node or indexer");
+        }
+        std::vector<usdd::EthereumWithdrawalClaim> appended;
+        std::string extraction_error;
+        if (!usdd::ExtractEthereumWithdrawals(
+                block, Params().GetConsensus().hashGenesisBlock,
+                claims.size(), appended, &extraction_error)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, extraction_error);
+        }
+        claims.insert(claims.end(), appended.begin(), appended.end());
+    }
+    interruption_point();
+    if (claims.size() != accumulator.count) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+            "Reconstructed withdrawal count disagrees with the persisted accumulator");
+    }
+
+    usdd::WithdrawalInclusionProof proof;
+    usdd::WithdrawalHash reconstructed_root;
+    std::string proof_error;
+    if (!usdd::BuildWithdrawalInclusionProof(
+            claims, index, proof, reconstructed_root, &proof_error) ||
+        reconstructed_root != accumulator.root) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+            proof_error.empty() ? "Reconstructed withdrawal root mismatch" : proof_error);
+    }
+
+    UniValue siblings(UniValue::VARR);
+    for (const auto& sibling : proof.siblings) siblings.push_back(HexStr(sibling));
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("index", index);
+    result.pushKV("root", HexStr(accumulator.root));
+    result.pushKV("count", accumulator.count);
+    result.pushKV("leaf", HexStr(proof.claim.leaf));
+    result.pushKV("burn_id", HexStr(proof.claim.burn_id));
+    result.pushKV("txid", HexStr(proof.claim.burn_txid_display));
+    result.pushKV("vout", static_cast<uint64_t>(proof.claim.burn_vout));
+    result.pushKV("asset", HexStr(proof.claim.asset_id));
+    result.pushKV("vault_id", HexStr(proof.claim.vault_id));
+    result.pushKV("recipient", HexStr(proof.claim.recipient));
+    result.pushKV("amount_usdt_micro", proof.claim.amount_usdt_micro);
+    result.pushKV("siblings", siblings);
+    result.pushKV("authorizing", false);
+    return result;
+},
+    };
+}
+
 // END ELEMENTS
 //
 
@@ -3995,6 +4693,11 @@ static const CRPCCommand commands[] =
     // ELEMENTS:
     { "blockchain",         &getdrivechainpegevents,            },
     { "blockchain",         &getsidechaininfo,                   },
+    { "blockchain",         &getdrivechainwithdrawalbundle,      },
+    { "blockchain",         &verifydrivechainwithdrawalbundle,   },
+    { "blockchain",         &submitdrivechainwithdrawal,         },
+    { "blockchain",         &getusddwithdrawalaccumulator,       },
+    { "blockchain",         &getusddwithdrawalproof,             },
 
     /* Not shown in help */
     { "hidden",              &invalidateblock,                   },

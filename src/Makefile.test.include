@@ -114,7 +114,7 @@ FUZZ_SUITE_LD_COMMON = \
  $(LIBLEVELDB_SSE42) \
  $(LIBMEMENV) \
  $(LIBSECP256K1) \
- $(LIBELEMENTSSIMPLICITY) \
+ $(ELEMENTS_SIMPLICITY_LINK_LIBS) \
  $(MINISKETCH_LIBS) \
  $(EVENT_LIBS) \
  $(EVENT_PTHREADS_LIBS) \
@@ -131,6 +131,7 @@ endif
 
 # test_bitcoin binary #
 BITCOIN_TESTS =\
+  test/drivechain_withdrawal_tests.cpp \
   test/pegin_witness_tests.cpp \
   test/addrman_tests.cpp \
   test/allocator_tests.cpp \
@@ -162,6 +163,8 @@ BITCOIN_TESTS =\
   test/drivechain_bmm_tests.cpp \
   test/drivechain_peg_tests.cpp \
   test/ecx_exchange_state_tests.cpp \
+  test/ecx_simplicity_test_shim.c \
+  test/ecx_simplicity_test_shim.h \
   test/flatfile_tests.cpp \
   test/fs_tests.cpp \
   test/getarg_tests.cpp \
@@ -210,6 +213,7 @@ BITCOIN_TESTS =\
   test/timedata_tests.cpp \
   test/torcontrol_tests.cpp \
   test/transaction_tests.cpp \
+  test/usdd_sp1_verifier_identity_tests.cpp \
   test/txindex_tests.cpp \
   test/txpackage_tests.cpp \
   test/txrequest_tests.cpp \
@@ -274,8 +278,9 @@ test_test_bitcoin_LDADD += $(LIBBITCOIN_WALLET)
 endif
 
 test_test_bitcoin_LDADD += $(LIBBITCOIN_NODE) $(LIBBITCOIN_CLI) $(LIBBITCOIN_COMMON) $(LIBBITCOIN_UTIL) $(LIBBITCOIN_CONSENSUS) $(LIBBITCOIN_CRYPTO) $(LIBUNIVALUE) \
-  $(LIBLEVELDB) $(LIBLEVELDB_SSE42) $(LIBMEMENV) $(LIBSECP256K1) $(LIBELEMENTSSIMPLICITY) $(EVENT_LIBS) $(EVENT_PTHREADS_LIBS) $(MINISKETCH_LIBS)
+  $(LIBLEVELDB) $(LIBLEVELDB_SSE42) $(LIBMEMENV) $(LIBSECP256K1) $(ELEMENTS_SIMPLICITY_LINK_LIBS) $(EVENT_LIBS) $(EVENT_PTHREADS_LIBS) $(MINISKETCH_LIBS)
 test_test_bitcoin_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
+test_test_bitcoin_CFLAGS = $(AM_CFLAGS) $(PIE_FLAGS)
 
 test_test_bitcoin_LDADD += $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(SQLITE_LIBS)
 test_test_bitcoin_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)

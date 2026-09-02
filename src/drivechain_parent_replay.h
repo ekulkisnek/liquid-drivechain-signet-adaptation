@@ -51,7 +51,7 @@ enum class DrivechainReplayStoreReadStatus {
 class DrivechainParentReplayStore final
 {
 public:
-    static constexpr uint32_t SCHEMA_VERSION{3};
+    static constexpr uint32_t SCHEMA_VERSION{4};
 
     DrivechainParentReplayStore(fs::path path, size_t cache_bytes, bool wipe);
     ~DrivechainParentReplayStore();
@@ -63,9 +63,9 @@ public:
                                          DrivechainParentReplayTip& tip,
                                          std::string* error) const;
 
-    /** Atomically wipe and seed the store with authenticated parent genesis. */
+    /** Atomically wipe and seed the derived store with an authenticated tip. */
     bool Reset(const uint256& identity,
-               const DrivechainParentReplayTip& genesis,
+               const DrivechainParentReplayTip& seed,
                std::string* error);
 
     /** Atomically and synchronously append one authenticated active block. */
@@ -73,7 +73,30 @@ public:
                 const DrivechainParentReplayTip& next,
                 const std::vector<DrivechainMintableDeposit>& deposits,
                 const std::optional<std::pair<uint256, DrivechainReplayedBmmEdge>>& edge,
+                const std::vector<DrivechainSuccessfulWithdrawal>& successful_withdrawals,
+                const std::vector<DrivechainWithdrawalProposalIdentity>& withdrawal_proposals,
                 std::string* error);
+
+    bool Append(const DrivechainParentReplayTip& previous,
+                const DrivechainParentReplayTip& next,
+                const std::vector<DrivechainMintableDeposit>& deposits,
+                const std::optional<std::pair<uint256, DrivechainReplayedBmmEdge>>& edge,
+                const std::vector<DrivechainSuccessfulWithdrawal>& successful_withdrawals,
+                std::string* error)
+    {
+        return Append(previous, next, deposits, edge,
+                      successful_withdrawals, {}, error);
+    }
+
+    /** Compatibility overload for blocks containing no successful M6. */
+    bool Append(const DrivechainParentReplayTip& previous,
+                const DrivechainParentReplayTip& next,
+                const std::vector<DrivechainMintableDeposit>& deposits,
+                const std::optional<std::pair<uint256, DrivechainReplayedBmmEdge>>& edge,
+                std::string* error)
+    {
+        return Append(previous, next, deposits, edge, {}, {}, error);
+    }
 
     DrivechainReplayStoreReadStatus ReadDeposit(
         const Sidechain::Bitcoin::COutPoint& outpoint,
@@ -83,6 +106,12 @@ public:
     DrivechainReplayStoreReadStatus ReadBmmEdge(
         const uint256& parent_hash,
         DrivechainReplayedBmmEdge& edge,
+        std::string* error) const;
+
+    DrivechainReplayStoreReadStatus ReadSuccessfulWithdrawal(
+        uint8_t sidechain_slot,
+        const uint256& m6id,
+        DrivechainSuccessfulWithdrawal& withdrawal,
         std::string* error) const;
 
 private:

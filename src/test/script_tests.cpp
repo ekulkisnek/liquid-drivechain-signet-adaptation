@@ -21,6 +21,10 @@
 #include <util/strencodings.h>
 #include <util/system.h>
 
+extern "C" {
+#include <simplicity/elements/cmr.h>
+}
+
 #if defined(HAVE_CONSENSUS_LIB)
 #include <script/bitcoinconsensus.h>
 #endif
@@ -119,8 +123,14 @@ static ScriptErrorDesc script_errors[]={
     {SCRIPT_ERR_ECMULTVERIFYFAIL, "ECMULTVERIFYFAIL"},
     {SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH, "SIMPLICITY_WRONG_LENGTH"},
     {SCRIPT_ERR_USDD_SP1_ANNEX, "USDD_SP1_ANNEX"},
+    {SCRIPT_ERR_USDD_SP1_WRONG_CONTROLLER_CMR, "USDD_SP1_WRONG_CONTROLLER_CMR"},
+    {SCRIPT_ERR_USDD_SP1_WRONG_GUEST_PROGRAM_ID, "USDD_SP1_WRONG_GUEST_PROGRAM_ID"},
+    {SCRIPT_ERR_USDD_SP1_MALFORMED_PUBLIC_VALUES, "USDD_SP1_MALFORMED_PUBLIC_VALUES"},
+    {SCRIPT_ERR_USDD_SP1_DEPLOYMENT_UNCONFIGURED, "USDD_SP1_DEPLOYMENT_UNCONFIGURED"},
+    {SCRIPT_ERR_USDD_SP1_WRONG_INBOUND_MINT_DOMAIN, "USDD_SP1_WRONG_INBOUND_MINT_DOMAIN"},
     {SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING, "USDD_BMM_CONTEXT_MISSING"},
     {SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE, "USDD_SP1_VERIFIER_UNAVAILABLE"},
+    {SCRIPT_ERR_USDD_SP1_BUDGET, "USDD_SP1_BUDGET"},
     {SCRIPT_ERR_SIMPLICITY_NOT_YET_IMPLEMENTED, "SIMPLICITY_NOT_YET_IMPLEMENTED"},
     {SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_RANGE, "SIMPLICITY_DATA_OUT_OF_RANGE"},
     {SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_ORDER, "SIMPLICITY_DATA_OUT_OF_ORDER"},
@@ -177,8 +187,42 @@ void WriteUint32BE(std::vector<unsigned char>& bytes, std::size_t offset, uint32
     bytes[offset + 3] = value;
 }
 
-std::vector<unsigned char> MakeUsddSp1Annex(uint32_t public_values_size = 3, uint32_t proof_size = 4)
+std::vector<unsigned char> MakeUsddStrictJournal(
+    const std::array<unsigned char, 32>& inbound_domain)
 {
+    static constexpr uint32_t PAYLOAD_SIZE{790};
+    std::vector<unsigned char> journal(88 + PAYLOAD_SIZE, 0);
+    const std::array<unsigned char, 8> magic{{'U', 'S', 'D', 'D', 'J', 'N', 'L', '1'}};
+    const std::array<unsigned char, 8> success{{'S', 'U', 'C', 'C', 'E', 'S', 'S', '!'}};
+    std::copy(magic.begin(), magic.end(), journal.begin());
+    journal[9] = 2;
+    journal[10] = 1;
+    std::copy(success.begin(), success.end(), journal.begin() + 11);
+    journal[19] = 1;
+    std::copy(
+        ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.begin(),
+        ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.end(),
+        journal.begin() + 20);
+    WriteUint32BE(journal, 84, PAYLOAD_SIZE);
+    journal[89] = 2;
+    journal[90] = 0x52;
+    journal[91] = 0x04;
+    std::copy(inbound_domain.begin(), inbound_domain.end(), journal.begin() + 92);
+    CSHA256().Write(journal.data() + 88, PAYLOAD_SIZE).Finalize(journal.data() + 52);
+    return journal;
+}
+
+std::vector<unsigned char> MakeUsddSp1Annex(
+    uint32_t proof_size = 4,
+    const std::array<unsigned char, 32>& inbound_domain = [] {
+        std::array<unsigned char, 32> value{};
+        value.fill(0x42);
+        return value;
+    }())
+{
+    const std::vector<unsigned char> public_values =
+        MakeUsddStrictJournal(inbound_domain);
+    const uint32_t public_values_size = public_values.size();
     std::vector<unsigned char> annex(usdd::SP1_ANNEX_HEADER_SIZE + public_values_size + proof_size, 0);
     annex[0] = usdd::SP1_ANNEX_TAG;
     std::copy(usdd::SP1_ANNEX_MAGIC.begin(), usdd::SP1_ANNEX_MAGIC.end(), annex.begin() + 1);
@@ -188,10 +232,38 @@ std::vector<unsigned char> MakeUsddSp1Annex(uint32_t public_values_size = 3, uin
     annex[12] = 1;
     WriteUint32BE(annex, 15, public_values_size);
     WriteUint32BE(annex, 19, proof_size);
-    std::fill(annex.begin() + 23, annex.begin() + 55, 0x42);
-    std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
-              annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size, 0x17);
+    std::copy(
+        ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.begin(),
+        ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.end(),
+        annex.begin() + 23);
+    std::copy(public_values.begin(), public_values.end(),
+              annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE);
     std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size, annex.end(), 0x99);
+    return annex;
+}
+
+std::vector<unsigned char> MakeUsddStrongExecutionAnnex(
+    const unsigned char public_value = 0x42,
+    const uint32_t public_values_size = 32)
+{
+    const uint32_t proof_size = 4;
+    std::vector<unsigned char> annex(
+        usdd::SP1_ANNEX_HEADER_SIZE + public_values_size + proof_size, 0);
+    annex[0] = usdd::SP1_ANNEX_TAG;
+    std::copy(usdd::SP1_ANNEX_MAGIC.begin(), usdd::SP1_ANNEX_MAGIC.end(),
+              annex.begin() + 1);
+    annex[9] = 1;
+    annex[10] = 1;
+    annex[11] = static_cast<uint8_t>(
+        usdd::Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2);
+    annex[12] = 1;
+    WriteUint32BE(annex, 15, public_values_size);
+    WriteUint32BE(annex, 19, proof_size);
+    std::fill(annex.begin() + 23, annex.begin() + 55, 0x31);
+    std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
+              annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size,
+              public_value);
+    std::fill(annex.end() - proof_size, annex.end(), 0x53);
     return annex;
 }
 
@@ -205,10 +277,24 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(valid, view) == usdd::Sp1AnnexError::OK);
     BOOST_CHECK(view.statement_kind == usdd::Sp1StatementKind::ETH_STATE_V1);
     BOOST_CHECK_EQUAL(view.guest_program_id.size(), 32U);
-    BOOST_CHECK_EQUAL(view.public_values.size(), 3U);
+    BOOST_CHECK_EQUAL(view.public_values.size(), 878U);
     BOOST_CHECK_EQUAL(view.proof.size(), 4U);
-    BOOST_CHECK_EQUAL(view.public_values[0], 0x17);
+    BOOST_CHECK_EQUAL(view.public_values[0], 'U');
     BOOST_CHECK_EQUAL(view.proof[0], 0x99);
+
+    const auto strong = MakeUsddStrongExecutionAnnex();
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(strong, view) ==
+                usdd::Sp1AnnexError::OK);
+    BOOST_CHECK(view.statement_kind ==
+                usdd::Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2);
+    BOOST_CHECK_EQUAL(view.public_values.size(), 32U);
+    BOOST_CHECK_EQUAL(view.public_values[0], 0x42);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(
+                    MakeUsddStrongExecutionAnnex(0x42, 31), view) ==
+                usdd::Sp1AnnexError::INVALID_STRONG_EXECUTION_PUBLIC_VALUES);
+    BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(
+                    MakeUsddStrongExecutionAnnex(0x00), view) ==
+                usdd::Sp1AnnexError::INVALID_STRONG_EXECUTION_PUBLIC_VALUES);
 
     const std::vector<unsigned char> unrelated{0x50, 'O', 'T', 'H', 'R'};
     BOOST_CHECK(!usdd::IsUsddSp1ProofAnnex(unrelated));
@@ -259,23 +345,202 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
     changed.push_back(0);
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::LENGTH_MISMATCH);
 
-    const uint32_t max_proof_size = usdd::SP1_ANNEX_MAX_SIZE - usdd::SP1_ANNEX_HEADER_SIZE - 1;
-    const auto max_size = MakeUsddSp1Annex(1, max_proof_size);
+    const uint32_t max_proof_size = usdd::SP1_ANNEX_MAX_SIZE -
+        usdd::SP1_ANNEX_HEADER_SIZE - MakeUsddStrictJournal({}).size();
+    const auto max_size = MakeUsddSp1Annex(max_proof_size);
     BOOST_CHECK_EQUAL(max_size.size(), usdd::SP1_ANNEX_MAX_SIZE);
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(max_size, view) == usdd::Sp1AnnexError::OK);
     changed = max_size;
     changed.push_back(0);
     BOOST_CHECK(usdd::ParseUsddSp1ProofAnnex(changed, view) == usdd::Sp1AnnexError::TOO_LARGE);
 
-    // Consensus cannot accept even a canonical envelope: the pinned raw SP1
-    // verifier does not exist yet.  This assertion should change only alongside
-    // upstream Simplicity jet, CMR, dispatch, and deterministic-cost changes.
-    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(unrelated, false) == usdd::Sp1ConsensusGateResult::NOT_USDD);
+    const std::vector<unsigned char> controller_cmr(
+        ElementsDrivechainIdentity::HISTORICAL_V8_CONTROLLER_CMR.begin(),
+        ElementsDrivechainIdentity::HISTORICAL_V8_CONTROLLER_CMR.end());
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    unrelated, controller_cmr, false) ==
+                usdd::Sp1ConsensusGateResult::NOT_USDD);
     changed = valid;
     changed[9] = 2;
-    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(changed, true) == usdd::Sp1ConsensusGateResult::MALFORMED);
-    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(valid, false) == usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING);
-    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(valid, true) == usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    changed, controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::MALFORMED);
+    auto wrong_controller_cmr = controller_cmr;
+    wrong_controller_cmr[0] ^= 1;
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    strong, wrong_controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::READY_FOR_JET);
+    changed = strong;
+    changed[23] ^= 1;
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    changed, controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::READY_FOR_JET);
+    changed = strong;
+    std::fill(changed.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
+              changed.begin() + usdd::SP1_ANNEX_HEADER_SIZE + 32, 0);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    changed, controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::MALFORMED);
+    BOOST_CHECK_EQUAL(
+        ElementsDrivechainIdentity::USDD_SP1_DEPLOYMENT_BINDING_VERSION, 2U);
+    BOOST_CHECK(ElementsDrivechainIdentity::USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    strong, controller_cmr, false) ==
+                usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    strong, controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::READY_FOR_JET);
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    valid, controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED);
+
+    // V11 has a separate, explicitly parameterized host gate. Merely parsing
+    // statement kind 3 cannot activate it on the historical V7 network.
+    std::array<unsigned char, 32> v11_controller_cmr{};
+    v11_controller_cmr.fill(0x21);
+    std::array<unsigned char, 32> v11_guest_program_id{};
+    v11_guest_program_id.fill(0x31);
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, v11_controller_cmr, false, v11_controller_cmr,
+                    v11_guest_program_id, true) ==
+                usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING);
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, v11_controller_cmr, true, v11_controller_cmr,
+                    v11_guest_program_id, false) ==
+                usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE);
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, v11_controller_cmr, true, v11_controller_cmr,
+                    v11_guest_program_id, true) ==
+                usdd::Sp1ConsensusGateResult::READY_FOR_JET);
+    std::array<unsigned char, 32> zero_v11_identity{};
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, v11_controller_cmr, true, zero_v11_identity,
+                    v11_guest_program_id, true) ==
+                usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED);
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, v11_controller_cmr, true, v11_controller_cmr,
+                    zero_v11_identity, true) ==
+                usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED);
+    auto wrong_v11_controller = v11_controller_cmr;
+    wrong_v11_controller[0] ^= 1;
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, wrong_v11_controller, true, v11_controller_cmr,
+                    v11_guest_program_id, true) ==
+                usdd::Sp1ConsensusGateResult::WRONG_CONTROLLER_CMR);
+    auto wrong_v11_guest = v11_guest_program_id;
+    wrong_v11_guest[0] ^= 1;
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    strong, v11_controller_cmr, true, v11_controller_cmr,
+                    wrong_v11_guest, true) ==
+                usdd::Sp1ConsensusGateResult::WRONG_GUEST_PROGRAM_ID);
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    valid, v11_controller_cmr, true, v11_controller_cmr,
+                    v11_guest_program_id, true) ==
+                usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED);
+    BOOST_CHECK(usdd::GateUsddSp1StrongExecutionAnnexForDeployment(
+                    MakeUsddStrongExecutionAnnex(0x00), v11_controller_cmr,
+                    true, v11_controller_cmr, v11_guest_program_id, true) ==
+                usdd::Sp1ConsensusGateResult::MALFORMED);
+
+    // The active V11 profile rejects the incompatible historical statement.
+    // Its deployment helper remains testable only in a historical build whose
+    // identity selects ETH_STATE_V1.
+    BOOST_CHECK(usdd::GateUsddSp1ProofAnnex(
+                    valid, controller_cmr, true) ==
+                usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED);
+
+    int64_t credited_budget{-1};
+    BOOST_CHECK_EQUAL(
+        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU,
+        ElementsDrivechainIdentity::USDD_SP1_PROOF_TX_MAX_WEIGHT);
+    BOOST_CHECK_EQUAL(
+        usdd::SP1_CONTROLLER_PROGRAM_COST_MWU,
+        3'532'580'406ULL);
+    BOOST_CHECK_EQUAL(
+        usdd::SP1_CONTROLLER_PROGRAM_BUDGET_WU,
+        3'532'581);
+    BOOST_CHECK(
+        usdd::SP1_CONTROLLER_PROGRAM_BUDGET_WU <= BUDGET_MAX);
+    BOOST_CHECK(usdd::ComputeUsddSp1VerifierBudget(0, credited_budget));
+    BOOST_CHECK_EQUAL(credited_budget, 0);
+    BOOST_CHECK(usdd::ComputeUsddSp1VerifierBudget(
+        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU, credited_budget));
+    BOOST_CHECK_EQUAL(
+        credited_budget,
+        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU);
+    BOOST_CHECK(!usdd::ComputeUsddSp1VerifierBudget(
+        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU + 1, credited_budget));
+    BOOST_CHECK(!usdd::ComputeUsddSp1VerifierBudget(-1, credited_budget));
+
+    // V11 grants no annex- or mutable-manifest-triggered credit. The measured
+    // stack retains its ordinary witness-derived budget; the configuration-
+    // bound leaf and verifier jet must fit that budget and BUDGET_MAX through
+    // normal Simplicity execution.
+    std::vector<std::vector<unsigned char>> measured_controller_stack;
+    measured_controller_stack.emplace_back(874U, 0x01);
+    measured_controller_stack.emplace_back(6'155U, 0x01);
+    measured_controller_stack.emplace_back(32U, 0x01);
+    measured_controller_stack.emplace_back(65U, 0x01);
+    measured_controller_stack.emplace_back(
+        ElementsDrivechainIdentity::USDD_SP1_MEASURED_ANNEX_BYTES, 0x01);
+    const int64_t measured_base_budget =
+        ::GetSerializeSize(measured_controller_stack, PROTOCOL_VERSION) +
+        VALIDATION_WEIGHT_OFFSET;
+    BOOST_CHECK_EQUAL(measured_base_budget, 1'280'792);
+    BOOST_CHECK(
+        measured_base_budget >
+        static_cast<int64_t>(
+            (usdd::SP1_VERIFIER_JET_COST_MWU + 999U) / 1000U));
+    BOOST_CHECK(usdd::ComputeUsddSp1VerifierBudget(
+        measured_base_budget, credited_budget));
+    BOOST_CHECK_EQUAL(credited_budget, measured_base_budget);
+    BOOST_CHECK(credited_budget <= BUDGET_MAX);
+    BOOST_CHECK(
+        static_cast<uint64_t>(credited_budget) * 1000U <
+        usdd::SP1_CONTROLLER_PROGRAM_COST_MWU);
+
+    std::array<unsigned char, 32> wrong_program_id{};
+    wrong_program_id.fill(0xa5);
+    std::array<unsigned char, 32> wrong_journal_hash{};
+    wrong_journal_hash.fill(0xb6);
+    BOOST_CHECK(!std::equal(
+        wrong_program_id.begin(), wrong_program_id.end(), valid.begin() + 23));
+#if defined(HAVE_USDD_SP1_VERIFIER)
+    BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(
+                    valid, wrong_program_id, wrong_journal_hash) ==
+                usdd::Sp1VerifierResult::REJECTED);
+#else
+    BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(
+                    valid, wrong_program_id, wrong_journal_hash) ==
+                usdd::Sp1VerifierResult::UNAVAILABLE);
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(usdd_inventory_htlc_simplicityhl_vector)
+{
+    // SimplicityHL f62adf11e16816dd8f33f16edb5ff9f4c4b45e36 (v0.6.0)
+    // compiled the canonical inventory-HTLC parameters documented in
+    // doc/usdd-inventory-htlc-simplicityhl-vector.md.  Decode the exact output
+    // with this node's generated jet catalogue and independently recompute its
+    // CMR.  This prevents a compiler-only CMR from being mistaken for a program
+    // identity that the consensus implementation actually understands.
+    static constexpr const char* PROGRAM_BASE64 =
+        "5YOgUIMQKEGGIOMFgTqyBAmpBh9oo1XIEIFBtGrEEAwA2gcHCcNTaRERERERERERERERERERERERERERERERERERERERERERBCBQbh5xuIRRm3QCMAhNpeb5mfvncu6xVoGKVzocLBwKb/NstzijZWfKBWxb4F5gEIFBuLD8UnHCwJ4CBOOD8aCcHE1bGAgTiA/IEEA0gbiRQBkDg4XDQGkHE4HFoHIEkUAbwcjBuRKbJ3NZQABAnI1BnkBCbTjAj/KIPa+tpgioDdK4D5sLjvHJcZ3nlPV1gTcrjhPcoIQKDcmj8mDhUBxCkUAcTA0hbwHFIOCgcKB4YBytAA==";
+    static constexpr const char* EXPECTED_CMR =
+        "f751a0301f110405940cb18ccc5cdd7b79c236573648aeb2a37dd86ee9a322ec";
+
+    bool invalid{false};
+    const std::vector<unsigned char> decoded = DecodeBase64(PROGRAM_BASE64, &invalid);
+    BOOST_REQUIRE(!invalid);
+    BOOST_REQUIRE_EQUAL(decoded.size(), 253U);
+
+    std::array<unsigned char, 32> cmr{};
+    simplicity_err error{SIMPLICITY_NO_ERROR};
+    BOOST_REQUIRE(simplicity_elements_computeCmr(
+        &error, cmr.data(),
+        decoded.data(), decoded.size()));
+    BOOST_REQUIRE_EQUAL(error, SIMPLICITY_NO_ERROR);
+    BOOST_CHECK_EQUAL(HexStr(cmr), EXPECTED_CMR);
 }
 
 void DoTest(const CScript& scriptPubKey, const CScript& scriptSig, const CScriptWitness& scriptWitness, uint32_t flags, const std::string& message, int scriptError, CAmount nValue = 0)

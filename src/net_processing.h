@@ -23,6 +23,14 @@ static const bool DEFAULT_PEERBLOCKFILTERS = false;
 /** Threshold for marking a node to be discouraged, e.g. disconnected and added to the discouragement filter. */
 static const int DISCOURAGEMENT_THRESHOLD{100};
 
+/** Pure per-edge strike accounting for deterministic BIP301 rejections. */
+unsigned int NextDrivechainParentRejectedStrikeCount(
+    const uint256& previous_parent,
+    const uint256& previous_successor,
+    unsigned int previous_count,
+    const uint256& rejected_parent,
+    const uint256& rejected_successor);
+
 struct CNodeStateStats {
     int nSyncHeight = -1;
     int nCommonHeight = -1;

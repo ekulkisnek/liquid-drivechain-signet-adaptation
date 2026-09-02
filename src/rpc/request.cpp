@@ -5,6 +5,7 @@
 
 #include <rpc/request.h>
 
+#include <chainparamsbase.h>
 #include <fs.h>
 
 #include <random.h>
@@ -12,6 +13,7 @@
 #include <util/system.h>
 #include <util/strencodings.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -142,26 +144,28 @@ bool GetAuthCookie(std::string *cookie_out)
 //
 // ELEMENTS:
 
-/** Default name for mainchain auth cookie file */
-static const std::string MAINCHAIN_COOKIEAUTH_FILE = "regtest/.cookie";
+std::string GetDefaultMainchainAuthCookieFile(const std::string& chain)
+{
+    // The sole production Elements chain is anchored to Bitcoin Signet.
+    if (chain == CBaseChainParams::ELEMENTS) return "signet/.cookie";
+
+    // These paths exist only for inherited unit/functional-test contexts.
+    if (chain == CBaseChainParams::LIQUID1) return ".cookie";
+    return "regtest/.cookie";
+}
+
 /** Get name mainchain RPC authentication cookie file */
 fs::path GetMainchainAuthCookieFile()
 {
-    std::string cookie_file = MAINCHAIN_COOKIEAUTH_FILE;
-    if (gArgs.GetChainName() == "liquid-signet") {
-        cookie_file = "signet/.cookie";
-    }
-    // Bitcoin mainnet exception
-    if (gArgs.GetChainName() == "liquidv1") {
-        cookie_file = ".cookie";
-    }
+    const std::string cookie_file =
+        GetDefaultMainchainAuthCookieFile(gArgs.GetChainName());
     fs::path cookie_path = fs::PathFromString(gArgs.GetArg("-mainchainrpccookiefile", cookie_file));
     if (cookie_path.is_absolute())
         return cookie_path;
     return fsbridge::AbsPathJoin(GetMainchainDefaultDataDir(), cookie_path);
 }
 
-bool ReadMainchainAuthCookieFile(
+bool ReadPrivateRpcAuthFile(
     const fs::path& path,
     std::string& cookie,
     std::string* error)
@@ -169,10 +173,14 @@ bool ReadMainchainAuthCookieFile(
     cookie.clear();
     if (error) error->clear();
     const std::string native_path = fs::PathToString(path);
+    if (!path.is_absolute()) {
+        if (error) *error = "RPC authentication file path must be absolute";
+        return false;
+    }
 
 #ifndef WIN32
     const int descriptor = open(
-        native_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        native_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (descriptor < 0) {
         if (error) {
             *error = strprintf(
@@ -205,7 +213,7 @@ bool ReadMainchainAuthCookieFile(
         return false;
     }
 
-    static constexpr size_t MAX_COOKIE_FILE_SIZE{256};
+    static constexpr size_t MAX_COOKIE_FILE_SIZE{4096};
     std::array<char, MAX_COOKIE_FILE_SIZE + 1> contents{};
     size_t used{0};
     while (used < contents.size()) {
@@ -232,7 +240,7 @@ bool ReadMainchainAuthCookieFile(
     }
     cookie.assign(contents.data(), used);
 #else
-    if (!fs::exists(path) || !fs::is_regular_file(path)) {
+    if (fs::is_symlink(path) || !fs::exists(path) || !fs::is_regular_file(path)) {
         if (error) *error = "mainchain RPC cookie is not a regular file: " + native_path;
         return false;
     }
@@ -241,9 +249,10 @@ bool ReadMainchainAuthCookieFile(
         if (error) *error = "cannot read mainchain RPC cookie: " + native_path;
         return false;
     }
-    cookie.assign(
-        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-    if (cookie.size() > 256) {
+    std::array<char, 4097> contents{};
+    input.read(contents.data(), contents.size());
+    cookie.assign(contents.data(), input.gcount());
+    if (input.bad() || cookie.size() > 4096) {
         cookie.clear();
         if (error) *error = "mainchain RPC cookie file is unexpectedly large";
         return false;
@@ -252,6 +261,13 @@ bool ReadMainchainAuthCookieFile(
 
     if (!cookie.empty() && cookie.back() == '\n') cookie.pop_back();
     if (!cookie.empty() && cookie.back() == '\r') cookie.pop_back();
+    return true;
+}
+
+bool ReadMainchainAuthCookieFile(
+    const fs::path& path, std::string& cookie, std::string* error)
+{
+    if (!ReadPrivateRpcAuthFile(path, cookie, error)) return false;
     static constexpr const char* COOKIE_PREFIX{"__cookie__:"};
     static constexpr size_t COOKIE_PREFIX_SIZE{11};
     if (cookie.rfind(COOKIE_PREFIX, 0) != 0 ||
@@ -264,6 +280,38 @@ bool ReadMainchainAuthCookieFile(
         return false;
     }
     return true;
+}
+
+bool ReadNativeDrivechainCookieFile(
+    const fs::path& path, std::string& cookie, std::string* error)
+{
+    return ReadMainchainAuthCookieFile(path, cookie, error);
+}
+
+bool ReadMainchainRpcCredentialFile(
+    const fs::path& path, std::string& credentials, std::string* error)
+{
+    credentials.clear();
+#ifdef WIN32
+    // This opt-in path promises POSIX ownership/mode enforcement. Do not
+    // silently downgrade it to the Windows cookie compatibility path.
+    if (error) *error = "private static parent credential files require POSIX file permissions";
+    return false;
+#else
+    if (!ReadPrivateRpcAuthFile(path, credentials, error)) return false;
+    const auto separator = credentials.find(':');
+    if (credentials.size() > 1024 || separator == std::string::npos ||
+        separator == 0 || separator + 1 == credentials.size() ||
+        credentials.find(':', separator + 1) != std::string::npos ||
+        credentials.compare(0, separator, "__cookie__") == 0 ||
+        !std::all_of(credentials.begin(), credentials.end(),
+                     [](unsigned char c) { return c >= 33 && c <= 126; })) {
+        credentials.clear();
+        if (error) *error = "parent credential file must contain one bounded username:password record";
+        return false;
+    }
+    return true;
+#endif
 }
 
 bool GetMainchainAuthCookie(std::string *cookie_out)

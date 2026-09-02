@@ -22,6 +22,7 @@ extern "C" {
 #include <simplicity/elements/env.h>
 }
 #include <streams.h>
+#include <test/ecx_simplicity_test_shim.h>
 #include <test/util/setup_common.h>
 #include <test/data/ecx_v17_configuration.hex.h>
 #include <test/data/ecx_v18_configuration.hex.h>
@@ -1198,6 +1199,54 @@ BOOST_AUTO_TEST_CASE(sp1_incremental_successor_annex_is_exact_disjoint_and_fail_
     BOOST_CHECK(!simplicity_elements_verify_sp1_groth16_v6_incremental_successor_annex_sha256(
         annex.data(), annex.size(), expected_program.data(), digest.begin(),
         TestIncrementalSuccessorSp1Verifier, &recorder));
+    BOOST_CHECK_EQUAL(recorder.calls, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(sp1_incremental_successor_jet_frame_routes_to_exact_verifier)
+{
+    // This tests the real frame adapter and annex parser. The recorder is a
+    // test callback, not a substitute for the separately qualified SP1 backend.
+    const std::array<unsigned char, 32> expected_program{{
+        0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4,
+        0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 7, 0, 0, 0, 8}};
+    const std::vector<unsigned char> annex{TestIncrementalSuccessorAnnexPayload()};
+    const uint256 digest{TestSha256(IncrementalSuccessorPublicValuesVector())};
+    AnnexVerifierRecorder recorder;
+    const auto evaluate = [&](const std::vector<unsigned char>& candidate,
+                              const std::array<unsigned char, 32>& program,
+                              const uint256& public_values_digest,
+                              bool backend_present = true) {
+        bool valid{false};
+        BOOST_REQUIRE(ecx_test_successor_jet_frame(
+            candidate.data(), candidate.size(), program.data(), public_values_digest.begin(),
+            backend_present ? TestIncrementalSuccessorSp1Verifier : nullptr, &recorder, &valid));
+        return valid;
+    };
+    BOOST_CHECK(evaluate(annex, expected_program, digest));
+    BOOST_CHECK_EQUAL(recorder.calls, 1U);
+    auto wrong_program{expected_program};
+    wrong_program[0] ^= 1;
+    BOOST_CHECK(!evaluate(annex, wrong_program, digest));
+    uint256 wrong_digest{digest};
+    wrong_digest.begin()[0] ^= 1;
+    BOOST_CHECK(!evaluate(annex, expected_program, wrong_digest));
+    BOOST_CHECK(!evaluate(annex, expected_program, digest, false));
+    BOOST_CHECK(!evaluate({}, expected_program, digest));
+    BOOST_CHECK(!evaluate(TestIncrementalActivationAnnexPayload(), expected_program, digest));
+    auto truncated{annex};
+    truncated.pop_back();
+    BOOST_CHECK(!evaluate(truncated, expected_program, digest));
+    auto trailing{annex};
+    trailing.push_back(0);
+    BOOST_CHECK(!evaluate(trailing, expected_program, digest));
+    auto bad_bool{annex};
+    bad_bool.back() = 2;
+    const uint256 recommitted{TestSha256(std::vector<unsigned char>{bad_bool.begin() + 435, bad_bool.end()})};
+    std::copy(recommitted.begin(), recommitted.end(), bad_bool.begin() + 43);
+    BOOST_CHECK(!evaluate(bad_bool, expected_program, recommitted));
+    BOOST_CHECK_EQUAL(recorder.calls, 1U); // Parser/identity failures never reach the backend.
+    recorder.reject = true;
+    BOOST_CHECK(!evaluate(annex, expected_program, digest));
     BOOST_CHECK_EQUAL(recorder.calls, 2U);
 }
 

@@ -7,6 +7,8 @@
 #include <test/util/setup_common.h>
 
 #include <checkqueue.h>
+#include <chainparams.h>
+#include <chainparamsbase.h>
 #include <clientversion.h>
 #include <consensus/amount.h>
 #include <consensus/tx_check.h>
@@ -20,9 +22,11 @@
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <script/standard.h>
+#include <script/usdd_sp1_annex.h>
 #include <streams.h>
 #include <test/util/script.h>
 #include <test/util/transaction_utils.h>
+#include <usdd_sp1_resources.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <validation.h>
@@ -65,6 +69,7 @@ static std::map<std::string, unsigned int> mapFlagNames = {
     {std::string("DISCOURAGE_OP_SUCCESS"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS},
     {std::string("DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION},
     {std::string("SIMPLICITY"), (unsigned int)SCRIPT_VERIFY_SIMPLICITY},
+    {std::string("USDD_SP1_ANNEX"), (unsigned int)SCRIPT_VERIFY_USDD_SP1_ANNEX},
     {std::string("CHECKTEMPLATEVERIFY"), (unsigned int)SCRIPT_VERIFY_CHECKTEMPLATEVERIFY},
     {std::string("DISCOURAGE_CHECKTEMPLATEVERIFY"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_CHECKTEMPLATEVERIFY},
     {std::string("DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH},
@@ -980,6 +985,242 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
         t.vout[0].nValue = 239;
         CheckIsNotStandard(t, "dust");
     }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_sp1_annex_standardness_and_weight_policy)
+{
+    LOCK(cs_main);
+    const std::string original_network{Params().NetworkIDString()};
+    struct ParamsRestorer {
+        const std::string network;
+        ~ParamsRestorer() { SelectParams(network); }
+    } restore_params{original_network};
+    SelectParams(CBaseChainParams::ELEMENTS);
+    BOOST_REQUIRE(Params().GetConsensus().enable_usdd_sp1_annex);
+
+    const auto write_u32_be = [](std::vector<unsigned char>& bytes,
+                                 const std::size_t offset,
+                                 const uint32_t value) {
+        bytes[offset] = value >> 24;
+        bytes[offset + 1] = value >> 16;
+        bytes[offset + 2] = value >> 8;
+        bytes[offset + 3] = value;
+    };
+    const auto make_annex = [&](const uint32_t proof_size,
+                                const uint32_t public_values_size = 32) {
+        std::vector<unsigned char> annex(
+            usdd::SP1_ANNEX_HEADER_SIZE + public_values_size + proof_size, 0);
+        annex[0] = usdd::SP1_ANNEX_TAG;
+        std::copy(usdd::SP1_ANNEX_MAGIC.begin(), usdd::SP1_ANNEX_MAGIC.end(),
+                  annex.begin() + 1);
+        annex[9] = 1;
+        annex[10] = 1;
+        annex[11] = static_cast<uint8_t>(
+            usdd::Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2);
+        annex[12] = 1;
+        write_u32_be(annex, 15, public_values_size);
+        write_u32_be(annex, 19, proof_size);
+        std::copy(
+            ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.begin(),
+            ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.end(),
+            annex.begin() + 23);
+        std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
+                  annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE +
+                      public_values_size,
+                  0x42);
+        std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size,
+                  annex.end(), 0x99);
+        return annex;
+    };
+    const uint32_t max_proof_size =
+        usdd::SP1_ANNEX_MAX_SIZE - usdd::SP1_ANNEX_HEADER_SIZE - 32;
+    const std::vector<unsigned char> max_annex = make_annex(max_proof_size);
+    BOOST_REQUIRE_EQUAL(max_annex.size(), usdd::SP1_ANNEX_MAX_SIZE);
+    const auto make_tapsimplicity_stack = [](
+        const std::vector<unsigned char>& annex) {
+        std::vector<std::vector<unsigned char>> stack;
+        stack.emplace_back(1, 0x01); // Simplicity witness
+        stack.emplace_back(1, 0x01); // Simplicity program
+        stack.emplace_back(32, 0x21); // executed leaf CMR; not host-authorized
+        stack.emplace_back(usdd::SP1_TAPROOT_CONTROL_BASE_SIZE, 0x33);
+        stack.back()[0] = usdd::SP1_TAPSIMPLICITY_LEAF_VERSION;
+        stack.push_back(annex);
+        return stack;
+    };
+
+    const COutPoint first_outpoint{uint256S("01"), 0};
+    CMutableTransaction minimal;
+    minimal.vin.emplace_back(first_outpoint);
+    minimal.vout.emplace_back(CAsset(), 0, CScript() << OP_RETURN);
+    minimal.witness.vtxinwit.resize(1);
+    minimal.witness.vtxinwit[0].scriptWitness.stack =
+        make_tapsimplicity_stack(max_annex);
+
+    CMutableTransaction without_annex{minimal};
+    without_annex.witness.vtxinwit[0].scriptWitness.stack.pop_back();
+    const uint64_t exact_annex_weight =
+        GetTransactionWeight(CTransaction(minimal)) -
+        GetTransactionWeight(CTransaction(without_annex));
+    BOOST_CHECK_EQUAL(
+        exact_annex_weight,
+        GetSizeOfCompactSize(max_annex.size()) + max_annex.size() +
+            GetSizeOfCompactSize(usdd::SP1_TAPSIMPLICITY_WITNESS_ITEMS) -
+            GetSizeOfCompactSize(usdd::SP1_TAPSIMPLICITY_WITNESS_ITEMS - 1));
+    BOOST_CHECK_EQUAL(
+        exact_annex_weight,
+        ElementsDrivechainIdentity::USDD_SP1_MAX_ANNEX_WEIGHT);
+    BOOST_CHECK_EQUAL(
+        ElementsDrivechainIdentity::USDD_SP1_PROOF_TX_MAX_WEIGHT * 4U,
+        ElementsDrivechainIdentity::CONSENSUS_MAX_BLOCK_WEIGHT);
+    BOOST_CHECK_EQUAL(
+        ElementsDrivechainIdentity::USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT,
+        189'275U);
+    BOOST_CHECK_EQUAL(
+        ElementsDrivechainIdentity::USDD_SP1_PROOF_TX_MAX_WEIGHT -
+            ElementsDrivechainIdentity::USDD_SP1_MEASURED_ANNEX_WEIGHT,
+        226'393U);
+    BOOST_CHECK(GetTransactionWeight(CTransaction(minimal)) > MAX_STANDARD_TX_WEIGHT);
+    BOOST_CHECK(GetTransactionWeight(CTransaction(minimal)) <=
+                static_cast<int64_t>(usdd::SP1_PROOF_TX_MAX_WEIGHT));
+    std::string reason;
+    BOOST_CHECK(IsStandardTx(CTransaction(minimal), reason));
+    BOOST_CHECK(reason.empty());
+
+    // V11 grants no annex-triggered or controller-triggered execution-budget
+    // credit. Structural policy admission does not authorize the spend; the
+    // configuration-bound leaf and verifier jet must succeed under the
+    // ordinary witness-derived budget and BUDGET_MAX.
+    CCoinsView coins_dummy;
+    CCoinsViewCache coins(&coins_dummy);
+    const CScript taproot_script = CScript() << OP_1 << std::vector<unsigned char>(32, 0x22);
+    coins.AddCoin(first_outpoint,
+                  Coin(CTxOut(Params().GetConsensus().pegged_asset, 1, taproot_script),
+                       1, false),
+                  /*possible_overwrite=*/false);
+    BOOST_CHECK(IsWitnessStandard(CTransaction(minimal), coins));
+
+    // A key-path spend cannot occupy the sole proof-verification lane, even
+    // when its annex is otherwise canonical.
+    CMutableTransaction key_path{minimal};
+    key_path.witness.vtxinwit[0].scriptWitness.stack = {
+        std::vector<unsigned char>(64, 0x11), make_annex(1)};
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(key_path), reason));
+    BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex-shape");
+    BOOST_CHECK(!IsWitnessStandard(CTransaction(key_path), coins));
+
+    CMutableTransaction malformed{minimal};
+    malformed.witness.vtxinwit[0].scriptWitness.stack.back()[9] = 2;
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(malformed), reason));
+    BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex");
+    BOOST_CHECK(!IsWitnessStandard(CTransaction(malformed), coins));
+
+    CMutableTransaction oversized_public_values{minimal};
+    oversized_public_values.witness.vtxinwit[0].scriptWitness.stack.back() =
+        make_annex(1, usdd::SP1_PUBLIC_VALUES_MAX_SIZE + 1);
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(oversized_public_values), reason));
+    BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex-public-values");
+    BOOST_CHECK(!IsWitnessStandard(CTransaction(oversized_public_values), coins));
+
+    CMutableTransaction legacy_v8_statement{minimal};
+    legacy_v8_statement.witness.vtxinwit[0].scriptWitness.stack.back()[11] =
+        static_cast<uint8_t>(usdd::Sp1StatementKind::ETH_STATE_V1);
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(legacy_v8_statement), reason));
+    BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex");
+    BOOST_CHECK(!IsWitnessStandard(CTransaction(legacy_v8_statement), coins));
+
+    CMutableTransaction wrong_controller{minimal};
+    wrong_controller.witness.vtxinwit[0].scriptWitness.stack[2][0] ^= 1;
+    reason.clear();
+    BOOST_CHECK(IsStandardTx(CTransaction(wrong_controller), reason));
+    BOOST_CHECK(reason.empty());
+    BOOST_CHECK(IsWitnessStandard(CTransaction(wrong_controller), coins));
+
+    CMutableTransaction wrong_guest{minimal};
+    wrong_guest.witness.vtxinwit[0].scriptWitness.stack.back()[23] ^= 1;
+    reason.clear();
+    BOOST_CHECK(IsStandardTx(CTransaction(wrong_guest), reason));
+    BOOST_CHECK(reason.empty());
+    BOOST_CHECK(IsWitnessStandard(CTransaction(wrong_guest), coins));
+
+    CMutableTransaction unrelated{minimal};
+    unrelated.witness.vtxinwit[0].scriptWitness.stack.back() =
+        std::vector<unsigned char>{usdd::SP1_ANNEX_TAG, 'O', 'T', 'H', 'R'};
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(unrelated), reason));
+    BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex");
+    BOOST_CHECK(!IsWitnessStandard(CTransaction(unrelated), coins));
+
+    CMutableTransaction multiple{minimal};
+    const COutPoint second_outpoint{uint256S("02"), 0};
+    multiple.vin.emplace_back(second_outpoint);
+    multiple.witness.vtxinwit.resize(2);
+    multiple.witness.vtxinwit[1].scriptWitness.stack =
+        make_tapsimplicity_stack(make_annex(1));
+    coins.AddCoin(second_outpoint,
+                  Coin(CTxOut(Params().GetConsensus().pegged_asset, 1, taproot_script),
+                       1, false),
+                  /*possible_overwrite=*/false);
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(multiple), reason));
+    BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex-multiple");
+    BOOST_CHECK(!IsWitnessStandard(CTransaction(multiple), coins));
+
+    // Approach the ordinary cap using only non-annex bytes. V7 credits only
+    // the exact annex bytes; it still rejects a transaction whose credited
+    // total exceeds the dedicated proof lane or whose remaining bytes exceed
+    // the ordinary transaction cap.
+    CMutableTransaction non_annex_boundary{without_annex};
+    uint32_t next_index{1};
+    while (GetTransactionWeight(CTransaction(non_annex_boundary)) <=
+           MAX_STANDARD_TX_WEIGHT) {
+        for (unsigned int batch = 0; batch < 128; ++batch) {
+            non_annex_boundary.vin.emplace_back(uint256S("03"), next_index++);
+            non_annex_boundary.witness.vtxinwit.emplace_back();
+        }
+    }
+    while (GetTransactionWeight(CTransaction(non_annex_boundary)) >
+           MAX_STANDARD_TX_WEIGHT) {
+        non_annex_boundary.vin.pop_back();
+        non_annex_boundary.witness.vtxinwit.pop_back();
+    }
+    BOOST_REQUIRE(GetTransactionWeight(CTransaction(non_annex_boundary)) <=
+                  MAX_STANDARD_TX_WEIGHT);
+    CMutableTransaction proof_boundary{non_annex_boundary};
+    proof_boundary.witness.vtxinwit[0].scriptWitness.stack.push_back(max_annex);
+    BOOST_REQUIRE(GetTransactionWeight(CTransaction(proof_boundary)) >
+                  static_cast<int64_t>(usdd::SP1_PROOF_TX_MAX_WEIGHT));
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(proof_boundary), reason));
+    BOOST_CHECK_EQUAL(reason, "tx-size");
+
+    proof_boundary.vin.emplace_back(uint256S("03"), next_index);
+    proof_boundary.witness.vtxinwit.emplace_back();
+    CMutableTransaction stripped_over_limit{proof_boundary};
+    stripped_over_limit.witness.vtxinwit[0].scriptWitness.stack.pop_back();
+    BOOST_REQUIRE(GetTransactionWeight(CTransaction(stripped_over_limit)) >
+                  MAX_STANDARD_TX_WEIGHT);
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(proof_boundary), reason));
+    BOOST_CHECK_EQUAL(reason, "tx-size");
+
+    // A similarly large ordinary witness item receives no annex exemption.
+    CMutableTransaction ordinary_over_limit{minimal};
+    ordinary_over_limit.witness.vtxinwit[0].scriptWitness.stack.back()[0] = 0x51;
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(ordinary_over_limit), reason));
+    BOOST_CHECK_EQUAL(reason, "tx-size");
+
+    SelectParams(original_network);
+    reason.clear();
+    BOOST_CHECK(!IsStandardTx(CTransaction(minimal), reason));
+    // Other networks do not acquire the native Alpha annex exemption. The
+    // large proof consequently fails their ordinary transaction-weight cap;
+    // it must not be parsed as a native proof on an ECX/Bitcoin-mode chain.
+    BOOST_CHECK_EQUAL(reason, "tx-size");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

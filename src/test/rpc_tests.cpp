@@ -375,6 +375,101 @@ BOOST_AUTO_TEST_CASE(rpc_convert_values_generatetoaddress)
     BOOST_CHECK_EQUAL(result[2].get_int(), 9);
 }
 
+BOOST_AUTO_TEST_CASE(rpc_convert_values_importdrivechaindeposit)
+{
+    static constexpr const char* TXID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    static constexpr const char* BLOCK_HASH = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    static constexpr const char* ADDRESS = "elements1qexample";
+
+    UniValue positional;
+    BOOST_CHECK_NO_THROW(positional = RPCConvertValues(
+        "importdrivechaindeposit", {TXID, "7", BLOCK_HASH, ADDRESS, "100000", "42"}));
+    BOOST_CHECK_EQUAL(positional[0].get_str(), TXID);
+    BOOST_CHECK_EQUAL(positional[1].get_int64(), 7);
+    BOOST_CHECK_EQUAL(positional[2].get_str(), BLOCK_HASH);
+    BOOST_CHECK_EQUAL(positional[3].get_str(), ADDRESS);
+    BOOST_CHECK_EQUAL(positional[4].get_int64(), 100000);
+    BOOST_CHECK_EQUAL(positional[5].get_int64(), 42);
+
+    UniValue named;
+    BOOST_CHECK_NO_THROW(named = RPCConvertNamedValues(
+        "importdrivechaindeposit",
+        {std::string{"mainchain_txid="} + TXID,
+         "mainchain_vout=7",
+         std::string{"mainchain_block_hash="} + BLOCK_HASH,
+         std::string{"address="} + ADDRESS,
+         "value_sats=100000",
+         "fee_sats=42"}));
+    BOOST_CHECK_EQUAL(named["mainchain_txid"].get_str(), TXID);
+    BOOST_CHECK_EQUAL(named["mainchain_vout"].get_int64(), 7);
+    BOOST_CHECK_EQUAL(named["mainchain_block_hash"].get_str(), BLOCK_HASH);
+    BOOST_CHECK_EQUAL(named["address"].get_str(), ADDRESS);
+    BOOST_CHECK_EQUAL(named["value_sats"].get_int64(), 100000);
+    BOOST_CHECK_EQUAL(named["fee_sats"].get_int64(), 42);
+}
+
+BOOST_AUTO_TEST_CASE(rpc_convert_values_native_drivechain_withdrawal)
+{
+    static constexpr const char* TXID =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    static constexpr const char* BLOCK_HASH =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    UniValue send;
+    BOOST_CHECK_NO_THROW(send = RPCConvertValues(
+        "sendtomainchain", {"tb1qexample", "1.25", "false", "true", "0.00001"}));
+    BOOST_CHECK_EQUAL(send[0].get_str(), "tb1qexample");
+    BOOST_CHECK_EQUAL(send[1].get_real(), 1.25);
+    BOOST_CHECK_EQUAL(send[2].get_bool(), false);
+    BOOST_CHECK_EQUAL(send[3].get_bool(), true);
+    BOOST_CHECK_EQUAL(send[4].get_real(), 0.00001);
+
+    UniValue build;
+    BOOST_CHECK_NO_THROW(build = RPCConvertValues(
+        "getdrivechainwithdrawalbundle", {TXID, "7", BLOCK_HASH, "3"}));
+    BOOST_CHECK_EQUAL(build[0].get_str(), TXID);
+    BOOST_CHECK_EQUAL(build[1].get_int(), 7);
+    BOOST_CHECK_EQUAL(build[2].get_str(), BLOCK_HASH);
+    BOOST_CHECK_EQUAL(build[3].get_int(), 3);
+
+    UniValue verify;
+    BOOST_CHECK_NO_THROW(verify = RPCConvertValues(
+        "verifydrivechainwithdrawalbundle", {"010203", BLOCK_HASH, "6"}));
+    BOOST_CHECK_EQUAL(verify[0].get_str(), "010203");
+    BOOST_CHECK_EQUAL(verify[1].get_str(), BLOCK_HASH);
+    BOOST_CHECK_EQUAL(verify[2].get_int(), 6);
+
+    UniValue submit;
+    BOOST_CHECK_NO_THROW(submit = RPCConvertNamedValues(
+        "submitdrivechainwithdrawal",
+        {std::string{"txid="} + TXID,
+         "vout=7",
+         std::string{"blockhash="} + BLOCK_HASH,
+         "minconfirmations=6"}));
+    BOOST_CHECK_EQUAL(submit["txid"].get_str(), TXID);
+    BOOST_CHECK_EQUAL(submit["vout"].get_int(), 7);
+    BOOST_CHECK_EQUAL(submit["blockhash"].get_str(), BLOCK_HASH);
+    BOOST_CHECK_EQUAL(submit["minconfirmations"].get_int(), 6);
+}
+
+BOOST_AUTO_TEST_CASE(rpc_convert_values_usdd_withdrawal_proof)
+{
+    static constexpr const char* BLOCK_HASH =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    UniValue positional;
+    BOOST_CHECK_NO_THROW(positional = RPCConvertValues(
+        "getusddwithdrawalproof", {"7", BLOCK_HASH}));
+    BOOST_CHECK_EQUAL(positional[0].get_int(), 7);
+    BOOST_CHECK_EQUAL(positional[1].get_str(), BLOCK_HASH);
+
+    UniValue named;
+    BOOST_CHECK_NO_THROW(named = RPCConvertNamedValues(
+        "getusddwithdrawalproof", {"index=7", std::string{"blockhash="} + BLOCK_HASH}));
+    BOOST_CHECK_EQUAL(named["index"].get_int(), 7);
+    BOOST_CHECK_EQUAL(named["blockhash"].get_str(), BLOCK_HASH);
+}
+
 BOOST_AUTO_TEST_CASE(rpc_getblockstats_calculate_percentiles_by_weight)
 {
     int64_t total_weight = 200;

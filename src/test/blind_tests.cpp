@@ -5,6 +5,7 @@
 #include <arith_uint256.h>
 #include <blind.h>
 #include <coins.h>
+#include <issuance.h>
 #include <uint256.h>
 #include <validation.h>
 
@@ -14,6 +15,10 @@
 
 #include <secp256k1.h>
 
+#include <array>
+#include <cstring>
+#include <thread>
+
 // For elements serialization rules
 struct ElementsSetup : public TestingSetup {
         ElementsSetup() : TestingSetup("custom") {}
@@ -22,6 +27,58 @@ struct ElementsSetup : public TestingSetup {
 BOOST_FIXTURE_TEST_SUITE(blind_tests, ElementsSetup)
 
 // TODO: Make deterministic blinding wrapper function, test caching more exactly
+
+BOOST_AUTO_TEST_CASE(blinding_fits_rpc_worker_stack)
+{
+    CKey recipient_key;
+    CKey dummy_key;
+    std::array<unsigned char, 32> recipient_secret{1, 2, 3};
+    std::array<unsigned char, 32> dummy_secret{4, 5, 6};
+    recipient_key.Set(recipient_secret.begin(), recipient_secret.end(), true);
+    dummy_key.Set(dummy_secret.begin(), dummy_secret.end(), true);
+
+    const CAsset asset(GetRandHash());
+    CMutableTransaction tx;
+    tx.vin.resize(2);
+    tx.vin[0].prevout = COutPoint(ArithToUint256(1), 0);
+    tx.vin[1].prevout = COutPoint(ArithToUint256(2), 0);
+    tx.vout.emplace_back(asset, 100, CScript() << OP_TRUE);
+    tx.vout.emplace_back(asset, 22, CScript());
+    tx.vout.emplace_back(asset, 0, CScript() << OP_RETURN);
+
+    std::vector<uint256> input_value_blinds(2);
+    std::vector<uint256> input_asset_blinds(2);
+    std::vector<CAsset> input_assets(2, asset);
+    std::vector<CAmount> input_amounts{11, 111};
+    std::vector<uint256> output_value_blinds;
+    std::vector<uint256> output_asset_blinds;
+    std::vector<CPubKey> output_pubkeys{
+        recipient_key.GetPubKey(), CPubKey(), dummy_key.GetPubKey()};
+    std::vector<CKey> no_issuance_keys;
+    int blinded_outputs{-1};
+
+    // On macOS std::thread uses the same approximately 512 KiB default stack
+    // as an HTTP RPC worker. This call crashed before the blinding buffers were
+    // moved to heap-backed storage.
+    std::thread worker([&] {
+        blinded_outputs = BlindTransaction(
+            input_value_blinds,
+            input_asset_blinds,
+            input_assets,
+            input_amounts,
+            output_value_blinds,
+            output_asset_blinds,
+            output_pubkeys,
+            no_issuance_keys,
+            no_issuance_keys,
+            tx);
+    });
+    worker.join();
+
+    BOOST_CHECK_EQUAL(blinded_outputs, 2);
+    BOOST_CHECK(tx.vout[0].nValue.IsCommitment());
+    BOOST_CHECK(tx.vout[2].nValue.IsCommitment());
+}
 
 BOOST_AUTO_TEST_CASE(naive_blinding_test)
 {
@@ -398,5 +455,266 @@ BOOST_AUTO_TEST_CASE(spendable_zero_value_blinding_fails_without_abort)
                          input_amounts, output_value_blinds, output_asset_blinds,
                          output_pubkeys, no_issuance_keys, no_issuance_keys, tx),
         -1);
+}
+
+BOOST_AUTO_TEST_CASE(confidential_reissuance_authority_round_trip)
+{
+    // Model the USDD singleton authority without a wallet, datadir, or live
+    // UTXO. The authority's asset is a blinded reissuance-token generator.
+    // Reissuance reveals the current public ABF, mints the derived asset, and
+    // rotates the successor to a distinct generator with a confidential value
+    // commitment that preserves balance.
+    // Frozen prototype issuance entropy. Keeping this tied to the deployed
+    // asset/token pair makes the native secp256k1-zkp commitments useful as
+    // exact cross-language deployment vectors rather than merely checking an
+    // unrelated internally consistent issuance.
+    const uint256 entropy = uint256S(
+        "0xf108d6c0265fd2bdc6b45277e3515804"
+        "ea55892e6f342765b2df25a7023efb78");
+
+    // The deployed token is normally written in display order. Consensus and
+    // libsecp256k1 consume uint256's raw little-endian bytes instead. Freeze
+    // both forms and the exact serialized unblinded generator H so controller
+    // artifacts cannot accidentally hash the display string or reverse twice.
+    const CAsset deployed_reissuance_token(uint256S(
+        "9387c79c879d572ea18588f867414f15"
+        "c77e061cd510398e15dd471dbf1337d4"));
+    BOOST_CHECK_EQUAL(
+        HexStr(std::vector<unsigned char>(
+            deployed_reissuance_token.begin(), deployed_reissuance_token.end())),
+        "d43713bf1d47dd158e3910d51c067ec7"
+        "154f4167f88885a12e579d879cc78793");
+    secp256k1_generator deployed_unblinded_generator;
+    BOOST_REQUIRE_EQUAL(
+        secp256k1_generator_generate(
+            secp256k1_blind_context,
+            &deployed_unblinded_generator,
+            deployed_reissuance_token.begin()),
+        1);
+    std::array<unsigned char, 33> deployed_unblinded_generator_serialized{};
+    BOOST_REQUIRE_EQUAL(
+        secp256k1_generator_serialize(
+            secp256k1_blind_context,
+            deployed_unblinded_generator_serialized.data(),
+            &deployed_unblinded_generator),
+        1);
+    BOOST_CHECK_EQUAL(
+        HexStr(std::vector<unsigned char>(
+            deployed_unblinded_generator_serialized.begin(),
+            deployed_unblinded_generator_serialized.end())),
+        "0b6445a8b61ae65dce7070ac735913e7"
+        "d711e04485dda299812bcc091f170c4b81");
+
+    const auto sequence_abf = [](uint64_t scalar) {
+        std::array<unsigned char, 32> bytes{};
+        for (size_t i = 0; i < sizeof(scalar); ++i) {
+            bytes[bytes.size() - 1 - i] = scalar & 0xff;
+            scalar >>= 8;
+        }
+        return uint256(bytes.data(), bytes.size());
+    };
+    const uint64_t current_sequence = 0;
+    const uint64_t next_sequence = current_sequence + 1;
+    const uint256 authority_abf = sequence_abf(current_sequence + 1);
+    const uint256 successor_abf = sequence_abf(next_sequence + 1);
+    BOOST_CHECK_EQUAL(
+        HexStr(std::vector<unsigned char>(authority_abf.begin(), authority_abf.end())),
+        std::string(62, '0') + "01");
+    // uint256 display hex reverses the raw consensus/secp scalar bytes.
+    BOOST_CHECK_EQUAL(authority_abf.GetHex(), "01" + std::string(62, '0'));
+    constexpr CAmount mint_amount = 500;
+
+    CAsset issued_asset;
+    CAsset reissuance_token;
+    CalculateAsset(issued_asset, entropy);
+    CalculateReissuanceToken(reissuance_token, entropy, /*fConfidential=*/false);
+    BOOST_CHECK_EQUAL(
+        issued_asset.GetHex(),
+        "8728cd6ff7c8732fa82e2e10636faa745ddb303655248f029b3cace24b78e5ec");
+    BOOST_CHECK_EQUAL(reissuance_token.GetHex(), deployed_reissuance_token.GetHex());
+
+    CConfidentialAsset authority_generator;
+    secp256k1_generator generator;
+    BlindAsset(authority_generator, generator, reissuance_token, authority_abf.begin());
+    BOOST_CHECK_EQUAL(
+        authority_generator.GetHex(),
+        "0b9319dc4278ae093c4b651e352450ace17c79093cda960f3fcac2e4968e4e55f5");
+
+    const std::array<uint64_t, 2> authority_values{1, 1};
+    std::array<unsigned char, 32> unblinded_asset_blinder{};
+    std::array<unsigned char, 32> unblinded_value_blinder{};
+    std::array<unsigned char, 32> current_value_blinder{};
+    const std::array<const unsigned char*, 2> current_asset_blinders{
+        unblinded_asset_blinder.data(), authority_abf.begin()};
+    const std::array<unsigned char*, 2> current_value_blinders{
+        unblinded_value_blinder.data(), current_value_blinder.data()};
+    BOOST_REQUIRE_EQUAL(
+        secp256k1_pedersen_blind_generator_blind_sum(
+            secp256k1_blind_context,
+            authority_values.data(),
+            current_asset_blinders.data(),
+            current_value_blinders.data(),
+            authority_values.size(),
+            /*n_inputs=*/1),
+        1);
+    CConfidentialValue current_authority_value;
+    secp256k1_pedersen_commitment current_value_commitment;
+    CreateValueCommitment(
+        current_authority_value,
+        current_value_commitment,
+        current_value_blinder.data(),
+        generator,
+        1);
+    BOOST_CHECK_EQUAL(
+        current_authority_value.GetHex(),
+        "096445a8b61ae65dce7070ac735913e7d711e04485dda299812bcc091f170c4b81");
+
+    const CScript current_controller = CScript() << OP_TRUE;
+    const CScript successor_controller = CScript() << OP_TRUE << OP_TRUE;
+    const CScript recipient = CScript() << OP_TRUE << OP_DROP << OP_TRUE;
+
+    CTxOut current_authority(authority_generator, current_authority_value, current_controller);
+    current_authority.nNonce.SetNull();
+    const std::vector<CTxOut> inputs{current_authority};
+
+    CMutableTransaction reissue;
+    reissue.vin.emplace_back(COutPoint(uint256S("0x01"), 0));
+    reissue.vin[0].assetIssuance.assetBlindingNonce = authority_abf;
+    reissue.vin[0].assetIssuance.assetEntropy = entropy;
+    reissue.vin[0].assetIssuance.nAmount = CConfidentialValue(mint_amount);
+    reissue.vin[0].assetIssuance.nInflationKeys.SetNull();
+    // The output proofs below make this a witness transaction; keep the input
+    // witness vector structurally aligned even though the issuance is explicit.
+    reissue.witness.vtxinwit.resize(1);
+    reissue.vout.emplace_back(issued_asset, mint_amount, recipient);
+
+    CConfidentialAsset successor_generator;
+    secp256k1_generator successor_secp_generator;
+    BlindAsset(
+        successor_generator,
+        successor_secp_generator,
+        reissuance_token,
+        successor_abf.begin());
+    BOOST_CHECK_EQUAL(
+        successor_generator.GetHex(),
+        "0b7031cc832d89503a0746f15152bac4ec3b0a4b5f3f70906aa7b36a9b2f3d1de1");
+
+    std::array<unsigned char, 32> successor_value_blinder{};
+    const std::array<const unsigned char*, 2> successor_asset_blinders_for_balance{
+        unblinded_asset_blinder.data(), successor_abf.begin()};
+    const std::array<unsigned char*, 2> successor_value_blinders_for_balance{
+        unblinded_value_blinder.data(), successor_value_blinder.data()};
+    BOOST_REQUIRE_EQUAL(
+        secp256k1_pedersen_blind_generator_blind_sum(
+            secp256k1_blind_context,
+            authority_values.data(),
+            successor_asset_blinders_for_balance.data(),
+            successor_value_blinders_for_balance.data(),
+            authority_values.size(),
+            /*n_inputs=*/1),
+        1);
+
+    CConfidentialValue successor_value;
+    secp256k1_pedersen_commitment successor_value_commitment;
+    CreateValueCommitment(
+        successor_value,
+        successor_value_commitment,
+        successor_value_blinder.data(),
+        successor_secp_generator,
+        1);
+    BOOST_CHECK_EQUAL(current_authority_value.GetHex(), successor_value.GetHex());
+    reissue.vout.emplace_back(successor_generator, successor_value, successor_controller);
+    reissue.witness.vtxoutwit.resize(reissue.vout.size());
+
+    std::vector<secp256k1_fixed_asset_tag> surjection_targets(2);
+    std::memcpy(&surjection_targets[0], reissuance_token.begin(), 32);
+    std::memcpy(&surjection_targets[1], issued_asset.begin(), 32);
+    secp256k1_generator issued_generator;
+    BOOST_REQUIRE_EQUAL(
+        secp256k1_generator_generate(
+            secp256k1_blind_context, &issued_generator, issued_asset.begin()),
+        1);
+    const std::vector<secp256k1_generator> target_generators{
+        generator, issued_generator};
+    const std::vector<uint256> target_asset_blinders{authority_abf, uint256()};
+    std::vector<unsigned char*> successor_value_blinders{
+        successor_value_blinder.data()};
+    std::vector<const unsigned char*> successor_asset_blinders{
+        successor_abf.begin()};
+    BOOST_REQUIRE(GenerateRangeproof(
+        reissue.witness.vtxoutwit[1].vchRangeproof,
+        successor_value_blinders,
+        uint256S("0x04"),
+        1,
+        successor_controller,
+        successor_value_commitment,
+        successor_secp_generator,
+        reissuance_token,
+        successor_asset_blinders));
+
+    // Elements' deployed surjection-proof rules reject an output generator
+    // exactly equal to any input generator. A fixed-generator successor is
+    // therefore consensus-impossible, even when the underlying asset matches.
+    secp256k1_surjectionproof exact_reuse_proof;
+    size_t exact_reuse_index = 0;
+    std::array<unsigned char, 32> proof_seed{};
+    proof_seed[0] = 1;
+    BOOST_REQUIRE(secp256k1_surjectionproof_initialize(
+        secp256k1_blind_context,
+        &exact_reuse_proof,
+        &exact_reuse_index,
+        surjection_targets.data(),
+        surjection_targets.size(),
+        surjection_targets.size(),
+        &surjection_targets[0],
+        100,
+        proof_seed.data()));
+    BOOST_CHECK_EQUAL(
+        secp256k1_surjectionproof_generate(
+            secp256k1_blind_context,
+            &exact_reuse_proof,
+            target_generators.data(),
+            target_generators.size(),
+            &generator,
+            exact_reuse_index,
+            authority_abf.begin(),
+            authority_abf.begin()),
+        0);
+
+    BOOST_REQUIRE(SurjectOutput(
+        reissue.witness.vtxoutwit[1],
+        surjection_targets,
+        target_generators,
+        target_asset_blinders,
+        successor_asset_blinders,
+        successor_secp_generator,
+        reissuance_token));
+
+    BOOST_CHECK(VerifyAmounts(inputs, CTransaction(reissue), nullptr, false));
+
+    CMutableTransaction mutated(reissue);
+    mutated.vin[0].assetIssuance.assetBlindingNonce = uint256S("0x02");
+    BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(mutated), nullptr, false));
+
+    mutated = reissue;
+    mutated.vin[0].assetIssuance.assetEntropy = uint256S("0x03");
+    BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(mutated), nullptr, false));
+
+    std::vector<CTxOut> explicit_authority_inputs{current_authority};
+    explicit_authority_inputs[0].nAsset = CConfidentialAsset(reissuance_token);
+    BOOST_CHECK(!VerifyAmounts(explicit_authority_inputs, CTransaction(reissue), nullptr, false));
+
+    mutated = reissue;
+    mutated.vout[0].nValue = CConfidentialValue(mint_amount + 1);
+    BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(mutated), nullptr, false));
+
+    mutated = reissue;
+    mutated.vout[1].nValue = CConfidentialValue(2);
+    BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(mutated), nullptr, false));
+
+    mutated = reissue;
+    mutated.vout.emplace_back(authority_generator, CConfidentialValue(1), successor_controller);
+    BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(mutated), nullptr, false));
+
 }
 BOOST_AUTO_TEST_SUITE_END()

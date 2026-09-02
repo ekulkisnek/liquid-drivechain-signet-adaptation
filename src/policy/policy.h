@@ -81,7 +81,8 @@ static constexpr unsigned int STANDARD_SCRIPT_VERIFY_FLAGS = MANDATORY_SCRIPT_VE
                                                              SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION |
                                                              SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS |
                                                              SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE |
-                                                             SCRIPT_VERIFY_SIMPLICITY;
+                                                             SCRIPT_VERIFY_SIMPLICITY |
+                                                             SCRIPT_VERIFY_USDD_SP1_ANNEX;
 
 
 /** For convenience, standard but not mandatory verify flags. */
@@ -131,8 +132,10 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 * 3600bytes witnessScript size, 80bytes per witness stack element, 100 witness stack elements
 * These limits are adequate for multisignatures up to n-of-100 using OP_CHECKSIG, OP_ADD, and OP_EQUAL.
 *
-* Also enforce a maximum stack item size limit and no annexes for tapscript spends.
-* TapSimplicity spends may use an annex when their witness has the exact consensus shape.
+* Also enforce a maximum stack item size limit. On the sole Elements
+* Drivechain, one canonical USDD SP1 proof annex is permitted; every other
+* annex remains nonstandard.
+* ECX annex policy is separately gated by its activation profile.
 */
 bool IsWitnessStandard(
     const CTransaction& tx,

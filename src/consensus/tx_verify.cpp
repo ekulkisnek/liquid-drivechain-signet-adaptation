@@ -228,12 +228,21 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         if (tx.vin[i].m_is_pegin) {
             // Check existence and validity of pegin witness
             std::string err;
-            if (tx.witness.vtxinwit.size() <= i || !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, prevout, err, true)) {
+            bool parent_unavailable{false};
+            if (tx.witness.vtxinwit.size() <= i ||
+                !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts,
+                                     prevout, err, true, nullptr, &parent_unavailable)) {
+                if (parent_unavailable) {
+                    return state.Error(strprintf("drivechain parent state unavailable: %s", err));
+                }
                 return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-pegin-witness", err);
             }
-            if (IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, prevout) &&
-                !drivechain::VerifyDeterministicDeposit(tx, i, inputs, err)) {
-                return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-drivechain-deposit", err);
+            if (IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, prevout)) {
+                const bool native_deposit = tx.witness.vtxinwit[i].m_pegin_witness.stack.size() == 8;
+                if (native_deposit ? !CheckDrivechainDepositOutputs(tx, i, err)
+                                   : !drivechain::VerifyDeterministicDeposit(tx, i, inputs, err)) {
+                    return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-drivechain-deposit", err);
+                }
             }
             std::pair<uint256, COutPoint> pegin = GetPeginSpentKey(tx.witness.vtxinwit[i].m_pegin_witness, prevout);
             if (inputs.IsPeginSpent(pegin)) {

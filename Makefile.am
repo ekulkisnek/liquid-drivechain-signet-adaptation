@@ -15,6 +15,7 @@ endif
 .INTERMEDIATE: $(OSX_TEMP_ISO) $(COVERAGE_INFO)
 
 export PYTHONPATH
+export MACOSX_DEPLOYMENT_TARGET
 
 if BUILD_BITCOIN_LIBS
 pkgconfigdir = $(libdir)/pkgconfig
@@ -48,7 +49,34 @@ DIST_CONTRIB = \
 	       $(top_srcdir)/test/sanitizer_suppressions/tsan \
 	       $(top_srcdir)/test/sanitizer_suppressions/ubsan \
 	       $(top_srcdir)/contrib/linearize/linearize-data.py \
-	       $(top_srcdir)/contrib/linearize/linearize-hashes.py
+	       $(top_srcdir)/contrib/linearize/linearize-hashes.py \
+	       $(top_srcdir)/contrib/devtools/check_macos_deployment_target.py \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/README.md \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/DeriveEcxCatalogue.hs \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/EcxPrimitiveCandidate.hs \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/EcxPrimitiveCandidateTests.hs \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/apply_overlay.py \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/catalogue.project \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/catalogue.project.freeze \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/catalogue_test.c \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/catalogue_vectors.inc \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/evidence/current-bmm-wsl-diagnostic-20260828.json \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/evidence/sp1-smoke-cost-candidate-20260827.json \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/generate.py \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/jet-identities.tsv \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/registry.json \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/reproduce.sh \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/run_c_tests.sh \
+	       $(top_srcdir)/contrib/devtools/ecx-catalogue/test_generate.py \
+	       $(top_srcdir)/contrib/devtools/ecx_groth16_compatibility_probe.cpp \
+	       $(top_srcdir)/contrib/devtools/elements_identity_refreeze.py \
+	       $(top_srcdir)/contrib/devtools/elementsconsensus_pkgconfig_probe.c \
+	       $(top_srcdir)/contrib/devtools/test_check_macos_deployment_target.py \
+	       $(top_srcdir)/contrib/devtools/test_elements_identity_refreeze.py \
+	       $(top_srcdir)/contrib/devtools/test_usdd_withdrawal_vectors.py \
+	       $(top_srcdir)/contrib/devtools/fixtures/README.md \
+	       $(top_srcdir)/contrib/devtools/fixtures/legacy_v7_identity.py \
+	       $(top_srcdir)/contrib/devtools/fixtures/elements-v7-identity.h
 
 DIST_SHARE = \
   $(top_srcdir)/share/genbuild.sh \
@@ -269,6 +297,8 @@ dist_noinst_SCRIPTS = autogen.sh
 EXTRA_DIST = $(DIST_SHARE) test/functional/test_runner.py test/functional test/bitcoin_functional/functional test/bitcoin_functional/functional/test_runner.py test/fuzz $(DIST_CONTRIB) $(WINDOWS_PACKAGING) $(OSX_PACKAGING) $(BIN_CHECKS)
 
 EXTRA_DIST += \
+    doc/usdd-bip301-checkpoint-v1-vectors.json \
+    doc/usdd-withdrawal-accumulator-v1-vectors.json \
     test/util/test_runner.py \
     test/util/data/bitcoin-util-test.json \
     test/util/data/blanktxv1.hex \

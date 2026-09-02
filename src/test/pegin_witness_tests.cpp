@@ -13,6 +13,7 @@
 #include <hash.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
+#include <drivechain_withdrawal.h>
 #include <validation.h> // For CheckTransaction
 #include <pegins.h>
 #include <policy/policy.h>
@@ -156,14 +157,15 @@ BOOST_AUTO_TEST_CASE(witness_valid)
 
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_bmm_m7_requires_exact_canonical_commitment)
+BOOST_AUTO_TEST_CASE(drivechain_bmm_m7_matches_pinned_enforcer_push_parsing)
 {
     const uint256 sidechain_hash = uint256S("0123456789abcdef00112233445566778899aabbccddeeff1020304050607080");
 
     const auto make_m7 = [](const int slot, const uint256& hash) {
         std::vector<unsigned char> payload = ParseHex("d1617368");
         payload.push_back(static_cast<unsigned char>(slot));
-        payload.insert(payload.end(), hash.begin(), hash.end());
+        const std::vector<unsigned char> display_hash = ParseHex(hash.GetHex());
+        payload.insert(payload.end(), display_hash.begin(), display_hash.end());
         return CScript() << OP_RETURN << payload;
     };
     const auto make_block = [](const std::vector<CScript>& scripts) {
@@ -191,11 +193,12 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_m7_requires_exact_canonical_commitment)
         24, sidechain_hash, &output_index, &err));
     BOOST_CHECK_EQUAL(output_index, 1U);
 
-    // Fixed cross-codec fixture: rust-bitcoin's enforcer ReverseHex-decodes
-    // the gRPC display hash and serializes these internal-order commitment
-    // bytes. This fixture is deliberately not produced by make_m7().
+    // Fixed cross-codec fixture: the enforcer decodes `critical_hash` as
+    // ConsensusHex into an opaque BmmCommitment and serializes those exact
+    // display-order bytes into M7. This fixture is deliberately not produced
+    // by make_m7().
     const std::vector<unsigned char> enforcer_fixture_bytes = ParseHex(
-        "6a25d1617368188070605040302010ffeeddccbbaa99887766554433221100efcdab8967452301");
+        "6a25d1617368180123456789abcdef00112233445566778899aabbccddeeff1020304050607080");
     const CScript enforcer_fixture(
         enforcer_fixture_bytes.begin(), enforcer_fixture_bytes.end());
     BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
@@ -217,27 +220,105 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_m7_requires_exact_canonical_commitment)
 
     std::vector<unsigned char> payload = ParseHex("d1617368");
     payload.push_back(24);
-    payload.insert(payload.end(), sidechain_hash.begin(), sidechain_hash.end());
+    const std::vector<unsigned char> nonminimal_display_hash = ParseHex(sidechain_hash.GetHex());
+    payload.insert(payload.end(), nonminimal_display_hash.begin(), nonminimal_display_hash.end());
     CScript nonminimal;
     nonminimal.push_back(OP_RETURN);
     nonminimal.push_back(OP_PUSHDATA1);
     nonminimal.push_back(payload.size());
     nonminimal.insert(nonminimal.end(), payload.begin(), payload.end());
-    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({nonminimal}),
-                                                     24, sidechain_hash, nullptr, &err));
+    // CoinbaseMessage::parse in the pinned rust-bitcoin enforcer accepts a
+    // single non-minimal push. Elements must recognize the same M7.
+    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(make_block({nonminimal}),
+                                                    24, sidechain_hash, nullptr, &err));
     BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(
         make_block({make_m7(24, sidechain_hash), nonminimal}),
         24, sidechain_hash, nullptr, &err));
 
-    CScript display_endian;
-    display_endian << OP_RETURN;
-    std::vector<unsigned char> display_payload = ParseHex("d1617368");
-    display_payload.push_back(24);
-    const std::vector<unsigned char> display_hash = ParseHex(sidechain_hash.GetHex());
-    display_payload.insert(display_payload.end(), display_hash.begin(), display_hash.end());
-    display_endian << display_payload;
-    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({display_endian}),
+    CScript internal_endian;
+    internal_endian << OP_RETURN;
+    std::vector<unsigned char> internal_payload = ParseHex("d1617368");
+    internal_payload.push_back(24);
+    internal_payload.insert(internal_payload.end(), sidechain_hash.begin(), sidechain_hash.end());
+    internal_endian << internal_payload;
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({internal_endian}),
                                                      24, sidechain_hash, nullptr, &err));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_parent_replay_validates_pinned_enforcer_m8)
+{
+    constexpr int slot{24};
+    constexpr uint16_t max_age{10};
+    constexpr uint16_t threshold{5};
+    const uint256 required_proposal = uint256S("11");
+    const uint256 sidechain_hash = uint256S("22");
+    const uint256 previous_parent = uint256S("33");
+
+    const auto make_m7 = [](const uint256& hash) {
+        std::vector<unsigned char> payload = ParseHex("d1617368");
+        payload.push_back(slot);
+        const std::vector<unsigned char> display_hash = ParseHex(hash.GetHex());
+        payload.insert(payload.end(), display_hash.begin(), display_hash.end());
+        return CScript() << OP_RETURN << payload;
+    };
+    const auto make_m8_script = [](const uint256& hash, const uint256& previous,
+                                   const bool nonminimal) {
+        std::vector<unsigned char> payload = ParseHex("00bf00");
+        payload.push_back(slot);
+        const std::vector<unsigned char> display_hash = ParseHex(hash.GetHex());
+        payload.insert(payload.end(), display_hash.begin(), display_hash.end());
+        payload.insert(payload.end(), previous.begin(), previous.end());
+        if (!nonminimal) return CScript() << OP_RETURN << payload;
+        CScript script;
+        script.push_back(OP_RETURN);
+        script.push_back(OP_PUSHDATA1);
+        script.push_back(payload.size());
+        script.insert(script.end(), payload.begin(), payload.end());
+        return script;
+    };
+    const auto make_block = [&](const std::vector<CScript>& coinbase_messages,
+                                const CScript& request_script) {
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+        for (const CScript& message : coinbase_messages) {
+            coinbase.vout.emplace_back(0, message);
+        }
+        Bitcoin::CMutableTransaction request;
+        request.vin.emplace_back(Bitcoin::COutPoint(uint256::ONE, 0));
+        request.vout.emplace_back(0, request_script);
+        Bitcoin::CBlock block;
+        block.hashPrevBlock = previous_parent;
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(request)));
+        return block;
+    };
+    const auto apply = [&](const Bitcoin::CBlock& block, std::string& error) {
+        DrivechainParentReplayState state;
+        state.active_proposal_hash = required_proposal;
+        state.required_proposal_activated = true;
+        return ApplyDrivechainParentBlockState(
+            block, 1, slot, required_proposal,
+            max_age, threshold, max_age, threshold,
+            max_age, threshold, state, nullptr, &error);
+    };
+
+    std::string error;
+    BOOST_CHECK(apply(make_block(
+        {make_m7(sidechain_hash)},
+        make_m8_script(sidechain_hash, previous_parent, /*nonminimal=*/false)), error));
+    BOOST_CHECK(!apply(make_block(
+        {}, make_m8_script(sidechain_hash, previous_parent, /*nonminimal=*/false)), error));
+    BOOST_CHECK(!apply(make_block(
+        {make_m7(uint256S("44"))},
+        make_m8_script(sidechain_hash, previous_parent, /*nonminimal=*/false)), error));
+    BOOST_CHECK(!apply(make_block(
+        {make_m7(sidechain_hash)},
+        make_m8_script(sidechain_hash, uint256S("55"), /*nonminimal=*/false)), error));
+
+    // M8BmmRequest::parse requires the exact PUSHBYTES_68 form. A PUSHDATA1
+    // lookalike is not an M8 at all, so both implementations ignore it.
+    BOOST_CHECK(apply(make_block(
+        {}, make_m8_script(sidechain_hash, previous_parent, /*nonminimal=*/true)), error));
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_parent_commitment_is_domain_separated_and_canonical)
@@ -324,7 +405,13 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
     const uint256 pending_proposal = uint256S("07");
     const uint256 ctip_txid = uint256S("08");
     const uint256 active_proposal = uint256S("09");
-    const uint256 auxiliary_ctip_txid = uint256S("0a");
+    const uint256 pending_m6id = uint256S("0a");
+    const uint256 other_active_proposal = uint256S("0b");
+    const uint256 other_pending_proposal = uint256S("0c");
+    const uint256 other_pending_m6id = uint256S("0d");
+    const uint256 other_ctip_txid = uint256S("0e");
+    const uint256 second_block_hash = uint256S("0f");
+    const uint256 successful_m6id = uint256S("10");
 
     DrivechainParentReplayTip genesis;
     genesis.hash = genesis_hash;
@@ -333,19 +420,32 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
     next.hash = block_hash;
     next.state.active_proposal_hash = active_proposal;
     next.state.pending_proposals.emplace(
-        pending_proposal, DrivechainPendingProposal{1, 2});
+        pending_proposal, DrivechainPendingProposal{0, 1});
+    next.state.pending_withdrawals.push_back(
+        DrivechainPendingWithdrawal{pending_m6id, 1, 2});
     next.state.ctip = Bitcoin::COutPoint{ctip_txid, 1};
-    next.state.ctip_value = 2000;
-    next.state.auxiliary_slots[5].active_proposal_hash = uint256::ONE;
-    next.state.auxiliary_slots[5].ctip =
-        Bitcoin::COutPoint{auxiliary_ctip_txid, 2};
-    next.state.auxiliary_slots[5].ctip_value = 3000;
+    next.state.ctip_value = 0;
+    DrivechainOtherSlotReplayState other_slot;
+    other_slot.active_proposal_hash = other_active_proposal;
+    other_slot.pending_proposals.emplace(
+        other_pending_proposal, DrivechainPendingProposal{0, 1});
+    other_slot.pending_withdrawals.push_back(
+        DrivechainPendingWithdrawal{other_pending_m6id, 1, 2});
+    other_slot.ctip = Bitcoin::COutPoint{other_ctip_txid, 2};
+    other_slot.ctip_value = 0;
+    next.state.other_slots.emplace(25, std::move(other_slot));
+    next.state.previous_m4_actions.emplace(
+        24, DrivechainM4Action{DrivechainM4ActionType::UPVOTE, pending_m6id});
+    next.state.previous_m4_actions.emplace(
+        25, DrivechainM4Action{DrivechainM4ActionType::ALARM, uint256{}});
 
     DrivechainMintableDeposit deposit{
         Bitcoin::COutPoint{deposit_txid, 0}, block_hash, 1, 1000,
         std::vector<unsigned char>{0x51}};
     DrivechainReplayedBmmEdge edge{
         block_hash, 0, 1, true, committed_child};
+    DrivechainSuccessfulWithdrawal successful_withdrawal{
+        24, successful_m6id, 1, block_hash};
     std::string error;
 
     {
@@ -353,10 +453,36 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
         BOOST_REQUIRE(store.Reset(identity, genesis, &error));
         BOOST_REQUIRE(store.Append(
             genesis, next, {deposit},
-            std::make_optional(std::make_pair(genesis_hash, edge)), &error));
+            std::make_optional(std::make_pair(genesis_hash, edge)),
+            {successful_withdrawal}, &error));
         BOOST_CHECK(!store.Append(
             genesis, next, {deposit},
-            std::make_optional(std::make_pair(genesis_hash, edge)), &error));
+            std::make_optional(std::make_pair(genesis_hash, edge)),
+            {successful_withdrawal}, &error));
+
+        // A paid M6 remains permanently spent while this parent branch is
+        // active, even if a later block proposes the same blinded id again.
+        DrivechainParentReplayTip replay = next;
+        replay.height = 2;
+        replay.hash = second_block_hash;
+        DrivechainSuccessfulWithdrawal duplicate_success{
+            24, successful_m6id, 2, second_block_hash};
+        BOOST_CHECK(!store.Append(
+            next, replay, {}, std::nullopt, {duplicate_success}, &error));
+        BOOST_CHECK(!store.Append(
+            next, replay, {}, std::nullopt, {},
+            {DrivechainWithdrawalProposalIdentity{24, successful_m6id}},
+            &error));
+        BOOST_CHECK(error.find("already succeeded") != std::string::npos);
+
+        // Height/hash equality is insufficient: appends must also bind the
+        // caller's complete previous replay state to the durable tip.
+        DrivechainParentReplayTip altered_previous = next;
+        altered_previous.state.ctip_value = 1;
+        DrivechainParentReplayTip second = altered_previous;
+        second.height = 2;
+        second.hash = second_block_hash;
+        BOOST_CHECK(!store.Append(altered_previous, second, {}, std::nullopt, &error));
     }
 
     {
@@ -368,17 +494,34 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
         BOOST_CHECK(loaded.hash == block_hash);
         BOOST_REQUIRE(loaded.state.ctip.has_value());
         BOOST_CHECK(loaded.state.ctip->hash == ctip_txid);
-        BOOST_CHECK_EQUAL(loaded.state.ctip_value, 2000);
-        const auto auxiliary = loaded.state.auxiliary_slots.find(5);
-        BOOST_REQUIRE(auxiliary != loaded.state.auxiliary_slots.end());
-        BOOST_REQUIRE(auxiliary->second.ctip.has_value());
-        BOOST_CHECK(auxiliary->second.ctip->hash == auxiliary_ctip_txid);
-        BOOST_CHECK_EQUAL(auxiliary->second.ctip->n, 2U);
-        BOOST_CHECK_EQUAL(auxiliary->second.ctip_value, 3000);
+        BOOST_CHECK_EQUAL(loaded.state.ctip_value, 0);
         const auto pending = loaded.state.pending_proposals.find(pending_proposal);
         BOOST_REQUIRE(pending != loaded.state.pending_proposals.end());
-        BOOST_CHECK_EQUAL(pending->second.proposal_height, 1U);
-        BOOST_CHECK_EQUAL(pending->second.votes, 2U);
+        BOOST_CHECK_EQUAL(pending->second.proposal_height, 0U);
+        BOOST_CHECK_EQUAL(pending->second.votes, 1U);
+        BOOST_REQUIRE_EQUAL(loaded.state.pending_withdrawals.size(), 1U);
+        BOOST_CHECK(loaded.state.pending_withdrawals[0].m6id == pending_m6id);
+        BOOST_CHECK_EQUAL(loaded.state.pending_withdrawals[0].votes, 2U);
+        const auto loaded_other = loaded.state.other_slots.find(25);
+        BOOST_REQUIRE(loaded_other != loaded.state.other_slots.end());
+        BOOST_CHECK(loaded_other->second.active_proposal_hash == other_active_proposal);
+        const auto loaded_other_proposal =
+            loaded_other->second.pending_proposals.find(other_pending_proposal);
+        BOOST_REQUIRE(loaded_other_proposal !=
+                      loaded_other->second.pending_proposals.end());
+        BOOST_CHECK_EQUAL(loaded_other_proposal->second.votes, 1U);
+        BOOST_REQUIRE(loaded_other->second.ctip.has_value());
+        BOOST_CHECK(loaded_other->second.ctip->hash == other_ctip_txid);
+        BOOST_CHECK_EQUAL(loaded_other->second.ctip_value, 0);
+        BOOST_REQUIRE_EQUAL(loaded_other->second.pending_withdrawals.size(), 1U);
+        BOOST_CHECK(loaded_other->second.pending_withdrawals[0].m6id == other_pending_m6id);
+        BOOST_REQUIRE_EQUAL(loaded.state.previous_m4_actions.size(), 2U);
+        BOOST_CHECK(loaded.state.previous_m4_actions.at(24).type ==
+                    DrivechainM4ActionType::UPVOTE);
+        BOOST_CHECK(loaded.state.previous_m4_actions.at(24).m6id == pending_m6id);
+        BOOST_CHECK(loaded.state.previous_m4_actions.at(25).type ==
+                    DrivechainM4ActionType::ALARM);
+        BOOST_CHECK(loaded.state.previous_m4_actions.at(25).m6id.IsNull());
         BOOST_CHECK(store.Load(wrong_identity, loaded, &error) ==
                     DrivechainReplayStoreLoadStatus::IDENTITY_MISMATCH);
 
@@ -393,6 +536,15 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
                       DrivechainReplayStoreReadStatus::FOUND);
         BOOST_CHECK(loaded_edge.successor_hash == block_hash);
         BOOST_CHECK(loaded_edge.committed_sidechain_hash == committed_child);
+
+        DrivechainSuccessfulWithdrawal loaded_withdrawal;
+        BOOST_REQUIRE(store.ReadSuccessfulWithdrawal(
+                          24, successful_m6id, loaded_withdrawal, &error) ==
+                      DrivechainReplayStoreReadStatus::FOUND);
+        BOOST_CHECK_EQUAL(loaded_withdrawal.sidechain_slot, 24U);
+        BOOST_CHECK(loaded_withdrawal.m6id == successful_m6id);
+        BOOST_CHECK_EQUAL(loaded_withdrawal.block_height, 1U);
+        BOOST_CHECK(loaded_withdrawal.block_hash == block_hash);
     }
 
     // A malformed durable tip is never interpreted as an empty or usable
@@ -412,6 +564,10 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
                       DrivechainReplayStoreLoadStatus::LOADED);
         DrivechainMintableDeposit removed;
         BOOST_CHECK(store.ReadDeposit(deposit.outpoint, removed, &error) ==
+                    DrivechainReplayStoreReadStatus::NOT_FOUND);
+        DrivechainSuccessfulWithdrawal removed_withdrawal;
+        BOOST_CHECK(store.ReadSuccessfulWithdrawal(
+                        24, successful_m6id, removed_withdrawal, &error) ==
                     DrivechainReplayStoreReadStatus::NOT_FOUND);
     }
 }
@@ -507,7 +663,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_state_replay_matches_slot_voting_rules)
         return ApplyDrivechainParentBlockState(
             block, height, slot, required_proposal,
             max_age, threshold, max_age, threshold,
-            max_age, threshold,
+            /* withdrawal_max_age= */ 10, /* withdrawal_threshold= */ 5,
             state, nullptr, &error);
     };
 
@@ -677,7 +833,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_replay_starts_unused_and_preserves_pendin
         return ApplyDrivechainParentBlockState(
             block, height, slot, required_proposal,
             unused_max_age, unused_threshold, used_max_age, used_threshold,
-            used_max_age, used_threshold,
+            /* withdrawal_max_age= */ 10, /* withdrawal_threshold= */ 5,
             state, deposits, &error);
     };
 
@@ -767,7 +923,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_ctip_replay_rejects_fabricated_transition
         return ApplyDrivechainParentBlockState(
             block, 10, slot, required_proposal,
             max_age, threshold, max_age, threshold,
-            max_age, threshold,
+            /* withdrawal_max_age= */ 10, /* withdrawal_threshold= */ 5,
             state, &deposits, &error);
     };
 
@@ -859,7 +1015,365 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_ctip_replay_rejects_fabricated_transition
     BOOST_CHECK_EQUAL(preactivation.ctip_value, 6000);
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)
+BOOST_AUTO_TEST_CASE(drivechain_parent_replay_accepts_only_miner_approved_m6)
+{
+    constexpr int slot{24};
+    constexpr uint8_t other_slot{3};
+    constexpr uint16_t max_age{10};
+    constexpr uint16_t threshold{5};
+    const uint256 required_proposal = uint256S(
+        "3333333333333333333333333333333333333333333333333333333333333333");
+    const uint256 other_proposal = uint256S(
+        "0303030303030303030303030303030303030303030303030303030303030303");
+    const Bitcoin::COutPoint initial_ctip(
+        uint256S("4444444444444444444444444444444444444444444444444444444444444444"), 0);
+    const CScript treasury_script = CScript()
+        << OP_NOP5 << std::vector<unsigned char>{slot} << OP_TRUE;
+
+    Bitcoin::CMutableTransaction withdrawal;
+    withdrawal.vin.emplace_back(initial_ctip);
+    withdrawal.vout.emplace_back(4000, treasury_script);
+    withdrawal.vout.emplace_back(900, CScript() << OP_TRUE);
+    const Bitcoin::CTransaction withdrawal_tx(withdrawal);
+    uint256 m6id;
+    uint8_t derived_slot{0};
+    std::string error;
+    BOOST_REQUIRE(ComputeDrivechainM6Id(
+        withdrawal_tx, 5000, m6id, &derived_slot, &error));
+    BOOST_CHECK_EQUAL(derived_slot, slot);
+
+    const auto make_m3 = [](const uint8_t message_slot, const uint256& id) {
+        std::vector<unsigned char> payload = ParseHex("d45aa943");
+        payload.push_back(message_slot);
+        payload.insert(payload.end(), id.begin(), id.end());
+        return CScript() << OP_RETURN << payload;
+    };
+    const auto make_explicit_m4 = [](const std::vector<unsigned char>& votes) {
+        std::vector<unsigned char> payload = ParseHex("d77d177601");
+        payload.insert(payload.end(), votes.begin(), votes.end());
+        return CScript() << OP_RETURN << payload;
+    };
+    const auto repeat_previous_m4 = []() {
+        return CScript() << OP_RETURN << ParseHex("d77d177600");
+    };
+    const auto make_block = [](const std::vector<CScript>& messages,
+                               const uint32_t nonce,
+                               const Bitcoin::CMutableTransaction* transaction = nullptr) {
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+        for (const CScript& message : messages) coinbase.vout.emplace_back(0, message);
+        Bitcoin::CBlock block;
+        block.nNonce = nonce;
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+        if (transaction) block.vtx.push_back(Bitcoin::MakeTransactionRef(*transaction));
+        return block;
+    };
+    const auto apply = [&](const Bitcoin::CBlock& block,
+                           const uint32_t height,
+                           DrivechainParentReplayState& state,
+                           std::vector<DrivechainSuccessfulWithdrawal>*
+                               successful_withdrawals = nullptr,
+                           std::vector<DrivechainWithdrawalProposalIdentity>*
+                               withdrawal_proposals = nullptr) {
+        return ApplyDrivechainParentBlockState(
+            block, height, slot, required_proposal,
+            max_age, threshold, max_age, threshold,
+            max_age, threshold, state, nullptr, &error,
+            successful_withdrawals, withdrawal_proposals);
+    };
+
+    DrivechainParentReplayState state;
+    state.active_proposal_hash = required_proposal;
+    state.required_proposal_activated = true;
+    state.required_activation_height = 1;
+    state.ctip = initial_ctip;
+    state.ctip_value = 5000;
+    state.other_slots[other_slot].active_proposal_hash = other_proposal;
+
+    std::vector<DrivechainWithdrawalProposalIdentity> withdrawal_proposals;
+    BOOST_REQUIRE(apply(
+        make_block({make_m3(slot, m6id)}, 100), 100, state,
+        nullptr, &withdrawal_proposals));
+    BOOST_REQUIRE_EQUAL(state.pending_withdrawals.size(), 1U);
+    BOOST_CHECK_EQUAL(state.pending_withdrawals[0].votes, 1U);
+    BOOST_REQUIRE_EQUAL(withdrawal_proposals.size(), 1U);
+    BOOST_CHECK_EQUAL(withdrawal_proposals[0].sidechain_slot, slot);
+    BOOST_CHECK(withdrawal_proposals[0].m6id == m6id);
+
+    // Active slots are globally sorted [3, 24]. A slot-24-only vote vector is
+    // invalid; the correct vector abstains for slot 3 and selects index 0 for
+    // slot 24. RepeatPrevious then reproduces that effective upvote.
+    DrivechainParentReplayState wrong_vector = state;
+    BOOST_CHECK(!apply(make_block({make_explicit_m4({0})}, 101), 101, wrong_vector));
+    BOOST_REQUIRE(apply(make_block({make_explicit_m4({0xff, 0})}, 101), 101, state));
+    BOOST_CHECK_EQUAL(state.pending_withdrawals[0].votes, 2U);
+    for (uint32_t height = 102; height <= 104; ++height) {
+        BOOST_REQUIRE(apply(make_block({repeat_previous_m4()}, height), height, state));
+    }
+    BOOST_CHECK_EQUAL(state.pending_withdrawals[0].votes, threshold);
+
+    // BIP300 requires strictly more than the threshold.
+    DrivechainParentReplayState exactly_threshold = state;
+    BOOST_CHECK(!apply(make_block({}, 105, &withdrawal), 105, exactly_threshold));
+
+    BOOST_REQUIRE(apply(make_block({repeat_previous_m4()}, 105), 105, state));
+    BOOST_CHECK_EQUAL(state.pending_withdrawals[0].votes, threshold + 1);
+
+    // Any payout mutation changes the blinded M6id and therefore cannot spend
+    // the approved bundle.
+    Bitcoin::CMutableTransaction tampered = withdrawal;
+    tampered.vout[1].nValue += 1;
+    DrivechainParentReplayState tampered_state = state;
+    BOOST_CHECK(!apply(make_block({}, 106, &tampered), 106, tampered_state));
+
+    const Bitcoin::CBlock successful_block =
+        make_block({}, 106, &withdrawal);
+    std::vector<DrivechainSuccessfulWithdrawal> successful_withdrawals;
+    BOOST_REQUIRE(apply(
+        successful_block, 106, state, &successful_withdrawals));
+    BOOST_CHECK(state.pending_withdrawals.empty());
+    BOOST_REQUIRE(state.ctip.has_value());
+    BOOST_CHECK_EQUAL(state.ctip->hash, withdrawal_tx.GetHash());
+    BOOST_CHECK_EQUAL(state.ctip->n, 0U);
+    BOOST_CHECK_EQUAL(state.ctip_value, 4000);
+    BOOST_REQUIRE_EQUAL(successful_withdrawals.size(), 1U);
+    BOOST_CHECK_EQUAL(successful_withdrawals[0].sidechain_slot, slot);
+    BOOST_CHECK(successful_withdrawals[0].m6id == m6id);
+    BOOST_CHECK_EQUAL(successful_withdrawals[0].block_height, 106U);
+    BOOST_CHECK(successful_withdrawals[0].block_hash ==
+                successful_block.GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_parent_replay_accepts_exact_native_elwd_m6)
+{
+    constexpr int slot{24};
+    constexpr uint16_t max_age{10};
+    constexpr uint16_t threshold{5};
+    constexpr CAmount old_ctip_value{200000};
+    constexpr CAmount burn_amount{100000};
+    constexpr CAmount parent_fee{1000};
+    constexpr CAmount successor_ctip_value{old_ctip_value - burn_amount};
+    const uint256 required_proposal = uint256S(
+        "3333333333333333333333333333333333333333333333333333333333333333");
+    const uint256 elements_genesis = uint256S(
+        "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+    const uint256 burn_txid = uint256S(
+        "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f");
+    const Bitcoin::COutPoint initial_ctip(
+        uint256S("4444444444444444444444444444444444444444444444444444444444444444"), 0);
+    const CScript treasury_script = CScript()
+        << OP_NOP5 << std::vector<unsigned char>{slot} << OP_TRUE;
+
+    drivechain::NativeWithdrawal withdrawal;
+    withdrawal.destination = CScript() << OP_0 << ParseHex(
+        "606162636465666768696a6b6c6d6e6f70717273");
+    withdrawal.burn_amount = burn_amount;
+    withdrawal.parent_fee = parent_fee;
+    withdrawal.payout_amount = burn_amount - parent_fee;
+
+    drivechain::NativeWithdrawalM6 blinded;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        drivechain::BuildNativeWithdrawalM6(
+            elements_genesis, slot, burn_txid, 7, withdrawal, blinded, &error),
+        error);
+
+    Bitcoin::CMutableTransaction actual = blinded.blinded_transaction;
+    actual.vin.emplace_back(initial_ctip);
+    actual.vout[0] = Bitcoin::CTxOut(successor_ctip_value, treasury_script);
+    const Bitcoin::CTransaction actual_tx(actual);
+    uint256 actual_m6id;
+    uint8_t actual_slot{0};
+    BOOST_REQUIRE_MESSAGE(
+        ComputeDrivechainM6Id(
+            actual_tx, old_ctip_value, actual_m6id, &actual_slot, &error),
+        error);
+    BOOST_CHECK_EQUAL(actual_slot, slot);
+    BOOST_CHECK(actual_m6id == blinded.m6id);
+
+    DrivechainParentReplayState state;
+    state.active_proposal_hash = required_proposal;
+    state.required_proposal_activated = true;
+    state.required_activation_height = 1;
+    state.ctip = initial_ctip;
+    state.ctip_value = old_ctip_value;
+    state.pending_withdrawals = {
+        {blinded.m6id, 99, threshold + 1},
+    };
+
+    Bitcoin::CMutableTransaction coinbase;
+    coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+    Bitcoin::CBlock block;
+    block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+    block.vtx.push_back(Bitcoin::MakeTransactionRef(actual));
+
+    std::vector<DrivechainSuccessfulWithdrawal> successful;
+    BOOST_REQUIRE_MESSAGE(
+        ApplyDrivechainParentBlockState(
+            block, 100, slot, required_proposal,
+            max_age, threshold, max_age, threshold, max_age, threshold,
+            state, nullptr, &error, &successful),
+        error);
+    BOOST_REQUIRE(state.ctip.has_value());
+    BOOST_CHECK(state.ctip->hash == actual_tx.GetHash());
+    BOOST_CHECK_EQUAL(state.ctip->n, 0U);
+    BOOST_CHECK_EQUAL(state.ctip_value, successor_ctip_value);
+    BOOST_CHECK(state.pending_withdrawals.empty());
+    BOOST_REQUIRE_EQUAL(successful.size(), 1U);
+    BOOST_CHECK_EQUAL(successful[0].sidechain_slot, slot);
+    BOOST_CHECK(successful[0].m6id == blinded.m6id);
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_parent_replay_sequences_usdd_root_and_native_elwd_m6)
+{
+    constexpr int slot{24};
+    constexpr uint16_t max_age{10};
+    constexpr uint16_t threshold{5};
+    constexpr CAmount initial_ctip_value{10000};
+    constexpr CAmount root_successor_value{8999};
+    constexpr CAmount native_burn_amount{4000};
+    constexpr CAmount native_parent_fee{100};
+    constexpr CAmount native_successor_value{
+        root_successor_value - native_burn_amount};
+    const uint256 required_proposal = uint256S(
+        "3333333333333333333333333333333333333333333333333333333333333333");
+    const CScript treasury_script = CScript()
+        << OP_NOP5 << std::vector<unsigned char>{slot} << OP_TRUE;
+
+    // Canonical two-output USDD accumulator M6 fixed across Elements, Rust,
+    // Solidity, and the enforcer. Its CTIP successor is always vout zero.
+    const std::vector<unsigned char> root_raw = ParseHex(
+        "02000000011f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504"
+        "030201000700000000ffffffff02272300000000000004b401185101000000000000"
+        "00296a27555344444d3601dd6833a6a2db112477ab453d2886af0c9154de56f5e"
+        "8fc8717e3f7974186b36700000000");
+    CDataStream root_stream(root_raw, SER_NETWORK, PROTOCOL_VERSION);
+    Bitcoin::CMutableTransaction root_m6;
+    root_stream >> root_m6;
+    BOOST_REQUIRE(root_stream.empty());
+    const Bitcoin::CTransaction root_tx(root_m6);
+    BOOST_REQUIRE_EQUAL(root_tx.vin.size(), 1U);
+    BOOST_REQUIRE_EQUAL(root_tx.vout.size(), 2U);
+    BOOST_CHECK_EQUAL(root_tx.vout[0].nValue, root_successor_value);
+
+    uint256 root_m6id;
+    uint8_t root_slot{0};
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        ComputeDrivechainM6Id(
+            root_tx, initial_ctip_value, root_m6id, &root_slot, &error),
+        error);
+    BOOST_CHECK_EQUAL(root_slot, slot);
+
+    drivechain::NativeWithdrawal native_withdrawal;
+    native_withdrawal.destination = CScript() << OP_0 << ParseHex(
+        "606162636465666768696a6b6c6d6e6f70717273");
+    native_withdrawal.burn_amount = native_burn_amount;
+    native_withdrawal.parent_fee = native_parent_fee;
+    native_withdrawal.payout_amount = native_burn_amount - native_parent_fee;
+
+    drivechain::NativeWithdrawalM6 native_blinded;
+    BOOST_REQUIRE_MESSAGE(
+        drivechain::BuildNativeWithdrawalM6(
+            uint256S(
+                "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"),
+            slot,
+            uint256S(
+                "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"),
+            7, native_withdrawal, native_blinded, &error),
+        error);
+    Bitcoin::CMutableTransaction native_m6 = native_blinded.blinded_transaction;
+    native_m6.vin.emplace_back(Bitcoin::COutPoint(root_tx.GetHash(), 0));
+    native_m6.vout[0] = Bitcoin::CTxOut(native_successor_value, treasury_script);
+    const Bitcoin::CTransaction native_tx(native_m6);
+    uint256 native_m6id;
+    uint8_t native_slot{0};
+    BOOST_REQUIRE_MESSAGE(
+        ComputeDrivechainM6Id(
+            native_tx, root_successor_value, native_m6id, &native_slot, &error),
+        error);
+    BOOST_CHECK_EQUAL(native_slot, slot);
+    BOOST_CHECK(native_m6id == native_blinded.m6id);
+
+    DrivechainParentReplayState state;
+    state.active_proposal_hash = required_proposal;
+    state.required_proposal_activated = true;
+    state.required_activation_height = 1;
+    state.ctip = root_tx.vin[0].prevout;
+    state.ctip_value = initial_ctip_value;
+    state.pending_withdrawals = {
+        {root_m6id, 99, threshold + 1},
+        {native_m6id, 99, threshold + 1},
+    };
+
+    const auto make_block = [](const Bitcoin::CMutableTransaction& transaction,
+                               const uint32_t nonce) {
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+        Bitcoin::CBlock block;
+        block.nNonce = nonce;
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(transaction));
+        return block;
+    };
+    const auto apply = [&](const Bitcoin::CBlock& block,
+                           const uint32_t height,
+                           std::vector<DrivechainSuccessfulWithdrawal>& successful) {
+        return ApplyDrivechainParentBlockState(
+            block, height, slot, required_proposal,
+            max_age, threshold, max_age, threshold, max_age, threshold,
+            state, nullptr, &error, &successful);
+    };
+
+    std::vector<DrivechainSuccessfulWithdrawal> successful;
+    BOOST_REQUIRE_MESSAGE(apply(make_block(root_m6, 100), 100, successful), error);
+    BOOST_REQUIRE_EQUAL(successful.size(), 1U);
+    BOOST_CHECK(successful[0].m6id == root_m6id);
+    BOOST_REQUIRE(state.ctip.has_value());
+    BOOST_CHECK(state.ctip->hash == root_tx.GetHash());
+    BOOST_CHECK_EQUAL(state.ctip->n, 0U);
+    BOOST_CHECK_EQUAL(state.ctip_value, root_successor_value);
+
+    successful.clear();
+    BOOST_REQUIRE_MESSAGE(apply(make_block(native_m6, 101), 101, successful), error);
+    BOOST_REQUIRE_EQUAL(successful.size(), 1U);
+    BOOST_CHECK(successful[0].m6id == native_m6id);
+    BOOST_REQUIRE(state.ctip.has_value());
+    BOOST_CHECK(state.ctip->hash == native_tx.GetHash());
+    BOOST_CHECK_EQUAL(state.ctip->n, 0U);
+    BOOST_CHECK_EQUAL(state.ctip_value, native_successor_value);
+    BOOST_CHECK(state.pending_withdrawals.empty());
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_m6id_matches_usdd_and_enforcer_vector)
+{
+    const std::vector<unsigned char> raw = ParseHex(
+        "02000000011f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504"
+        "030201000700000000ffffffff02272300000000000004b401185101000000000000"
+        "00296a27555344444d3601dd6833a6a2db112477ab453d2886af0c9154de56f5e"
+        "8fc8717e3f7974186b36700000000");
+    CDataStream stream(raw, SER_NETWORK, PROTOCOL_VERSION);
+    Bitcoin::CMutableTransaction mutable_tx;
+    stream >> mutable_tx;
+    BOOST_REQUIRE(stream.empty());
+    const Bitcoin::CTransaction transaction(mutable_tx);
+    BOOST_CHECK_EQUAL(
+        transaction.GetHash(),
+        uint256S("641c51cde9625227dd15e9f8482d0c62700b3824d7bef9f5e83a689120f8acca"));
+
+    uint256 m6id;
+    uint8_t slot{0};
+    std::string error;
+    BOOST_REQUIRE(ComputeDrivechainM6Id(
+        transaction, /* previous_treasury_value= */ 10000,
+        m6id, &slot, &error));
+    BOOST_CHECK_EQUAL(slot, 24U);
+    BOOST_CHECK_EQUAL(
+        m6id,
+        uint256S("9cf04f94106990b941c4cd437435e376bf4bbd08671ddd8549169f251af6b5a9"));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_parent_replay_rejects_two_configured_slot_m6s_in_one_block)
 {
     constexpr int slot{24};
     constexpr uint16_t max_age{10};
@@ -871,181 +1385,62 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)
     const CScript treasury_script = CScript()
         << OP_NOP5 << std::vector<unsigned char>{slot} << OP_TRUE;
 
-    const CAmount old_treasury_value{5000};
-    const CAmount new_treasury_value{3900};
-    const CAmount payout_value{1000};
-    const CAmount mainchain_fee{
-        old_treasury_value - new_treasury_value - payout_value};
-    std::vector<unsigned char> fee_bytes;
-    for (int byte = 7; byte >= 0; --byte) {
-        fee_bytes.push_back(
-            (static_cast<uint64_t>(mainchain_fee) >> (8 * byte)) & 0xff);
-    }
+    Bitcoin::CMutableTransaction first;
+    first.vin.emplace_back(initial_ctip);
+    first.vout.emplace_back(4000, treasury_script);
+    first.vout.emplace_back(999, CScript() << OP_TRUE);
+    const Bitcoin::CTransaction first_tx(first);
 
-    Bitcoin::CMutableTransaction blinded;
-    blinded.nVersion = 2;
-    blinded.vout.emplace_back(0, CScript() << OP_RETURN << fee_bytes);
-    blinded.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x42));
-    blinded.vout.emplace_back(payout_value, CScript() << OP_TRUE);
-    const uint256 m6id = blinded.GetHash();
+    Bitcoin::CMutableTransaction second;
+    second.vin.emplace_back(Bitcoin::COutPoint(first_tx.GetHash(), 0));
+    second.vout.emplace_back(3000, treasury_script);
+    second.vout.emplace_back(999, CScript() << OP_TRUE);
+    const Bitcoin::CTransaction second_tx(second);
 
-    Bitcoin::CMutableTransaction m6;
-    m6.nVersion = 2;
-    m6.vin.emplace_back(initial_ctip);
-    m6.vout.emplace_back(new_treasury_value, treasury_script);
-    m6.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x42));
-    m6.vout.emplace_back(payout_value, CScript() << OP_TRUE);
-
-    const auto make_m3 = [&](const uint8_t message_slot, const uint256& bundle_id) {
-        std::vector<unsigned char> payload = ParseHex("d45aa943");
-        payload.push_back(message_slot);
-        payload.insert(payload.end(), bundle_id.begin(), bundle_id.end());
-        return CScript() << OP_RETURN << payload;
-    };
-    const auto make_m4 = [](const std::vector<unsigned char>& votes) {
-        std::vector<unsigned char> payload = ParseHex("d77d177601");
-        payload.insert(payload.end(), votes.begin(), votes.end());
-        return CScript() << OP_RETURN << payload;
-    };
-    const auto make_block = [](const std::vector<CScript>& messages,
-                               const uint32_t nonce,
-                               const std::optional<Bitcoin::CMutableTransaction>& transaction = std::nullopt) {
-        Bitcoin::CMutableTransaction coinbase;
-        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
-        for (const CScript& message : messages) coinbase.vout.emplace_back(0, message);
-        Bitcoin::CBlock block;
-        block.nNonce = nonce;
-        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
-        if (transaction) {
-            block.vtx.push_back(Bitcoin::MakeTransactionRef(*transaction));
-        }
-        return block;
-    };
-    const auto active_state = [&] {
-        DrivechainParentReplayState state;
-        state.active_proposal_hash = required_proposal;
-        state.required_proposal_activated = true;
-        state.required_activation_height = 1;
-        state.ctip = initial_ctip;
-        state.ctip_value = old_treasury_value;
-        return state;
-    };
-    const auto apply = [&](const Bitcoin::CBlock& block, const uint32_t height,
-                           DrivechainParentReplayState& state, std::string& error) {
-        return ApplyDrivechainParentBlockState(
-            block, height, slot, required_proposal,
-            max_age, threshold, max_age, threshold,
-            max_age, threshold,
-            state, nullptr, &error);
-    };
-
+    uint256 first_m6id;
+    uint256 second_m6id;
     std::string error;
+    BOOST_REQUIRE(ComputeDrivechainM6Id(first_tx, 5000, first_m6id, nullptr, &error));
+    BOOST_REQUIRE(ComputeDrivechainM6Id(second_tx, 4000, second_m6id, nullptr, &error));
 
-    // A matching M3 is not enough. The finalized M6 remains invalid until its
-    // score is strictly greater than the network's inclusion threshold.
-    DrivechainParentReplayState unapproved = active_state();
-    BOOST_CHECK(apply(make_block({make_m3(slot, m6id)}, 10), 10, unapproved, error));
-    BOOST_REQUIRE_EQUAL(unapproved.pending_withdrawals.size(), 1U);
-    BOOST_CHECK_EQUAL(unapproved.pending_withdrawals.front().vote_count, 1U);
-    BOOST_CHECK(!apply(make_block({}, 11, m6), 11, unapproved, error));
+    DrivechainParentReplayState state;
+    state.active_proposal_hash = required_proposal;
+    state.required_proposal_activated = true;
+    state.required_activation_height = 1;
+    state.ctip = initial_ctip;
+    state.ctip_value = 5000;
+    state.pending_withdrawals = {
+        {first_m6id, 99, threshold + 1},
+        {second_m6id, 99, threshold + 1},
+    };
 
-    // M4 indexes the sorted global active-slot list. Slot 5 precedes slot 24,
-    // so each vector abstains for slot 5 and upvotes bundle index zero for 24.
-    DrivechainParentReplayState approved = active_state();
-    approved.auxiliary_slots[5].active_proposal_hash = uint256::ONE;
-    BOOST_CHECK(apply(make_block({make_m3(slot, m6id)}, 20), 20, approved, error));
-    for (uint32_t height = 21; height <= 24; ++height) {
-        BOOST_CHECK(apply(make_block({make_m4({0xff, 0x00})}, height),
-                          height, approved, error));
-    }
-    BOOST_CHECK_EQUAL(approved.pending_withdrawals.front().vote_count, 5U);
-    BOOST_CHECK(!apply(make_block({}, 25, m6), 25, approved, error));
+    Bitcoin::CMutableTransaction coinbase;
+    coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+    Bitcoin::CBlock block;
+    block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+    block.vtx.push_back(Bitcoin::MakeTransactionRef(first));
+    block.vtx.push_back(Bitcoin::MakeTransactionRef(second));
 
-    // The fifth later upvote raises the initial score of one to six. M4 is
-    // processed before M6 in the same block, matching the enforcer.
-    BOOST_CHECK(apply(
-        make_block({make_m4({0xff, 0x00})}, 25, m6), 25, approved, error));
-    BOOST_CHECK(approved.pending_withdrawals.empty());
-    BOOST_REQUIRE(approved.ctip.has_value());
-    BOOST_CHECK_EQUAL(approved.ctip->hash, Bitcoin::CTransaction(m6).GetHash());
-    BOOST_CHECK_EQUAL(approved.ctip->n, 0U);
-    BOOST_CHECK_EQUAL(approved.ctip_value, new_treasury_value);
+    BOOST_CHECK(!ApplyDrivechainParentBlockState(
+        block, 100, slot, required_proposal,
+        max_age, threshold, max_age, threshold, max_age, threshold,
+        state, nullptr, &error));
+    BOOST_CHECK(error.find("multiple successful M6 withdrawals") != std::string::npos);
 
-    // A different fee produces a different blinded M6id and cannot consume
-    // approval for the original bundle.
-    DrivechainParentReplayState mismatched = active_state();
-    mismatched.pending_withdrawals.push_back(
-        DrivechainPendingWithdrawal{m6id, 30, threshold + 1});
-    Bitcoin::CMutableTransaction wrong_fee = m6;
-    wrong_fee.vout[0].nValue = new_treasury_value - 1;
-    BOOST_CHECK(!apply(make_block({}, 30, wrong_fee), 30, mismatched, error));
-
-    // A malformed global vote vector cannot be interpreted as a vote for the
-    // configured slot.
-    DrivechainParentReplayState malformed_votes = active_state();
-    malformed_votes.auxiliary_slots[5].active_proposal_hash = uint256::ONE;
-    BOOST_CHECK(apply(make_block({make_m3(slot, m6id)}, 40), 40,
-                      malformed_votes, error));
-    BOOST_CHECK(!apply(make_block({make_m4({0x00})}, 41), 41,
-                       malformed_votes, error));
-
-    // Executing an approved M6 for another active sidechain must advance that
-    // slot's CTIP and remove its bundle. Otherwise subsequent global M4 indices
-    // drift even though this slot's own state is unchanged.
-    constexpr uint8_t auxiliary_slot{5};
-    const Bitcoin::COutPoint auxiliary_initial_ctip(
-        uint256S("5555555555555555555555555555555555555555555555555555555555555555"), 0);
-    const CAmount auxiliary_old_value{6000};
-    const CAmount auxiliary_new_value{4900};
-    const CScript auxiliary_treasury_script = CScript()
-        << OP_NOP5 << std::vector<unsigned char>{auxiliary_slot} << OP_TRUE;
-
-    Bitcoin::CMutableTransaction auxiliary_blinded;
-    auxiliary_blinded.nVersion = 2;
-    auxiliary_blinded.vout.emplace_back(0, CScript() << OP_RETURN << fee_bytes);
-    auxiliary_blinded.vout.emplace_back(
-        0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x43));
-    auxiliary_blinded.vout.emplace_back(payout_value, CScript() << OP_TRUE);
-    const uint256 auxiliary_m6id = auxiliary_blinded.GetHash();
-
-    Bitcoin::CMutableTransaction auxiliary_m6;
-    auxiliary_m6.nVersion = 2;
-    auxiliary_m6.vin.emplace_back(auxiliary_initial_ctip);
-    auxiliary_m6.vout.emplace_back(auxiliary_new_value, auxiliary_treasury_script);
-    auxiliary_m6.vout.emplace_back(
-        0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x43));
-    auxiliary_m6.vout.emplace_back(payout_value, CScript() << OP_TRUE);
-
-    DrivechainParentReplayState cross_slot = active_state();
-    auto& auxiliary_state = cross_slot.auxiliary_slots[auxiliary_slot];
-    auxiliary_state.active_proposal_hash = uint256::ONE;
-    auxiliary_state.ctip = auxiliary_initial_ctip;
-    auxiliary_state.ctip_value = auxiliary_old_value;
-    BOOST_CHECK(apply(
-        make_block({make_m3(auxiliary_slot, auxiliary_m6id),
-                    make_m3(slot, m6id)}, 50),
-        50, cross_slot, error));
-    for (uint32_t height = 51; height <= 54; ++height) {
-        BOOST_CHECK(apply(make_block({make_m4({0x00, 0xff})}, height),
-                          height, cross_slot, error));
-    }
-    BOOST_CHECK(apply(
-        make_block({make_m4({0x00, 0xff})}, 55, auxiliary_m6),
-        55, cross_slot, error));
-    BOOST_CHECK(auxiliary_state.pending_withdrawals.empty());
-    BOOST_REQUIRE(auxiliary_state.ctip.has_value());
-    BOOST_CHECK_EQUAL(
-        auxiliary_state.ctip->hash, Bitcoin::CTransaction(auxiliary_m6).GetHash());
-    BOOST_CHECK_EQUAL(auxiliary_state.ctip->n, 0U);
-    BOOST_CHECK_EQUAL(auxiliary_state.ctip_value, auxiliary_new_value);
-    BOOST_REQUIRE_EQUAL(cross_slot.pending_withdrawals.size(), 1U);
-    BOOST_CHECK_EQUAL(cross_slot.pending_withdrawals.front().vote_count, 1U);
-
-    // Slot 5 remains in the vector because it is still active, but slot 24's
-    // bundle is still index zero and receives the intended vote.
-    BOOST_CHECK(apply(make_block({make_m4({0xff, 0x00})}, 56),
-                      56, cross_slot, error));
-    BOOST_CHECK_EQUAL(cross_slot.pending_withdrawals.front().vote_count, 2U);
+    DrivechainParentReplayState one_state;
+    one_state.active_proposal_hash = required_proposal;
+    one_state.required_proposal_activated = true;
+    one_state.required_activation_height = 1;
+    one_state.ctip = initial_ctip;
+    one_state.ctip_value = 5000;
+    one_state.pending_withdrawals = {{first_m6id, 99, threshold + 1}};
+    Bitcoin::CBlock one_block;
+    one_block.vtx.push_back(block.vtx[0]);
+    one_block.vtx.push_back(block.vtx[1]);
+    BOOST_CHECK(ApplyDrivechainParentBlockState(
+        one_block, 100, slot, required_proposal,
+        max_age, threshold, max_age, threshold, max_age, threshold,
+        one_state, nullptr, &error));
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_activation_block_deposit_is_mintable)
@@ -1092,7 +1487,7 @@ BOOST_AUTO_TEST_CASE(drivechain_activation_block_deposit_is_mintable)
     BOOST_CHECK(ApplyDrivechainParentBlockState(
         block, activation_height, slot, required_proposal,
         max_age, threshold, max_age, threshold,
-        max_age, threshold,
+        /* withdrawal_max_age= */ 10, /* withdrawal_threshold= */ 5,
         state, &deposits, &error));
     BOOST_CHECK(state.required_proposal_activated);
     BOOST_CHECK_EQUAL(state.required_activation_height, activation_height);
@@ -1256,6 +1651,301 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_header_mtp_is_strict)
         BOOST_REQUIRE(header.read(json));
         BOOST_CHECK(!ParseDrivechainParentHeader(header, expected_hash, mtp, &err));
     }
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_bmm_m7_requires_exact_canonical_commitment)
+{
+    const uint256 sidechain_hash = uint256S("0123456789abcdef00112233445566778899aabbccddeeff1020304050607080");
+
+    const auto make_m7 = [](const int slot, const uint256& hash) {
+        std::vector<unsigned char> payload = ParseHex("d1617368");
+        payload.push_back(static_cast<unsigned char>(slot));
+        const std::vector<unsigned char> display_hash = ParseHex(hash.GetHex());
+        payload.insert(payload.end(), display_hash.begin(), display_hash.end());
+        return CScript() << OP_RETURN << payload;
+    };
+    const auto make_block = [](const std::vector<CScript>& scripts) {
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0, 0);
+        for (const CScript& script : scripts) coinbase.vout.emplace_back(0, script);
+        Bitcoin::CBlock block;
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+        return block;
+    };
+
+    std::string err;
+    uint32_t output_index{99};
+    uint256 parsed_hash;
+    BOOST_CHECK(ExtractCanonicalDrivechainBmmCommitmentInBlock(
+        make_block({CScript() << OP_RETURN << std::vector<unsigned char>{0x01},
+                    make_m7(24, sidechain_hash)}),
+        24, parsed_hash, &output_index, &err));
+    BOOST_CHECK_EQUAL(parsed_hash, sidechain_hash);
+    BOOST_CHECK_EQUAL(output_index, 1U);
+
+    output_index = 99;
+    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
+        make_block({CScript() << OP_RETURN << std::vector<unsigned char>{0x01}, make_m7(24, sidechain_hash)}),
+        24, sidechain_hash, &output_index, &err));
+    BOOST_CHECK_EQUAL(output_index, 1U);
+
+    // The pinned enforcer decodes critical_hash as ConsensusHex into an
+    // opaque BmmCommitment, not a ReverseHex block hash. Preserve a fixed
+    // cross-codec fixture independent of make_m7().
+    const std::vector<unsigned char> enforcer_fixture_bytes = ParseHex(
+        "6a25d1617368180123456789abcdef00112233445566778899aabbccddeeff1020304050607080");
+    const CScript enforcer_fixture(
+        enforcer_fixture_bytes.begin(), enforcer_fixture_bytes.end());
+    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
+        make_block({enforcer_fixture}), 24, sidechain_hash, nullptr, &err));
+
+    const uint256 wrong_hash = uint256S("1123456789abcdef00112233445566778899aabbccddeeff1020304050607080");
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({make_m7(24, wrong_hash)}),
+                                                     24, sidechain_hash, nullptr, &err));
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({make_m7(23, sidechain_hash)}),
+                                                     24, sidechain_hash, nullptr, &err));
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(
+        make_block({make_m7(24, sidechain_hash), make_m7(24, sidechain_hash)}),
+        24, sidechain_hash, nullptr, &err));
+
+    CScript trailing = make_m7(24, sidechain_hash);
+    trailing << OP_TRUE;
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({trailing}),
+                                                     24, sidechain_hash, nullptr, &err));
+
+    std::vector<unsigned char> payload = ParseHex("d1617368");
+    payload.push_back(24);
+    const std::vector<unsigned char> display_hash = ParseHex(sidechain_hash.GetHex());
+    payload.insert(payload.end(), display_hash.begin(), display_hash.end());
+    CScript nonminimal;
+    nonminimal.push_back(OP_RETURN);
+    nonminimal.push_back(OP_PUSHDATA1);
+    nonminimal.push_back(payload.size());
+    nonminimal.insert(nonminimal.end(), payload.begin(), payload.end());
+    // Exact commitment and single-push framing are required, but the pinned
+    // enforcer intentionally permits non-minimal push opcodes.
+    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(make_block({nonminimal}),
+                                                    24, sidechain_hash, nullptr, &err));
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(
+        make_block({make_m7(24, sidechain_hash), nonminimal}),
+        24, sidechain_hash, nullptr, &err));
+
+    for (const unsigned int length_bytes : {2U, 4U}) {
+        CScript pushed;
+        pushed.push_back(OP_RETURN);
+        pushed.push_back(length_bytes == 2 ? OP_PUSHDATA2 : OP_PUSHDATA4);
+        for (unsigned int byte = 0; byte < length_bytes; ++byte) {
+            pushed.push_back(byte == 0 ? payload.size() : 0);
+        }
+        pushed.insert(pushed.end(), payload.begin(), payload.end());
+        BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(make_block({pushed}),
+                                                        24, sidechain_hash, nullptr, &err));
+        // Removing payload bytes must not turn an incomplete push into M7.
+        pushed.pop_back();
+        BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({pushed}),
+                                                         24, sidechain_hash, nullptr, &err));
+    }
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(
+        make_block({make_m7(24, sidechain_hash), make_m7(24, wrong_hash)}),
+        24, sidechain_hash, nullptr, &err));
+
+    CScript internal_endian;
+    internal_endian << OP_RETURN;
+    std::vector<unsigned char> internal_payload = ParseHex("d1617368");
+    internal_payload.push_back(24);
+    internal_payload.insert(internal_payload.end(), sidechain_hash.begin(), sidechain_hash.end());
+    internal_endian << internal_payload;
+    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({internal_endian}),
+                                                     24, sidechain_hash, nullptr, &err));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)
+{
+    constexpr int slot{24};
+    constexpr uint16_t max_age{10};
+    constexpr uint16_t threshold{5};
+    const uint256 required_proposal = uint256S(
+        "3333333333333333333333333333333333333333333333333333333333333333");
+    const Bitcoin::COutPoint initial_ctip(
+        uint256S("4444444444444444444444444444444444444444444444444444444444444444"), 0);
+    const CScript treasury_script = CScript()
+        << OP_NOP5 << std::vector<unsigned char>{slot} << OP_TRUE;
+
+    const CAmount old_treasury_value{5000};
+    const CAmount new_treasury_value{3900};
+    const CAmount payout_value{1000};
+    const CAmount mainchain_fee{
+        old_treasury_value - new_treasury_value - payout_value};
+    std::vector<unsigned char> fee_bytes;
+    for (int byte = 7; byte >= 0; --byte) {
+        fee_bytes.push_back(
+            (static_cast<uint64_t>(mainchain_fee) >> (8 * byte)) & 0xff);
+    }
+
+    Bitcoin::CMutableTransaction blinded;
+    blinded.nVersion = 2;
+    blinded.vout.emplace_back(0, CScript() << OP_RETURN << fee_bytes);
+    blinded.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x42));
+    blinded.vout.emplace_back(payout_value, CScript() << OP_TRUE);
+    const uint256 m6id = blinded.GetHash();
+
+    Bitcoin::CMutableTransaction m6;
+    m6.nVersion = 2;
+    m6.vin.emplace_back(initial_ctip);
+    m6.vout.emplace_back(new_treasury_value, treasury_script);
+    m6.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x42));
+    m6.vout.emplace_back(payout_value, CScript() << OP_TRUE);
+
+    const auto make_m3 = [&](const uint8_t message_slot, const uint256& bundle_id) {
+        std::vector<unsigned char> payload = ParseHex("d45aa943");
+        payload.push_back(message_slot);
+        payload.insert(payload.end(), bundle_id.begin(), bundle_id.end());
+        return CScript() << OP_RETURN << payload;
+    };
+    const auto make_m4 = [](const std::vector<unsigned char>& votes) {
+        std::vector<unsigned char> payload = ParseHex("d77d177601");
+        payload.insert(payload.end(), votes.begin(), votes.end());
+        return CScript() << OP_RETURN << payload;
+    };
+    const auto make_block = [](const std::vector<CScript>& messages,
+                               const uint32_t nonce,
+                               const std::optional<Bitcoin::CMutableTransaction>& transaction = std::nullopt) {
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+        for (const CScript& message : messages) coinbase.vout.emplace_back(0, message);
+        Bitcoin::CBlock block;
+        block.nNonce = nonce;
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
+        if (transaction) {
+            block.vtx.push_back(Bitcoin::MakeTransactionRef(*transaction));
+        }
+        return block;
+    };
+    const auto active_state = [&] {
+        DrivechainParentReplayState state;
+        state.active_proposal_hash = required_proposal;
+        state.required_proposal_activated = true;
+        state.required_activation_height = 1;
+        state.ctip = initial_ctip;
+        state.ctip_value = old_treasury_value;
+        return state;
+    };
+    const auto apply = [&](const Bitcoin::CBlock& block, const uint32_t height,
+                           DrivechainParentReplayState& state, std::string& error) {
+        return ApplyDrivechainParentBlockState(
+            block, height, slot, required_proposal,
+            max_age, threshold, max_age, threshold,
+            max_age, threshold,
+            state, nullptr, &error);
+    };
+
+    std::string error;
+
+    // A matching M3 is not enough. The finalized M6 remains invalid until its
+    // score is strictly greater than the network's inclusion threshold.
+    DrivechainParentReplayState unapproved = active_state();
+    BOOST_CHECK(apply(make_block({make_m3(slot, m6id)}, 10), 10, unapproved, error));
+    BOOST_REQUIRE_EQUAL(unapproved.pending_withdrawals.size(), 1U);
+    BOOST_CHECK_EQUAL(unapproved.pending_withdrawals.front().votes, 1U);
+    BOOST_CHECK(!apply(make_block({}, 11, m6), 11, unapproved, error));
+
+    // M4 indexes the sorted global active-slot list. Slot 5 precedes slot 24,
+    // so each vector abstains for slot 5 and upvotes bundle index zero for 24.
+    DrivechainParentReplayState approved = active_state();
+    approved.other_slots[5].active_proposal_hash = uint256::ONE;
+    BOOST_CHECK(apply(make_block({make_m3(slot, m6id)}, 20), 20, approved, error));
+    for (uint32_t height = 21; height <= 24; ++height) {
+        BOOST_CHECK(apply(make_block({make_m4({0xff, 0x00})}, height),
+                          height, approved, error));
+    }
+    BOOST_CHECK_EQUAL(approved.pending_withdrawals.front().votes, 5U);
+    BOOST_CHECK(!apply(make_block({}, 25, m6), 25, approved, error));
+
+    // The fifth later upvote raises the initial score of one to six. M4 is
+    // processed before M6 in the same block, matching the enforcer.
+    BOOST_CHECK(apply(
+        make_block({make_m4({0xff, 0x00})}, 25, m6), 25, approved, error));
+    BOOST_CHECK(approved.pending_withdrawals.empty());
+    BOOST_REQUIRE(approved.ctip.has_value());
+    BOOST_CHECK_EQUAL(approved.ctip->hash, Bitcoin::CTransaction(m6).GetHash());
+    BOOST_CHECK_EQUAL(approved.ctip->n, 0U);
+    BOOST_CHECK_EQUAL(approved.ctip_value, new_treasury_value);
+
+    // A different fee produces a different blinded M6id and cannot consume
+    // approval for the original bundle.
+    DrivechainParentReplayState mismatched = active_state();
+    mismatched.pending_withdrawals.push_back(
+        DrivechainPendingWithdrawal{m6id, 30, threshold + 1});
+    Bitcoin::CMutableTransaction wrong_fee = m6;
+    wrong_fee.vout[0].nValue = new_treasury_value - 1;
+    BOOST_CHECK(!apply(make_block({}, 30, wrong_fee), 30, mismatched, error));
+
+    // A malformed global vote vector cannot be interpreted as a vote for the
+    // configured slot.
+    DrivechainParentReplayState malformed_votes = active_state();
+    malformed_votes.other_slots[5].active_proposal_hash = uint256::ONE;
+    BOOST_CHECK(apply(make_block({make_m3(slot, m6id)}, 40), 40,
+                      malformed_votes, error));
+    BOOST_CHECK(!apply(make_block({make_m4({0x00})}, 41), 41,
+                       malformed_votes, error));
+
+    // Executing an approved M6 for another active sidechain must advance that
+    // slot's CTIP and remove its bundle. Otherwise subsequent global M4 indices
+    // drift even though this slot's own state is unchanged.
+    constexpr uint8_t auxiliary_slot{5};
+    const Bitcoin::COutPoint auxiliary_initial_ctip(
+        uint256S("5555555555555555555555555555555555555555555555555555555555555555"), 0);
+    const CAmount auxiliary_old_value{6000};
+    const CAmount auxiliary_new_value{4900};
+    const CScript auxiliary_treasury_script = CScript()
+        << OP_NOP5 << std::vector<unsigned char>{auxiliary_slot} << OP_TRUE;
+
+    Bitcoin::CMutableTransaction auxiliary_blinded;
+    auxiliary_blinded.nVersion = 2;
+    auxiliary_blinded.vout.emplace_back(0, CScript() << OP_RETURN << fee_bytes);
+    auxiliary_blinded.vout.emplace_back(
+        0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x43));
+    auxiliary_blinded.vout.emplace_back(payout_value, CScript() << OP_TRUE);
+    const uint256 auxiliary_m6id = auxiliary_blinded.GetHash();
+
+    Bitcoin::CMutableTransaction auxiliary_m6;
+    auxiliary_m6.nVersion = 2;
+    auxiliary_m6.vin.emplace_back(auxiliary_initial_ctip);
+    auxiliary_m6.vout.emplace_back(auxiliary_new_value, auxiliary_treasury_script);
+    auxiliary_m6.vout.emplace_back(
+        0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x43));
+    auxiliary_m6.vout.emplace_back(payout_value, CScript() << OP_TRUE);
+
+    DrivechainParentReplayState cross_slot = active_state();
+    auto& auxiliary_state = cross_slot.other_slots[auxiliary_slot];
+    auxiliary_state.active_proposal_hash = uint256::ONE;
+    auxiliary_state.ctip = auxiliary_initial_ctip;
+    auxiliary_state.ctip_value = auxiliary_old_value;
+    BOOST_CHECK(apply(
+        make_block({make_m3(auxiliary_slot, auxiliary_m6id),
+                    make_m3(slot, m6id)}, 50),
+        50, cross_slot, error));
+    for (uint32_t height = 51; height <= 54; ++height) {
+        BOOST_CHECK(apply(make_block({make_m4({0x00, 0xff})}, height),
+                          height, cross_slot, error));
+    }
+    BOOST_CHECK(apply(
+        make_block({make_m4({0x00, 0xff})}, 55, auxiliary_m6),
+        55, cross_slot, error));
+    BOOST_CHECK(auxiliary_state.pending_withdrawals.empty());
+    BOOST_REQUIRE(auxiliary_state.ctip.has_value());
+    BOOST_CHECK_EQUAL(
+        auxiliary_state.ctip->hash, Bitcoin::CTransaction(auxiliary_m6).GetHash());
+    BOOST_CHECK_EQUAL(auxiliary_state.ctip->n, 0U);
+    BOOST_CHECK_EQUAL(auxiliary_state.ctip_value, auxiliary_new_value);
+    BOOST_REQUIRE_EQUAL(cross_slot.pending_withdrawals.size(), 1U);
+    BOOST_CHECK_EQUAL(cross_slot.pending_withdrawals.front().votes, 1U);
+
+    // Slot 5 remains in the vector because it is still active, but slot 24's
+    // bundle is still index zero and receives the intended vote.
+    BOOST_CHECK(apply(make_block({make_m4({0xff, 0x00})}, 56),
+                      56, cross_slot, error));
+    BOOST_CHECK_EQUAL(cross_slot.pending_withdrawals.front().votes, 2U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

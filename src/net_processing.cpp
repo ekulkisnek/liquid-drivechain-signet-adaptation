@@ -15,6 +15,7 @@
 #include <deploymentstatus.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
+#include <mainchainrpc.h>
 #include <merkleblock.h>
 #include <netbase.h>
 #include <netmessagemaker.h>
@@ -41,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <typeinfo>
@@ -107,6 +109,35 @@ static const unsigned int MAX_GETDATA_SZ = 1000;
 static const int MAX_BLOCKS_IN_TRANSIT_PER_PEER = 16;
 /** Time during which a peer must stall block download progress before being disconnected. */
 static constexpr auto BLOCK_STALLING_TIMEOUT{2s};
+/**
+ * Maximum time a native-drivechain peer may hold an ephemeral header while we
+ * wait for its full block. These requests cannot use the ordinary in-flight
+ * block machinery because the header is deliberately absent from the global
+ * block index until its BMM commitment is authenticated.
+ */
+static constexpr auto DRIVECHAIN_EPHEMERAL_BLOCK_TIMEOUT{30s};
+/** Backoff after an exact active P->Q edge rejects a requested child block. */
+static constexpr auto DRIVECHAIN_PARENT_REJECTED_BACKOFF{30s};
+/** Availability failures are never punished, but should not form a hot loop. */
+static constexpr auto DRIVECHAIN_PARENT_UNAVAILABLE_BACKOFF{5s};
+static constexpr unsigned int MAX_DRIVECHAIN_PARENT_REJECTED_STRIKES{2};
+
+unsigned int NextDrivechainParentRejectedStrikeCount(
+    const uint256& previous_parent,
+    const uint256& previous_successor,
+    const unsigned int previous_count,
+    const uint256& rejected_parent,
+    const uint256& rejected_successor)
+{
+    if (rejected_parent.IsNull() || rejected_successor.IsNull()) return 0;
+    if (previous_count != 0 && previous_parent == rejected_parent &&
+        previous_successor == rejected_successor) {
+        return previous_count == std::numeric_limits<unsigned int>::max()
+            ? previous_count
+            : previous_count + 1;
+    }
+    return 1;
+}
 /** Number of headers sent in one getheaders result. We rely on the assumption that if a peer sends
  *  less than this number, we reached its tip. Changing this value is a protocol upgrade. */
 static const unsigned int MAX_HEADERS_RESULTS = 2000;
@@ -705,6 +736,18 @@ struct CNodeState {
     const CBlockIndex* pindexBestHeaderSent{nullptr};
     //! Length of current-streak of unconnecting headers announcements
     int nUnconnectingHeaders{0};
+    // Native drivechain headers cannot authenticate their coinbase BMM
+    // commitment. Keep one ephemeral request per live peer; an unknown header
+    // is never inserted into the global block index before its full block has
+    // passed BMM/deposit admission.
+    std::optional<CBlockHeader> pending_drivechain_header;
+    const CBlockIndex* pending_drivechain_predecessor{nullptr};
+    std::chrono::microseconds pending_drivechain_deadline{0us};
+    uint256 drivechain_rejected_parent;
+    uint256 drivechain_rejected_successor;
+    unsigned int drivechain_parent_rejected_strikes{0};
+    std::chrono::microseconds drivechain_retry_after{0us};
+    const CBlockIndex* drivechain_retry_predecessor{nullptr};
     //! Whether we've started headers synchronization with this peer.
     bool fSyncStarted{false};
     //! When to potentially disconnect peer for stalling headers download
@@ -2120,6 +2163,133 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, const Peer& peer,
         return;
     }
 
+    if (m_chainparams.GetConsensus().drivechain_slot.has_value()) {
+        BlockValidationState ephemeral_state;
+        bool request_block{false};
+        bool request_more_headers{false};
+        uint256 requested_hash;
+        uint32_t fetch_flags{0};
+        CBlockLocator next_locator;
+        {
+            LOCK(cs_main);
+            CNodeState* nodestate = State(pfrom.GetId());
+            assert(nodestate != nullptr);
+
+            const auto now = GetTime<std::chrono::microseconds>();
+            if (nodestate->drivechain_retry_after != 0us &&
+                now >= nodestate->drivechain_retry_after) {
+                nodestate->drivechain_retry_after = 0us;
+                nodestate->drivechain_retry_predecessor = nullptr;
+            }
+
+            // A reconnect creates a fresh CNodeState, so rejected siblings
+            // cannot accumulate globally. While this connection has one full
+            // block outstanding, accept only a retry of that exact header.
+            if (nodestate->drivechain_retry_after != 0us) {
+                LogPrint(
+                    BCLog::NET,
+                    "ignoring drivechain header during parent-validation backoff (peer=%d)\n",
+                    pfrom.GetId());
+            } else if (nodestate->pending_drivechain_header.has_value()) {
+                const uint256 pending_hash =
+                    nodestate->pending_drivechain_header->GetHash();
+                const CBlockIndex* authenticated_elsewhere =
+                    m_chainman.m_blockman.LookupBlockIndex(pending_hash);
+                if (authenticated_elsewhere &&
+                    IsDrivechainHeaderAuthenticated(
+                        authenticated_elsewhere,
+                        m_chainparams.GetConsensus())) {
+                    // Another peer may have delivered the same full block.
+                    // Treat that as progress rather than repeatedly asking
+                    // this peer for a block we already authenticated.
+                    nodestate->pending_drivechain_header.reset();
+                    nodestate->pending_drivechain_predecessor = nullptr;
+                    nodestate->pending_drivechain_deadline = 0us;
+                    UpdateBlockAvailability(pfrom.GetId(), pending_hash);
+                    next_locator = m_chainman.ActiveChain().GetLocator(
+                        authenticated_elsewhere);
+                    request_more_headers = true;
+                } else {
+                    LogPrint(BCLog::NET,
+                        "ignoring drivechain header while ephemeral full block %s is already pending (peer=%d)\n",
+                        pending_hash.GetHex(),
+                        pfrom.GetId());
+                }
+            } else {
+                for (size_t i = 1; i < headers.size(); ++i) {
+                    if (headers[i].hashPrevBlock != headers[i - 1].GetHash()) {
+                        Misbehaving(pfrom.GetId(), 20,
+                                    "non-continuous drivechain headers sequence");
+                        return;
+                    }
+                }
+
+                const CBlockIndex* last_known{nullptr};
+                for (const CBlockHeader& header : headers) {
+                    const CBlockIndex* known =
+                        m_chainman.m_blockman.LookupBlockIndex(header.GetHash());
+                    if (known != nullptr) {
+                        if (!IsDrivechainHeaderAuthenticated(
+                                known, m_chainparams.GetConsensus())) {
+                            ephemeral_state.Error(
+                                "indexed drivechain header lacks authenticated full block");
+                            break;
+                        }
+                        last_known = known;
+                        continue;
+                    }
+
+                    const CBlockIndex* predecessor{nullptr};
+                    if (!m_chainman.CheckDrivechainEphemeralHeader(
+                            header, ephemeral_state, m_chainparams,
+                            &predecessor)) {
+                        break;
+                    }
+                    nodestate->pending_drivechain_header = header;
+                    nodestate->pending_drivechain_predecessor = predecessor;
+                    nodestate->pending_drivechain_deadline =
+                        GetTime<std::chrono::microseconds>() +
+                        DRIVECHAIN_EPHEMERAL_BLOCK_TIMEOUT;
+                    requested_hash = header.GetHash();
+                    request_block = true;
+                    break; // descendants wait for this full block
+                }
+
+                if (!request_block && ephemeral_state.IsValid() && last_known) {
+                    UpdateBlockAvailability(pfrom.GetId(),
+                                            last_known->GetBlockHash());
+                    next_locator =
+                        m_chainman.ActiveChain().GetLocator(last_known);
+                    request_more_headers = true;
+                }
+            }
+            if (request_block) fetch_flags = GetFetchFlags(pfrom);
+        }
+
+        if (!ephemeral_state.IsValid()) {
+            if (ephemeral_state.IsInvalid()) {
+                MaybePunishNodeForBlock(pfrom.GetId(), ephemeral_state,
+                                        via_compact_block,
+                                        "invalid ephemeral drivechain header");
+            }
+            return;
+        }
+        if (request_block) {
+            std::vector<CInv> request{
+                CInv(MSG_BLOCK | fetch_flags, requested_hash)};
+            m_connman.PushMessage(
+                &pfrom, msgMaker.Make(NetMsgType::GETDATA, request));
+            LogPrint(BCLog::NET,
+                     "requesting ephemeral drivechain full block %s from peer=%d\n",
+                     requested_hash.GetHex(), pfrom.GetId());
+        } else if (request_more_headers) {
+            m_connman.PushMessage(
+                &pfrom, msgMaker.Make(NetMsgType::GETHEADERS,
+                                      next_locator, uint256{}));
+        }
+        return;
+    }
+
     // If we are already too far ahead of where we want to be on headers, discard
     //   the received headers. We can still get ahead by up to a single maximum-sized
     //   headers message here, but never further, so that's fine.
@@ -2205,8 +2375,10 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, const Peer& peer,
     if (!m_chainman.ProcessNewBlockHeaders(headers, state, m_chainparams, &pindexLast, &all_duplicate)) {
         if (state.IsInvalid()) {
             MaybePunishNodeForBlock(pfrom.GetId(), state, via_compact_block, "invalid header received");
-            return;
         }
+        // A non-invalid failure is a local/transient admission failure. Never
+        // continue to the pindexLast assertions or peer-availability updates.
+        return;
     }
 
     {
@@ -2595,10 +2767,139 @@ void PeerManagerImpl::ProcessGetCFCheckPt(CNode& peer, CDataStream& vRecv)
 void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlock>& block, bool force_processing)
 {
     bool new_block{false};
-    m_chainman.ProcessNewBlock(m_chainparams, block, force_processing, &new_block);
-    if (new_block) {
+    DrivechainBlockAdmissionInfo drivechain_info;
+    // Peer-supplied cache misses may use only the background-authenticated M7
+    // index. Trusted ConnectTip, reindex, RPC submission, and local mining may
+    // perform live parent discovery when their edge is not already cached.
+    DrivechainUntrustedParentAdmission untrusted_parent_admission{
+        /*enable=*/true};
+    const bool accepted = m_chainman.ProcessNewBlock(
+        m_chainparams, block, force_processing, &new_block,
+        &drivechain_info);
+    if (accepted && new_block) {
         node.m_last_block_time = GetTime<std::chrono::seconds>();
-    } else {
+    }
+
+    // Header-only chains carry no BMM evidence. Drivechain synchronization
+    // therefore advances one authenticated full block at a time. Admission of
+    // a block already received through another peer is still enough to advance
+    // this peer. Conversely, a failed requested block (including retryable
+    // PARENT_REJECTED/UNAVAILABLE) must release its pending slot so a fresh
+    // candidate for the same authenticated predecessor can be announced.
+    if (m_chainparams.GetConsensus().drivechain_slot.has_value()) {
+        CBlockLocator next_locator;
+        bool request_next{false};
+        bool discourage_repeated_parent_rejection{false};
+        {
+            LOCK(cs_main);
+            CNodeState* state = State(node.GetId());
+            const CBlockIndex* index = m_chainman.m_blockman.LookupBlockIndex(block->GetHash());
+            const bool matches_pending = state &&
+                state->pending_drivechain_header.has_value() &&
+                state->pending_drivechain_header->GetHash() == block->GetHash();
+            const bool authenticated = index && index->nHeight > 0 &&
+                IsDrivechainHeaderAuthenticated(index, m_chainparams.GetConsensus());
+
+            if (state && matches_pending && authenticated) {
+                state->pending_drivechain_header.reset();
+                state->pending_drivechain_predecessor = nullptr;
+                state->pending_drivechain_deadline = 0us;
+                state->drivechain_rejected_parent.SetNull();
+                state->drivechain_rejected_successor.SetNull();
+                state->drivechain_parent_rejected_strikes = 0;
+                state->drivechain_retry_after = 0us;
+                state->drivechain_retry_predecessor = nullptr;
+                next_locator = m_chainman.ActiveChain().GetLocator(index);
+                request_next = true;
+            } else if (state && matches_pending && !authenticated) {
+                const CBlockIndex* resume =
+                    state->pending_drivechain_predecessor;
+                state->pending_drivechain_header.reset();
+                state->pending_drivechain_predecessor = nullptr;
+                state->pending_drivechain_deadline = 0us;
+                const auto bmm_status = drivechain_info.bmm_status;
+                if (bmm_status == DrivechainBmmStatus::PARENT_REJECTED) {
+                    const unsigned int strikes =
+                        NextDrivechainParentRejectedStrikeCount(
+                            state->drivechain_rejected_parent,
+                            state->drivechain_rejected_successor,
+                            state->drivechain_parent_rejected_strikes,
+                            drivechain_info.parent_hash,
+                            drivechain_info.successor_hash);
+                    state->drivechain_rejected_parent =
+                        drivechain_info.parent_hash;
+                    state->drivechain_rejected_successor =
+                        drivechain_info.successor_hash;
+                    state->drivechain_parent_rejected_strikes = strikes;
+                    if (strikes == 0) {
+                        // A rejection without an authenticated exact edge is
+                        // not deterministic enough to blame on the peer.
+                        state->drivechain_retry_after =
+                            GetTime<std::chrono::microseconds>() +
+                            DRIVECHAIN_PARENT_UNAVAILABLE_BACKOFF;
+                        state->drivechain_retry_predecessor = resume;
+                    } else if (strikes >=
+                               MAX_DRIVECHAIN_PARENT_REJECTED_STRIKES) {
+                        LogPrintf(
+                            "Peer=%d repeatedly supplied child blocks rejected by active BIP301 edge %s->%s; discouraging address\n",
+                            node.GetId(),
+                            drivechain_info.parent_hash.GetHex(),
+                            drivechain_info.successor_hash.GetHex());
+                        // Retain a backoff for noban/manual peers, which the
+                        // standard discouragement path intentionally exempts.
+                        state->drivechain_retry_after =
+                            GetTime<std::chrono::microseconds>() +
+                            DRIVECHAIN_PARENT_REJECTED_BACKOFF;
+                        state->drivechain_retry_predecessor = resume;
+                        discourage_repeated_parent_rejection = true;
+                    } else {
+                        state->drivechain_retry_after =
+                            GetTime<std::chrono::microseconds>() +
+                            DRIVECHAIN_PARENT_REJECTED_BACKOFF;
+                        state->drivechain_retry_predecessor = resume;
+                        LogPrint(
+                            BCLog::NET,
+                            "backing off peer=%d after child block rejection on active BIP301 edge %s->%s\n",
+                            node.GetId(),
+                            drivechain_info.parent_hash.GetHex(),
+                            drivechain_info.successor_hash.GetHex());
+                    }
+                } else if (bmm_status == DrivechainBmmStatus::UNAVAILABLE) {
+                    // Availability failures are never peer faults. A short
+                    // retry delay prevents a local parent outage from turning
+                    // into a tight P2P/RPC loop.
+                    state->drivechain_retry_after =
+                        GetTime<std::chrono::microseconds>() +
+                        DRIVECHAIN_PARENT_UNAVAILABLE_BACKOFF;
+                    state->drivechain_retry_predecessor = resume;
+                } else if (resume) {
+                    // The rejected header itself is not a safe synchronization
+                    // point. Resume from its authenticated predecessor.
+                    next_locator = m_chainman.ActiveChain().GetLocator(resume);
+                    request_next = true;
+                }
+            }
+        }
+        if (request_next) {
+            const CNetMsgMaker msg_maker(node.GetCommonVersion());
+            m_connman.PushMessage(
+                &node, msg_maker.Make(NetMsgType::GETHEADERS, next_locator, uint256{}));
+        }
+        if (discourage_repeated_parent_rejection) {
+            // Use the standard peer-misbehavior path so noban, manual, and
+            // local-peer exceptions remain exactly the same as elsewhere.
+            // Normal remote peers are disconnected and their address enters
+            // the discouragement filter, surviving reconnect attempts.
+            Misbehaving(
+                node.GetId(), DISCOURAGEMENT_THRESHOLD,
+                "repeated deterministic BIP301 parent-edge rejection");
+            if (PeerRef peer = GetPeerRef(node.GetId())) {
+                (void)MaybeDiscourageAndDisconnect(node, *peer);
+            }
+        }
+    }
+
+    if (!(accepted && new_block)) {
         LOCK(cs_main);
         mapBlockSource.erase(block->GetHash());
     }
@@ -3561,6 +3862,15 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         CBlockHeaderAndShortTxIDs cmpctblock;
         vRecv >> cmpctblock;
 
+        if (m_chainparams.GetConsensus().drivechain_slot.has_value()) {
+            // Compact-block reconstruction depends on an indexed header. A
+            // native drivechain deliberately has no such entry until complete
+            // BMM authentication, so request the ordinary full block instead.
+            return ProcessHeadersMessage(
+                pfrom, *peer, {cmpctblock.header},
+                /*via_compact_block=*/true);
+        }
+
         bool received_new_header = false;
 
         {
@@ -3892,6 +4202,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // Always process the block if we requested it, since we may
             // need it even when it's not a candidate for a new best tip.
             forceProcessing = IsBlockRequested(hash);
+            if (m_chainparams.GetConsensus().drivechain_slot.has_value()) {
+                const CNodeState* state = State(pfrom.GetId());
+                forceProcessing = forceProcessing ||
+                    (state && state->pending_drivechain_header.has_value() &&
+                     state->pending_drivechain_header->GetHash() == hash);
+            }
             RemoveBlockRequest(hash);
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
@@ -4699,6 +5015,59 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
 
         CNodeState &state = *State(pto->GetId());
 
+        if (state.drivechain_retry_after != 0us &&
+            current_time >= state.drivechain_retry_after) {
+            const CBlockIndex* resume =
+                state.drivechain_retry_predecessor;
+            state.drivechain_retry_after = 0us;
+            state.drivechain_retry_predecessor = nullptr;
+            if (resume) {
+                m_connman.PushMessage(
+                    pto, msgMaker.Make(
+                        NetMsgType::GETHEADERS,
+                        m_chainman.ActiveChain().GetLocator(resume),
+                        uint256{}));
+            }
+        }
+
+        // Ephemeral native-drivechain block requests intentionally do not
+        // enter the ordinary block-index/in-flight machinery. Resolve a
+        // request immediately when another peer authenticated the block, and
+        // disconnect a silent peer after a fixed deadline so it cannot pin
+        // this connection's one-header admission slot indefinitely.
+        if (state.pending_drivechain_header.has_value()) {
+            const uint256 pending_hash =
+                state.pending_drivechain_header->GetHash();
+            const CBlockIndex* authenticated_elsewhere =
+                m_chainman.m_blockman.LookupBlockIndex(pending_hash);
+            if (authenticated_elsewhere &&
+                IsDrivechainHeaderAuthenticated(
+                    authenticated_elsewhere, consensusParams)) {
+                state.pending_drivechain_header.reset();
+                state.pending_drivechain_predecessor = nullptr;
+                state.pending_drivechain_deadline = 0us;
+                state.drivechain_rejected_parent.SetNull();
+                state.drivechain_rejected_successor.SetNull();
+                state.drivechain_parent_rejected_strikes = 0;
+                state.drivechain_retry_after = 0us;
+                state.drivechain_retry_predecessor = nullptr;
+                UpdateBlockAvailability(pto->GetId(), pending_hash);
+                m_connman.PushMessage(
+                    pto, msgMaker.Make(
+                        NetMsgType::GETHEADERS,
+                        m_chainman.ActiveChain().GetLocator(
+                            authenticated_elsewhere),
+                        uint256{}));
+            } else if (state.pending_drivechain_deadline != 0us &&
+                       current_time >= state.pending_drivechain_deadline) {
+                LogPrintf(
+                    "Timeout downloading ephemeral drivechain block %s from peer=%d, disconnecting\n",
+                    pending_hash.ToString(), pto->GetId());
+                pto->fDisconnect = true;
+                return true;
+            }
+        }
+
         // Start block sync
         if (pindexBestHeader == nullptr)
             pindexBestHeader = m_chainman.ActiveChain().Tip();
@@ -4706,7 +5075,8 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         int64_t headers_ahead = pindexBestHeader->nHeight - m_chainman.ActiveHeight();
         // ELEMENTS: Only download if our headers aren't "too far ahead" of our blocks.
         bool got_enough_headers = node::fTrimHeaders && (headers_ahead >= node::nHeaderDownloadBuffer);
-        if (!state.fSyncStarted && !pto->fClient && !fImporting && !fReindex && !got_enough_headers) {
+        if (state.drivechain_retry_after == 0us &&
+            !state.fSyncStarted && !pto->fClient && !fImporting && !fReindex && !got_enough_headers) {
             // Only actively request headers from a single peer, unless we're close to today.
             if ((nSyncStarted == 0 && fFetch) || pindexBestHeader->GetBlockTime() > GetAdjustedTime() - 24 * 60 * 60) {
                 state.fSyncStarted = true;

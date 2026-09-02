@@ -4,7 +4,8 @@ libdir=@libdir@
 includedir=@includedir@
 
 Name: @PACKAGE_NAME@ consensus library
-Description: Library for the Bitcoin consensus protocol.
+Description: Library for the Elements consensus protocol.
 Version: @PACKAGE_VERSION@
-Libs: -L${libdir} -lbitcoinconsensus
+Libs: -L${libdir} -lelementsconsensus
+Libs.private: @USDD_SP1_VERIFIER_PKGCONFIG_LIBS@ @ECX_SP1_VERIFIER_PKGCONFIG_LIBS@
 Cflags: -I${includedir}

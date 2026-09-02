@@ -8,15 +8,25 @@
 
 #include <script/standard.h>
 
+#include <asset.h>
+#include <consensus/amount.h>
+#include <mainchainrpc.h>
+
 #include <any>
+#include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 //! Default value for -daemon option
 static constexpr bool DEFAULT_DAEMON = false;
 //! Default value for -daemonwait option
 static constexpr bool DEFAULT_DAEMONWAIT = false;
+//! Default liveness-only BIP301 bid submitted to the local enforcer wallet.
+static constexpr CAmount DEFAULT_DRIVECHAIN_BMM_BID{1000};
 
 class ArgsManager;
 namespace interfaces {
@@ -47,6 +57,43 @@ void InitLogging(const ArgsManager& args);
 //!Parameter interaction: change current parameters depending on various rules
 void InitParameterInteraction(ArgsManager& args);
 
+/** Native drivechains forbid DNS on synchronous consensus RPC paths. */
+bool IsMainchainRPCHostAllowed(const std::string& host, bool native_drivechain);
+
+/** Forbid non-loopback JSON-RPC listeners on the native chain. */
+bool ValidateNativeDrivechainRpcServerConfig(
+    const ArgsManager& args, std::string* error = nullptr);
+
+/** Validate and select max(configured bid, candidate transaction fees). */
+bool ComputeDrivechainBmmBid(CAmount configured_bid,
+                             CAmount sidechain_fees,
+                             CAmount& selected_bid,
+                             std::string* error = nullptr);
+
+/** Strictly parse a positive, MoneyRange-safe BIP301 bid. */
+bool ParseDrivechainBmmBid(const std::string& value,
+                           CAmount& bid,
+                           std::string* error = nullptr);
+
+/**
+ * Submit one already-validated blinded BIP300 M6 to the configured enforcer.
+ *
+ * This is a liveness-only transport helper. Callers must first authenticate
+ * the corresponding, confirmed Elements burn; an enforcer response is never
+ * consensus evidence.
+ */
+bool SubmitDrivechainWithdrawalBundle(int sidechain_slot,
+                                      const std::vector<unsigned char>& bundle,
+                                      std::string* response = nullptr,
+                                      std::string* error = nullptr);
+
+/** Resolve -feeasset, optionally enforcing the immutable production asset. */
+bool ResolveElementsFeeAsset(const std::optional<std::string>& configured,
+                             const CAsset& pegged_asset,
+                             bool enforce_canonical,
+                             CAsset& resolved,
+                             std::string* error = nullptr);
+
 /** Initialize bitcoin core: Basic context setup.
  *  @note This can be done before daemonization. Do not call Shutdown() if this function fails.
  *  @pre Parameters should be parsed and config file should be read.
@@ -57,7 +104,7 @@ bool AppInitBasicSetup(const ArgsManager& args);
  * @note This can be done before daemonization. Do not call Shutdown() if this function fails.
  * @pre Parameters should be parsed and config file should be read, AppInitBasicSetup should have been called.
  */
-bool AppInitParameterInteraction(const ArgsManager& args);
+bool AppInitParameterInteraction(ArgsManager& args);
 /**
  * Initialization sanity checks: ecc init, sanity checks, dir lock.
  * @note This can be done before daemonization. Do not call Shutdown() if this function fails.

@@ -29,6 +29,11 @@ struct DrivechainWithdrawalBundle {
     uint256 m6id;
 };
 
+/** Pure native inputless M6 codec; does not authorize a burn or broadcast. */
+DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
+    CAmount amount, CAmount mainchain_fee, const CScript& payout_script,
+    const COutPoint& withdrawal_outpoint, uint32_t sidechain_block_height);
+
 /** Build the exact ECX-bound BIP300 M6 bytes for a confirmed withdrawal. */
 DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
     CAmount amount,

@@ -1556,33 +1556,80 @@ static RPCHelpMan getsimplicityinfo()
 static RPCHelpMan getbmmconsensuscontext()
 {
     return RPCHelpMan{"getbmmconsensuscontext",
-        "Return the authenticated BMM parent clock used by TapSimplicity execution.\n",
+        "Return the active sidechain tip's authenticated prior-parent context.\n"
+        "Native Alpha uses its validated P-to-Q drivechain anchor; other networks use\n"
+        "the ECX BMM state coin. This does not activate ECX or choose a future block's parent.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::NUM, "sidechainheight", "Active sidechain height"},
             {RPCResult::Type::STR_HEX, "sidechainblockhash", "Active sidechain block hash"},
+            {RPCResult::Type::STR, "contextsource", "native-drivechain-anchor or ecx-bmm-state"},
             {RPCResult::Type::OBJ, "bmm", "Authenticated prior-parent context", {
                 {RPCResult::Type::BOOL, "authenticated", "Always true for this fail-closed RPC"},
                 {RPCResult::Type::NUM, "parentheight", "BMM-authenticated parent height"},
                 {RPCResult::Type::NUM, "parentmtp", "BMM-authenticated parent median time past"},
                 {RPCResult::Type::STR_HEX, "parentblockhash", "BMM-authenticated parent block hash"},
             }},
-            {RPCResult::Type::NUM, "sourceparentheight", "Approval height committed by the active header"},
+            {RPCResult::Type::NUM, "sourceparentheight", "Parent height of the returned active-tip context"},
         }},
         RPCExamples{HelpExampleCli("getbmmconsensuscontext", "") + HelpExampleRpc("getbmmconsensuscontext", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    LOCK(cs_main);
-    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-    if (!tip) throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
+    const Consensus::Params& consensus = Params().GetConsensus();
     std::string error;
-    drivechain::BmmL1State state;
     drivechain::BmmParentContext parent_context;
-    if (!drivechain::GetEffectiveBmmState(
-            chainman.ActiveChainstate().CoinsTip(), tip, state, error) ||
-        !drivechain::GetBmmParentContext(state, parent_context, error)) {
-        throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "authenticated BMM context is unavailable" : error);
+    std::optional<DrivechainAnchor> native_anchor;
+    uint256 sidechain_hash;
+    int sidechain_height{0};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+        if (!tip) throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
+        sidechain_hash = tip->GetBlockHash();
+        sidechain_height = tip->nHeight;
+        if (consensus.drivechain_slot.has_value()) {
+            // This projection rejects genesis, header-only, failed and malformed
+            // indexes. The persisted anchor is not by itself a current-chain
+            // authentication: recheck its P -> Q edge below, without cs_main.
+            if (!GetPriorActiveBmmParentCheckpoint(tip, consensus).has_value()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip has no authenticated native BMM anchor");
+            }
+            native_anchor = tip->m_drivechain_anchor;
+        } else {
+            drivechain::BmmL1State state;
+            if (!drivechain::GetEffectiveBmmState(
+                    chainman.ActiveChainstate().CoinsTip(), tip, state, error) ||
+                !drivechain::GetBmmParentContext(state, parent_context, error)) {
+                throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "authenticated BMM context is unavailable" : error);
+            }
+        }
+    }
+    if (native_anchor) {
+        // Parent RPC/replay must never run while holding a sidechain consensus
+        // lock. Fail closed on unavailable/orphaned anchors, replay-generation
+        // changes, or a sidechain reorg racing this read-only RPC.
+        if (!WarmDrivechainParentState(&error)) {
+            throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "native BMM parent replay is unavailable" : error);
+        }
+        const uint64_t epoch = GetDrivechainParentReplayEpoch();
+        if (epoch == 0 || IsDrivechainAnchorActive(
+                *native_anchor, *consensus.drivechain_slot, &error) != DrivechainAnchorStatus::ACTIVE) {
+            throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "native BMM anchor is not active" : error);
+        }
+        {
+            LOCK(cs_main);
+            const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+            if (GetDrivechainParentReplayEpoch() != epoch || tip == nullptr ||
+                tip->GetBlockHash() != sidechain_hash ||
+                tip->m_drivechain_anchor != native_anchor ||
+                !GetPriorActiveBmmParentCheckpoint(tip, consensus).has_value()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "BMM context changed during authentication; retry");
+            }
+        }
+        parent_context.block_hash = native_anchor->parent_block_hash;
+        parent_context.height = native_anchor->parent_height;
+        parent_context.median_time_past = native_anchor->parent_median_time_past;
     }
     UniValue parent(UniValue::VOBJ);
     parent.pushKV("authenticated", true);
@@ -1590,8 +1637,9 @@ static RPCHelpMan getbmmconsensuscontext()
     parent.pushKV("parentmtp", parent_context.median_time_past);
     parent.pushKV("parentblockhash", parent_context.block_hash.GetHex());
     UniValue result(UniValue::VOBJ);
-    result.pushKV("sidechainheight", static_cast<uint64_t>(tip->nHeight));
-    result.pushKV("sidechainblockhash", tip->GetBlockHash().GetHex());
+    result.pushKV("sidechainheight", static_cast<uint64_t>(sidechain_height));
+    result.pushKV("sidechainblockhash", sidechain_hash.GetHex());
+    result.pushKV("contextsource", native_anchor ? "native-drivechain-anchor" : "ecx-bmm-state");
     result.pushKV("bmm", parent);
     result.pushKV("sourceparentheight", parent_context.height);
     return result;

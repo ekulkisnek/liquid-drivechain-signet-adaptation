@@ -15,6 +15,11 @@ AM_LIBTOOLFLAGS = --preserve-dup-deps
 PTHREAD_FLAGS = $(PTHREAD_CFLAGS) $(PTHREAD_LIBS)
 EXTRA_LIBRARIES =
 
+# AC_ARG_VAR records the reviewed release floor at configure time. Export it
+# so direct `make -C src` builds and C/C++ dependency build scripts cannot
+# silently fall back to the host SDK's deployment target.
+export MACOSX_DEPLOYMENT_TARGET
+
 BITCOIN_INCLUDES=-I$(builddir) -I$(srcdir)/$(MINISKETCH_INCLUDE_DIR_INT) -I$(srcdir)/secp256k1/include -I$(srcdir)/$(UNIVALUE_INCLUDE_DIR_INT) -I$(srcdir)/$(ELEMENTS_SIMPLICITY_INCLUDE_DIR_INT) $(BDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(LEVELDB_CPPFLAGS)
 
 LIBBITCOIN_NODE=libbitcoin_node.a
@@ -109,7 +114,10 @@ if BUILD_BITCOIN_UTIL
 endif
 
 if BUILD_BITCOIN_CHAINSTATE
-  bin_PROGRAMS += bitcoin-chainstate
+  # This utility is hardcoded to Bitcoin mainnet consensus for upstream kernel
+  # tests. Keep it buildable for CI, but never install or ship it as an Elements
+  # production program.
+  noinst_PROGRAMS += bitcoin-chainstate
 endif
 
 .PHONY: FORCE check-symbols check-security
@@ -160,6 +168,9 @@ BITCOIN_CORE_H = \
   ecx_bond_v2.h \
   ecxProductionActivationProfile.inc \
   drivechain_peg.h \
+  drivechain_parent_replay.h \
+  elements_drivechain_identity.h \
+  usdd_sp1_verifier_identity.h \
   dynafed.h \
   external_signer.h \
   flatfile.h \
@@ -205,6 +216,7 @@ BITCOIN_CORE_H = \
   node/coinstats.h \
   node/context.h \
   node/drivechain_withdrawal_bundle.h \
+  node/drivechain_withdrawal_journal.h \
   node/ecx_deployment_identity.h \
   node/miner.h \
   node/minisketchwrapper.h \
@@ -368,6 +380,7 @@ libbitcoin_node_a_SOURCES = \
   drivechain_bmm.cpp \
   ecx_exchange_state.cpp \
   drivechain_peg.cpp \
+  drivechain_parent_replay.cpp \
   flatfile.cpp \
   httprpc.cpp \
   httpserver.cpp \
@@ -377,7 +390,9 @@ libbitcoin_node_a_SOURCES = \
   index/coinstatsindex.cpp \
   index/txindex.cpp \
   init.cpp \
+  drivechain_rpc_security.cpp \
   mainchainrpc.cpp \
+  mainchainrpc_ecx.cpp \
   mapport.cpp \
   net.cpp \
   net_processing.cpp \
@@ -387,6 +402,7 @@ libbitcoin_node_a_SOURCES = \
   node/coin.cpp \
   node/coinstats.cpp \
   node/context.cpp \
+  node/drivechain_withdrawal_journal.cpp \
   node/ecx_deployment_identity.cpp \
   node/interfaces.cpp \
   node/miner.cpp \
@@ -453,6 +469,7 @@ libbitcoin_wallet_a_SOURCES = \
   wallet/crypter.cpp \
   wallet/db.cpp \
   wallet/dump.cpp \
+  wallet/drivechain_withdrawal.cpp \
   wallet/external_signer_scriptpubkeyman.cpp \
   wallet/feebumper.cpp \
   wallet/fees.cpp \
@@ -564,6 +581,8 @@ libelements_consensus_a_SOURCES = \
   arith_uint256.cpp \
   arith_uint256.h \
   asset.cpp \
+  drivechain_withdrawal.cpp \
+  drivechain_withdrawal.h \
   consensus/amount.h \
   consensus/merkle.cpp \
   consensus/merkle.h \
@@ -592,6 +611,8 @@ libelements_consensus_a_SOURCES = \
   script/bitcoinconsensus.cpp \
   script/interpreter.cpp \
   script/interpreter.h \
+  script/usdd_sp1_annex.h \
+  script/usdd_sp1_verifier_ffi.h \
   script/script.cpp \
   script/script.h \
   script/script_error.cpp \
@@ -601,6 +622,8 @@ libelements_consensus_a_SOURCES = \
   tinyformat.h \
   uint256.cpp \
   uint256.h \
+  usdd_sp1_resources.h \
+  usdd_withdrawal_accumulator.h \
   util/strencodings.cpp \
   util/strencodings.h \
   version.h
@@ -735,7 +758,7 @@ elements_bin_ldadd = \
   $(LIBLEVELDB_SSE42) \
   $(LIBMEMENV) \
   $(LIBSECP256K1) \
-  $(LIBELEMENTSSIMPLICITY)
+  $(ELEMENTS_SIMPLICITY_LINK_LIBS)
 
 elements_bin_ldadd += $(BDB_LIBS) $(MINIUPNPC_LIBS) $(NATPMP_LIBS) $(EVENT_PTHREADS_LIBS) $(EVENT_LIBS) $(ZMQ_LIBS) $(SQLITE_LIBS)
 elements_bin_ldadd += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
@@ -788,7 +811,7 @@ elements_tx_LDADD = \
   $(LIBBITCOIN_CONSENSUS) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBSECP256K1) \
-  $(LIBELEMENTSSIMPLICITY)
+  $(ELEMENTS_SIMPLICITY_LINK_LIBS)
 elements_tx_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 #
 
@@ -807,7 +830,7 @@ elements_wallet_LDADD = \
   $(LIBBITCOIN_CONSENSUS) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBSECP256K1) \
-  $(LIBELEMENTSSIMPLICITY) \
+  $(ELEMENTS_SIMPLICITY_LINK_LIBS) \
   $(BDB_LIBS) \
   $(EVENT_LIBS) \
   $(LIBLEVELDB) \
@@ -838,7 +861,7 @@ elements_util_LDADD = \
   $(LIBBITCOIN_CONSENSUS) \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBSECP256K1) \
-  $(LIBELEMENTSSIMPLICITY)
+  $(ELEMENTS_SIMPLICITY_LINK_LIBS)
 elements_util_LDADD += $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
 #
 
@@ -935,8 +958,10 @@ bitcoin_chainstate_SOURCES += \
   common/bloom.cpp \
   confidential_validation.cpp \
   dynafed.cpp \
+  drivechain_parent_replay.cpp \
   issuance.cpp \
   mainchainrpc.cpp \
+  mainchainrpc_ecx.cpp \
   merkleblock.cpp \
   pegins.cpp \
   primitives/bitcoin/block.cpp \
@@ -962,7 +987,7 @@ bitcoin_chainstate_LDADD = \
   $(LIBBITCOIN_CRYPTO) \
   $(LIBUNIVALUE) \
   $(LIBSECP256K1) \
-  $(LIBELEMENTSSIMPLICITY) \
+  $(ELEMENTS_SIMPLICITY_LINK_LIBS) \
   $(LIBLEVELDB) \
   $(LIBLEVELDB_SSE42) \
   $(LIBMEMENV)
@@ -982,10 +1007,31 @@ if BUILD_BITCOIN_LIBS
 include_HEADERS = script/bitcoinconsensus.h
 libelementsconsensus_la_SOURCES = support/cleanse.cpp $(crypto_libbitcoin_crypto_base_a_SOURCES) $(libelements_consensus_a_SOURCES)
 
-libelementsconsensus_la_LDFLAGS = $(AM_LDFLAGS) -no-undefined $(RELDFLAGS)
-libelementsconsensus_la_LIBADD = $(LIBSECP256K1) $(LIBELEMENTSSIMPLICITY) $(ECX_SP1_VERIFIER_LIB) $(ECX_SP1_VERIFIER_SYSTEM_LIBS)
+libelementsconsensus_la_LDFLAGS = $(AM_LDFLAGS) -no-undefined $(RELDFLAGS) $(USDD_SP1_VERIFIER_SHARED_LDFLAGS) $(ECX_SP1_VERIFIER_SHARED_LDFLAGS)
+libelementsconsensus_la_LIBADD = $(LIBSECP256K1) $(LIBELEMENTSSIMPLICITY)
 libelementsconsensus_la_CPPFLAGS = $(AM_CPPFLAGS) -I$(builddir)/obj -I$(srcdir)/secp256k1/include -I$(srcdir)/$(ELEMENTS_SIMPLICITY_INCLUDE_DIR_INT) -DBUILD_BITCOIN_INTERNAL
 libelementsconsensus_la_CXXFLAGS = $(AM_CXXFLAGS) $(PIE_FLAGS)
+
+consensussidecardir = $(libdir)
+nodist_consensussidecar_DATA =
+if WITH_USDD_SP1_VERIFIER
+nodist_consensussidecar_DATA += \
+  libelements-usdd-sp1-verifier.a \
+  libelements-secp256k1.a
+
+libelements-usdd-sp1-verifier.a: $(USDD_SP1_VERIFIER_ARCHIVE)
+	$(AM_V_GEN)$(INSTALL_DATA) "$<" "$@"
+
+libelements-secp256k1.a: $(LIBSECP256K1)
+	$(AM_V_GEN)$(INSTALL_DATA) "$(builddir)/secp256k1/.libs/libsecp256k1.a" "$@"
+endif
+
+if WITH_ECX_SP1_VERIFIER
+nodist_consensussidecar_DATA += libelements-ecx-sp1-verifier.a
+
+libelements-ecx-sp1-verifier.a: $(ECX_SP1_VERIFIER_LIB)
+	$(AM_V_GEN)$(INSTALL_DATA) "$<" "$@"
+endif
 
 endif
 #
@@ -997,6 +1043,13 @@ CTAES_DIST += crypto/ctaes/README.md
 CTAES_DIST += crypto/ctaes/test.c
 
 CLEANFILES = $(EXTRA_LIBRARIES)
+
+if WITH_USDD_SP1_VERIFIER
+CLEANFILES += libelements-usdd-sp1-verifier.a libelements-secp256k1.a
+endif
+if WITH_ECX_SP1_VERIFIER
+CLEANFILES += libelements-ecx-sp1-verifier.a
+endif
 
 CLEANFILES += *.gcda *.gcno
 CLEANFILES += compat/*.gcda compat/*.gcno

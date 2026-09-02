@@ -3,27 +3,32 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <assetsdir.h>
+#include <node/drivechain_withdrawal_bundle.h>
 #include <bech32.h>
 #include <block_proof.h>
 #include <core_io.h>
 #include <crypto/sha256.h>
 #include <deploymentstatus.h>
 #include <drivechain_peg.h>
+#include <drivechain_withdrawal.h>
 #include <dynafed.h>
 #include <hash.h>
 #include <issuance.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
-#include <node/drivechain_withdrawal_bundle.h>
+#include <policy/feerate.h>
+#include <policy/policy.h>
 #include <rpc/rawtransaction_util.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <script/generic.hpp>
 #include <script/pegins.h>
+#include <script/standard.h>
 #include <secp256k1.h>
 #include <streams.h>
 #include <util/moneystr.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 #include <util/system.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
@@ -680,6 +685,11 @@ RPCHelpMan getpeginaddress()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    if (Params().GetConsensus().drivechain_slot.has_value()) {
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND,
+                           "Legacy federated peg-ins are disabled on a Drivechain network; use importdrivechaindeposit");
+    }
+
     std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
     if (!wallet) return NullUniValue;
     CWallet* const pwallet = wallet.get();
@@ -958,7 +968,246 @@ RPCHelpMan initpegoutwallet()
     };
 }
 
-RPCHelpMan sendtomainchain_base()
+RPCHelpMan sendtomainchain_drivechain()
+{
+    return RPCHelpMan{"sendtomainchain",
+                "\nIrreversibly burns the native pegged asset on Elements as the first step "
+                "of a BIP300 withdrawal. The burn must confirm before anybody calls "
+                "submitdrivechainwithdrawal to propose its exact blinded M6.\n"
+                + wallet::HELP_REQUIRING_PASSPHRASE,
+                {
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination address on Bitcoin mainchain, or hex:<scriptPubKey>"},
+                    {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The net amount paid to the Bitcoin destination"},
+                    {"subtractfeefromamount", RPCArg::Type::BOOL, RPCArg::Default{false}, "Must be false. The Elements transaction fee is separate from the irreversible burn."},
+                    {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, return extra information about the transaction."},
+                    {"mainchainfee", RPCArg::Type::AMOUNT, RPCArg::Default{0}, "Bitcoin miner fee committed by this withdrawal. The burned amount is amount + mainchainfee."},
+                },
+                {
+                    RPCResult{"if verbose is not set or set to false",
+                        RPCResult::Type::STR_HEX, "txid", "Transaction ID of the resulting sidechain transaction",
+                    },
+                    RPCResult{"if verbose is set to true",
+                        RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::STR_HEX, "txid", "The transaction id."},
+                            {RPCResult::Type::NUM, "withdrawal_vout", "The canonical unspendable burn output."},
+                            {RPCResult::Type::STR_AMOUNT, "burn_amount", "Total native pegged asset destroyed."},
+                            {RPCResult::Type::STR_AMOUNT, "payout_amount", "Net Bitcoin payout encoded by the burn."},
+                            {RPCResult::Type::STR_AMOUNT, "mainchain_fee", "Bitcoin miner fee encoded by the burn."},
+                            {RPCResult::Type::STR, "status", "awaiting_confirmation"},
+                            {RPCResult::Type::STR, "fee_reason", "The Elements transaction fee reason."}
+                        },
+                    },
+                },
+                RPCExamples{
+                    HelpExampleCli("sendtomainchain", "\"tb1q...\" 0.1 false true 0.00001")
+            + HelpExampleRpc("sendtomainchain", "\"tb1q...\" 0.1 false true 0.00001")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    if (!consensus.drivechain_slot.has_value()) {
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND,
+                           "Native BIP300 withdrawals are not enabled on this network");
+    }
+    if (!consensus.DrivechainWithdrawalValidationEnabled()) {
+        // Fail before wallet lookup, wallet locking, transaction construction,
+        // or broadcast on any identity without exact M3/M4/M6 replay.
+        throw JSONRPCError(
+            RPC_METHOD_NOT_FOUND,
+            "Native BIP300 withdrawals are disabled on this drivechain: "
+            "full M3/M4/M6 withdrawal-vote and CTIP-decrease consensus validation is not implemented");
+    }
+
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+
+    LOCK(pwallet->cs_wallet);
+    EnsureWalletIsUnlocked(*pwallet);
+
+    const std::string destination_arg = request.params[0].get_str();
+    CScript destination_script;
+    if (destination_arg.rfind("hex:", 0) == 0) {
+        const std::string script_hex = destination_arg.substr(4);
+        if (!IsHex(script_hex) || script_hex.empty() || script_hex.size() % 2 != 0) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                               "hex: destination must contain a nonempty, even-length hexadecimal scriptPubKey");
+        }
+        const std::vector<unsigned char> bytes = ParseHex(script_hex);
+        destination_script = CScript(bytes.begin(), bytes.end());
+    } else {
+        std::string address_error;
+        const CTxDestination parent_address =
+            DecodeParentDestination(destination_arg, address_error);
+        if (!IsValidDestination(parent_address)) {
+            throw JSONRPCError(
+                RPC_INVALID_ADDRESS_OR_KEY,
+                strprintf("Invalid Bitcoin address: %s", address_error));
+        }
+        destination_script = GetScriptForDestination(parent_address);
+    }
+    if (destination_script.empty() ||
+        destination_script.size() >
+            drivechain::NATIVE_WITHDRAWAL_MAX_DESTINATION_SIZE) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                           "Bitcoin destination script must be between 1 and 128 bytes");
+    }
+    TxoutType destination_type;
+    if (!IsStandard(destination_script, destination_type)) {
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Bitcoin destination must be a currently standard script");
+    }
+    switch (destination_type) {
+    case TxoutType::PUBKEY:
+    case TxoutType::PUBKEYHASH:
+    case TxoutType::SCRIPTHASH:
+    case TxoutType::MULTISIG:
+    case TxoutType::WITNESS_V0_SCRIPTHASH:
+    case TxoutType::WITNESS_V0_KEYHASH:
+    case TxoutType::WITNESS_V1_TAPROOT:
+        break;
+    default:
+        throw JSONRPCError(
+            RPC_INVALID_ADDRESS_OR_KEY,
+            "Bitcoin destination must be a recognized, currently spendable standard script; data outputs, treasury scripts, unknown witness versions, and nonstandard scripts are forbidden");
+    }
+
+    const CAmount payout_amount = AmountFromValue(request.params[1], true);
+    if (payout_amount <= 0 || !MoneyRange(payout_amount)) {
+        throw JSONRPCError(RPC_TYPE_ERROR, "Invalid withdrawal payout amount");
+    }
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    const bool witness_destination = destination_script.IsWitnessProgram(
+        witness_version, witness_program);
+    const size_t parent_output_size = ::GetSerializeSize(
+        Sidechain::Bitcoin::CTxOut(payout_amount, destination_script),
+        PROTOCOL_VERSION);
+    // Match Bitcoin Core's standard dust estimate: serialized output plus a
+    // typical 148-byte legacy or 67-byte discounted witness input, evaluated
+    // at the inherited 3,000 sat/kvB dust relay rate.
+    const uint32_t parent_spend_size = witness_destination ? 67 : 148;
+    const CAmount parent_dust_threshold =
+        CFeeRate(DUST_RELAY_TX_FEE_BITCOIN).GetFee(
+            static_cast<uint32_t>(parent_output_size) + parent_spend_size);
+    if (payout_amount < parent_dust_threshold) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            strprintf("Bitcoin withdrawal payout is dust for this destination (minimum %s)",
+                      FormatMoney(parent_dust_threshold)));
+    }
+    const bool subtract_fee = request.params[2].isNull()
+        ? false
+        : request.params[2].get_bool();
+    if (subtract_fee) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "subtractfeefromamount is not supported for native BIP300 withdrawals; the Elements fee must remain separate from the exact burn");
+    }
+    const bool verbose = request.params[3].isNull()
+        ? false
+        : request.params[3].get_bool();
+    const CAmount parent_fee = request.params[4].isNull()
+        ? 0
+        : AmountFromValue(request.params[4], true);
+    if (parent_fee < 0 || !MoneyRange(parent_fee) ||
+        payout_amount > MAX_MONEY - parent_fee) {
+        throw JSONRPCError(RPC_TYPE_ERROR,
+                           "Invalid mainchain fee or withdrawal total");
+    }
+    const CAmount burn_amount = payout_amount + parent_fee;
+
+    CScript burn_script;
+    std::string withdrawal_error;
+    if (!drivechain::BuildNativeWithdrawalScript(
+            Params().ParentGenesisBlockHash(), destination_script, parent_fee,
+            burn_script, &withdrawal_error)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, withdrawal_error);
+    }
+    TxoutType burn_type;
+    if (!IsStandard(burn_script, burn_type)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "The resulting irreversible burn is not relayable under this Elements network's standard policy");
+    }
+
+    std::vector<CRecipient> recipients;
+    recipients.push_back({burn_script,
+                          burn_amount,
+                          consensus.pegged_asset,
+                          CPubKey(),
+                          false});
+
+    mapValue_t map_value;
+    map_value["drivechain_withdrawal"] = "native-v1";
+    map_value["drivechain_parent_fee_sats"] = ToString(parent_fee);
+    CCoinControl no_coin_control;
+    const UniValue send_result = SendMoney(
+        *pwallet, no_coin_control, recipients, std::move(map_value),
+        true /* verbose */, true /* ignore_blind_fail */);
+    const std::string txid_hex = find_value(send_result, "txid").get_str();
+    const uint256 txid = uint256S(txid_hex);
+    const CWalletTx* const wallet_tx = pwallet->GetWalletTx(txid);
+    if (!wallet_tx || !wallet_tx->tx) {
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            "Committed withdrawal transaction is unavailable in the wallet");
+    }
+
+    std::optional<uint32_t> withdrawal_vout;
+    for (uint32_t vout = 0; vout < wallet_tx->tx->vout.size(); ++vout) {
+        const CTxOut& output = wallet_tx->tx->vout[vout];
+        if (output.scriptPubKey != burn_script) continue;
+        const CTxOutWitness* output_witness =
+            vout < wallet_tx->tx->witness.vtxoutwit.size()
+            ? &wallet_tx->tx->witness.vtxoutwit[vout]
+            : nullptr;
+        drivechain::NativeWithdrawal parsed;
+        if (!drivechain::ParseNativeWithdrawalOutput(
+                output, output_witness, consensus.pegged_asset,
+                Params().ParentGenesisBlockHash(), parsed,
+                &withdrawal_error) ||
+            parsed.burn_amount != burn_amount ||
+            parsed.payout_amount != payout_amount ||
+            parsed.parent_fee != parent_fee) {
+            continue;
+        }
+        if (withdrawal_vout.has_value()) {
+            throw JSONRPCError(
+                RPC_WALLET_ERROR,
+                "Committed transaction contains multiple native withdrawal burns");
+        }
+        withdrawal_vout = vout;
+    }
+    if (!withdrawal_vout.has_value()) {
+        throw JSONRPCError(
+            RPC_WALLET_ERROR,
+            "Committed transaction is missing its exact native withdrawal burn");
+    }
+
+    if (!verbose) return txid_hex;
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("txid", txid_hex);
+    result.pushKV("withdrawal_vout", static_cast<uint64_t>(*withdrawal_vout));
+    result.pushKV("burn_amount", ValueFromAmount(burn_amount));
+    result.pushKV("payout_amount", ValueFromAmount(payout_amount));
+    result.pushKV("mainchain_fee", ValueFromAmount(parent_fee));
+    result.pushKV("bitcoin_script_pub_key", HexStr(destination_script));
+    result.pushKV("status", "awaiting_confirmation");
+    result.pushKV("fee_reason", find_value(send_result, "fee_reason"));
+    result.pushKV(
+        "next_step",
+        strprintf("submitdrivechainwithdrawal %s %u <confirming_block_hash>",
+                  txid_hex, *withdrawal_vout));
+    return result;
+},
+    };
+}
+
+/** Ordinary Elements/Liquid federated peg-out path. */
+RPCHelpMan sendtomainchain_legacy()
 {
     return RPCHelpMan{"sendtomainchain",
                 "\nSends sidechain funds to the given mainchain address through the BIP300 drivechain peg-out mechanism.\n"
@@ -1393,10 +1642,18 @@ RPCHelpMan sendtomainchain_pak()
     };
 }
 
-// BIP300 drivechain peg-out replaces the legacy federated/PAK sendtomainchain paths.
+// Preserve the existing Liquid/federated wallet behavior on ordinary Elements
+// networks. Only an explicitly slot-assigned network selects the native
+// drivechain path (which applies its own fail-closed M6 capability gate).
 RPCHelpMan sendtomainchain()
 {
-    return sendtomainchain_base();
+    if (Params().GetConsensus().drivechain_slot.has_value()) {
+        return sendtomainchain_drivechain();
+    }
+    if (Params().GetEnforcePak()) {
+        return sendtomainchain_pak();
+    }
+    return sendtomainchain_legacy();
 }
 
 extern UniValue signrawtransaction(const JSONRPCRequest& request);
@@ -1600,6 +1857,11 @@ RPCHelpMan createrawpegin()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    if (Params().GetConsensus().drivechain_slot.has_value()) {
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND,
+                           "Legacy federated peg-ins are disabled on a Drivechain network; use importdrivechaindeposit");
+    }
+
     if (!IsHex(request.params[0].get_str()) || !IsHex(request.params[1].get_str())) {
         throw JSONRPCError(RPC_TYPE_ERROR, "the first two arguments must be hex strings");
     }
@@ -1646,6 +1908,11 @@ RPCHelpMan claimpegin()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    if (Params().GetConsensus().drivechain_slot.has_value()) {
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND,
+                           "Legacy federated peg-ins are disabled on a Drivechain network; use importdrivechaindeposit");
+    }
+
     CTransactionRef tx_ref;
     CMutableTransaction mtx;
 
@@ -1706,7 +1973,221 @@ RPCHelpMan claimpegin()
     };
 }
 
-RPCHelpMan importdrivechaindeposit()
+static RPCHelpMan importdrivechaindeposit_native()
+{
+    return RPCHelpMan{"importdrivechaindeposit",
+                "\nImport a confirmed BIP300/301 drivechain deposit into this Elements wallet.\n"
+                "The node independently checks the raw parent-chain block, canonical treasury transition,\n"
+                "outpoint, value, destination commitment, active-chain membership, and confirmation depth.\n",
+                {
+                    {"mainchain_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The confirmed mainchain deposit transaction id."},
+                    {"mainchain_vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The exact BIP300 deposit outpoint index."},
+                    {"mainchain_block_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The mainchain block containing the BIP300 deposit event."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The Elements address committed by the BIP300 deposit."},
+                    {"value_sats", RPCArg::Type::NUM, RPCArg::Optional::NO, "The exact deposit value in satoshis."},
+                    {"fee_sats", RPCArg::Type::NUM, RPCArg::Default{0}, "Maximum optional sidechain network fee sponsored by this wallet without reducing the credited deposit."},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR_HEX, "txid", "The deterministic wallet credit transaction id."},
+                        {RPCResult::Type::STR_HEX, "mainchain_txid", "The mainchain deposit transaction id."},
+                        {RPCResult::Type::NUM, "mainchain_vout", "The mainchain deposit output index."},
+                        {RPCResult::Type::STR_HEX, "mainchain_block_hash", "The mainchain block containing the deposit."},
+                        {RPCResult::Type::STR, "address", "The credited Elements address."},
+                        {RPCResult::Type::STR_AMOUNT, "amount", "The credited amount in pegged asset units."},
+                        {RPCResult::Type::NUM, "value_sats", "The credited amount in satoshis."},
+                        {RPCResult::Type::NUM, "deposit_value_sats", "The deposit input value in satoshis."},
+                        {RPCResult::Type::NUM, "fee_sats", "The actual sidechain network fee sponsored by this wallet."},
+                        {RPCResult::Type::STR_HEX, "hex", "The sidechain transaction hex."},
+                        {RPCResult::Type::BOOL, "already_imported", "Whether this sidechain deposit transaction was already known."},
+                        {RPCResult::Type::BOOL, "broadcast", "Whether the transaction was broadcast by this call."},
+                    },
+                },
+                RPCExamples{
+                    HelpExampleCli("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\" 0 \"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\" \"el1qq...\" 100000")
+            + HelpExampleRpc("importdrivechaindeposit", "\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\", 0, \"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\", \"el1qq...\", 100000")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const auto& drivechain_slot = Params().GetConsensus().drivechain_slot;
+    if (!drivechain_slot.has_value()) {
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Native BIP300 deposits are not enabled on this network");
+    }
+
+    // Reject unsupported ordinary-network calls before the global
+    // auto-default-wallet path can create or load any wallet on disk.
+    std::shared_ptr<CWallet> const wallet = GetWalletForJSONRPCRequest(request);
+    if (!wallet) return NullUniValue;
+    CWallet* const pwallet = wallet.get();
+
+    const std::string mainchain_txid_str = request.params[0].get_str();
+    if (!IsHex(mainchain_txid_str) || mainchain_txid_str.size() != 64) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "mainchain_txid must be a 32-byte hex transaction id");
+    }
+
+    const int64_t mainchain_vout = request.params[1].get_int64();
+    if (mainchain_vout < 0 || mainchain_vout > std::numeric_limits<uint32_t>::max()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "mainchain_vout must be a valid uint32 output index");
+    }
+
+    const std::string mainchain_block_hash_str = request.params[2].get_str();
+    if (!IsHex(mainchain_block_hash_str) || mainchain_block_hash_str.size() != 64) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "mainchain_block_hash must be a 32-byte hex block hash");
+    }
+
+    const std::string address = request.params[3].get_str();
+    const CTxDestination dest = DecodeDestination(address);
+    if (!IsValidDestination(dest)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Elements address");
+    }
+
+    int64_t value_sats{0};
+    if (request.params[4].isNum()) {
+        value_sats = request.params[4].get_int64();
+    } else if (request.params[4].isStr() && ParseInt64(request.params[4].get_str(), &value_sats)) {
+        // Allow elements-cli and bridge callers that serialize the satoshi amount as a string.
+    } else {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be an integer number of satoshis");
+    }
+    if (value_sats <= 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be greater than zero");
+    }
+    if (value_sats > std::numeric_limits<CAmount>::max()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats is too large");
+    }
+    int64_t max_fee_sats{0};
+    if (request.params.size() > 5 && !request.params[5].isNull()) {
+        if (request.params[5].isNum()) {
+            max_fee_sats = request.params[5].get_int64();
+        } else if (request.params[5].isStr() && ParseInt64(request.params[5].get_str(), &max_fee_sats)) {
+        } else {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_sats must be an integer number of satoshis");
+        }
+    }
+    if (max_fee_sats < 0 || !MoneyRange(max_fee_sats)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_sats must be a non-negative monetary amount");
+    }
+    const CAmount deposit_amount = value_sats;
+    const CAmount amount = deposit_amount;
+
+    const uint256 mainchain_txid = uint256S(mainchain_txid_str);
+    const uint256 mainchain_block_hash = uint256S(mainchain_block_hash_str);
+    const COutPoint mainchain_outpoint(mainchain_txid, static_cast<uint32_t>(mainchain_vout));
+    const std::vector<unsigned char> address_bytes(address.begin(), address.end());
+    std::string deposit_error;
+    if (!IsConfirmedDrivechainDeposit(mainchain_block_hash,
+                                      *drivechain_slot,
+                                      mainchain_outpoint,
+                                      deposit_amount,
+                                      address_bytes,
+                                      &deposit_error)) {
+        throw JSONRPCError(RPC_VERIFY_REJECTED, strprintf("BIP300 deposit validation failed: %s", deposit_error));
+    }
+
+    CMutableTransaction mtx;
+    mtx.nVersion = 2;
+
+    CTxIn pegin_input(mainchain_outpoint, CScript(), CTxIn::SEQUENCE_FINAL);
+    pegin_input.m_is_pegin = true;
+    mtx.vin.push_back(pegin_input);
+    mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, amount, GetScriptForDestination(dest)));
+    mtx.witness.vtxinwit.resize(1);
+    mtx.witness.vtxoutwit.resize(mtx.vout.size());
+    mtx.witness.vtxinwit[0].m_pegin_witness = CreateDrivechainDepositPeginWitness(
+        deposit_amount,
+        Params().GetConsensus().pegged_asset,
+        Params().ParentGenesisBlockHash(),
+        CScript() << OP_TRUE,
+        mainchain_outpoint,
+        mainchain_block_hash,
+        address_bytes);
+
+    // The recipient receives the full deposit. Permissionless relayers may
+    // sponsor ordinary signed wallet inputs for the network fee; they can
+    // never choose a fee that is deducted from the mint authorization.
+    CAmount fee_sats{0};
+    if (max_fee_sats > 0) {
+        int change_position{-1};
+        bilingual_str funding_error;
+        CCoinControl coin_control;
+        coin_control.SelectExternal(mainchain_outpoint, GetPeginOutputFromWitness(mtx.witness.vtxinwit[0].m_pegin_witness));
+        LOCK(pwallet->cs_wallet);
+        if (!wallet::FundTransaction(*pwallet,
+                                     mtx,
+                                     fee_sats,
+                                     change_position,
+                                     funding_error,
+                                     /*lockUnspents=*/false,
+                                     /*setSubtractFeeFromOutputs=*/{},
+                                     coin_control)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Unable to sponsor drivechain deposit fee: %s", funding_error.original));
+        }
+        if (fee_sats > max_fee_sats) {
+            throw JSONRPCError(RPC_WALLET_ERROR,
+                               strprintf("Required sidechain fee %s exceeds fee_sats limit %s",
+                                         FormatMoney(fee_sats), FormatMoney(max_fee_sats)));
+        }
+
+        std::map<COutPoint, Coin> input_coins;
+        for (const CTxIn& input : mtx.vin) input_coins[input.prevout];
+        pwallet->chain().findCoins(input_coins);
+        input_coins[mainchain_outpoint] = Coin(
+            GetPeginOutputFromWitness(mtx.witness.vtxinwit[0].m_pegin_witness), 0, false);
+        for (const auto& input : input_coins) {
+            if (input.second.IsSpent()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to locate a selected fee-sponsoring wallet input");
+            }
+        }
+        std::map<int, bilingual_str> signing_errors;
+        if (!pwallet->SignTransaction(mtx, input_coins, SIGHASH_DEFAULT, signing_errors)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Unable to sign the fee-sponsoring wallet inputs");
+        }
+    }
+
+    CTransactionRef tx_ref = MakeTransactionRef(mtx);
+    const uint256 side_txid = tx_ref->GetHash();
+    const std::string tx_hex = EncodeHexTx(*tx_ref);
+    bool already_imported{false};
+    {
+        LOCK(pwallet->cs_wallet);
+        already_imported = pwallet->GetWalletTx(side_txid) != nullptr;
+    }
+    bool broadcast = false;
+
+    if (!already_imported) {
+        std::string err_string;
+        if (pwallet->chain().broadcastTransaction(tx_ref, /*max_tx_fee=*/0, /*relay=*/true, err_string)) {
+            broadcast = true;
+        } else if (err_string.find("already in block chain") != std::string::npos ||
+                   err_string.find("txn-already-in-mempool") != std::string::npos ||
+                   err_string.find("Transaction already in block chain") != std::string::npos) {
+            already_imported = true;
+        } else {
+            throw JSONRPCError(RPC_TRANSACTION_REJECTED, err_string);
+        }
+    }
+
+    UniValue ret(UniValue::VOBJ);
+        ret.pushKV("txid", side_txid.GetHex());
+        ret.pushKV("mainchain_txid", mainchain_txid.GetHex());
+        ret.pushKV("mainchain_vout", mainchain_vout);
+        ret.pushKV("mainchain_block_hash", mainchain_block_hash.GetHex());
+        ret.pushKV("address", address);
+        ret.pushKV("amount", ValueFromAmount(amount));
+        ret.pushKV("value_sats", value_sats);
+        ret.pushKV("deposit_value_sats", deposit_amount);
+        ret.pushKV("fee_sats", fee_sats);
+    ret.pushKV("hex", tx_hex);
+    ret.pushKV("already_imported", already_imported);
+    ret.pushKV("broadcast", broadcast);
+    return ret;
+},
+    };
+}
+
+
+static RPCHelpMan importdrivechaindeposit_ecx()
 {
     return RPCHelpMan{"importdrivechaindeposit",
                 "\nImport a confirmed BIP300/301 drivechain deposit into this Elements wallet.\n"
@@ -1982,6 +2463,14 @@ void FillBlinds(CWallet* pwallet, CMutableTransaction& tx, std::vector<uint256>&
             }
         }
     }
+}
+
+RPCHelpMan importdrivechaindeposit()
+{
+    // Alpha consumes its authenticated native eight-item CTIP witness, never
+    // an ECX Connect/JSON evidence record with the same version marker.
+    return Params().GetConsensus().drivechain_slot.has_value()
+        ? importdrivechaindeposit_native() : importdrivechaindeposit_ecx();
 }
 
 RPCHelpMan blindrawtransaction()

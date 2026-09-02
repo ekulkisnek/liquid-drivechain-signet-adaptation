@@ -1,6 +1,7 @@
 #include "primitive.h"
 
 #include "elementsJets.h"
+#include "primitiveJetCost.inc"
 #include "../limitations.h"
 #include "../simplicity_alloc.h"
 #include "../simplicity_assert.h"

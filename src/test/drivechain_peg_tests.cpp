@@ -376,6 +376,41 @@ public:
 
 BOOST_FIXTURE_TEST_SUITE(drivechain_peg_tests, DrivechainPegTestingSetup)
 
+BOOST_AUTO_TEST_CASE(deposit_codec_dispatch_keeps_native_and_ecx_state_separate)
+{
+    const CTransaction legacy = LegacyPublicDeposit();
+    const DeterministicFixture deterministic;
+    const COutPoint outpoint = legacy.vin[0].prevout;
+    const std::string address = TestDepositAddress();
+    const CScriptWitness native = CreateDrivechainDepositPeginWitness(
+        2'000, Params().GetConsensus().pegged_asset,
+        Params().ParentGenesisBlockHash(), CScript() << OP_TRUE, outpoint,
+        uint256S(DEPOSIT_BLOCK), std::vector<unsigned char>(address.begin(), address.end()));
+
+    // The shared spent-key/amount parser recognizes all deposit formats, but
+    // ECX Connect/DisconnectDepositState and evidence anchors must never run
+    // on Alpha's distinct eight-item native witness.
+    BOOST_REQUIRE_EQUAL(native.stack.size(), 8U);
+    BOOST_CHECK(IsDrivechainDepositPeginWitness(native, outpoint));
+    BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(native, outpoint));
+    BOOST_CHECK(GetPeginSpentKey(native, outpoint) == std::make_pair(outpoint.hash, outpoint));
+
+    for (const CTransaction* tx : {&legacy, deterministic.transaction.get()}) {
+        const CScriptWitness& witness = tx->witness.vtxinwit[0].m_pegin_witness;
+        const COutPoint& deposit = tx->vin[0].prevout;
+        BOOST_CHECK(IsDrivechainDepositPeginWitness(witness, deposit));
+        BOOST_CHECK(IsEcxDrivechainDepositPeginWitness(witness, deposit));
+        BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(witness, COutPoint(uint256::ONE, deposit.n)));
+
+        CScriptWitness altered = witness;
+        altered.stack[4][0] ^= 1;
+        BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(altered, deposit));
+        altered = witness;
+        altered.stack.pop_back();
+        BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(altered, deposit));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(normalizes_l1_lifecycle_and_deduplicates)
 {
     UniValue response;
@@ -721,6 +756,9 @@ BOOST_AUTO_TEST_CASE(authenticated_enforcer_configuration_fails_closed)
     args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55052");
     BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
     BOOST_CHECK(error.find("same authenticated endpoint") != std::string::npos);
+
+    args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55051");
+    BOOST_CHECK_MESSAGE(ValidateDrivechainGrpcTLSConfig(args, &error), error);
 
     args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051 injected");
     args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55051 injected");

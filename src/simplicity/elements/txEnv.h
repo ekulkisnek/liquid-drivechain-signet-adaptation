@@ -184,13 +184,17 @@ typedef struct sigInput {
   const unsigned char* annex;
   uint_fast32_t annexLen;
   sha256_midstate annexHash;
+  /* Exact bounded Taproot annex retained for the pinned SP1 verifier jet. */
+  const unsigned char* fullAnnex;
   sha256_midstate pegin;
   sha256_midstate scriptSigHash;
   outpoint prevOutpoint;
   utxo txo;
   uint_fast32_t sequence;
   assetIssuance issuance;
+  uint_fast32_t fullAnnexLen;
   bool hasAnnex;
+  bool hasFullAnnex;
   bool isPegin;
 } sigInput;
 
@@ -255,6 +259,8 @@ typedef struct elementsTapEnv {
  * + the transaction data, which may be shared when Simplicity expressions are used for multiple inputs in the same transaction),
  * + the input index under consideration,
  * + the hash of the genesis block for the chain,
+ * + optional legacy BIP301-authenticated mainchain parent median-time-past,
+ * + the atomic V11 prior-active parent endpoint in canonical wire order.
  */
 typedef struct txEnv {
   const elementsTransaction* tx;
@@ -292,6 +298,11 @@ typedef struct txEnv {
   ecx_sp1_groth16_verify_fn verifySp1Groth16;
   void* verifySp1Groth16Context;
   uint_fast32_t ix;
+  uint_fast64_t bmmParentMtp;
+  bool bmmParentMtpPresent;
+  unsigned char priorActiveBmmParentCheckpoint[80];
+  bool priorActiveBmmParentCheckpointPresent;
+  bool priorActiveBmmParentCheckpointValid;
 } txEnv;
 
 /* Construct a txEnv structure from its components.
@@ -302,6 +313,10 @@ typedef struct txEnv {
  *               NULL != genesisHash
  *               ix < tx->numInputs
  */
-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, const ecx_prior_active_root_env* ecxRoot, uint_fast32_t ix);
+txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
+                                      const sha256_midstate* genesisHash, const ecx_prior_active_root_env* ecxRoot, uint_fast32_t ix,
+                                      bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp,
+                                      bool priorActiveBmmParentCheckpointPresent,
+                                      const unsigned char priorActiveBmmParentCheckpoint[80]);
 
 #endif

@@ -11,6 +11,7 @@
 #include <crypto/sha256.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <script/usdd_sp1_annex.h>
 #include <uint256.h>
 extern "C" {
 #include <simplicity/elements/env.h>
@@ -797,6 +798,9 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
 
                     // If not enabled, keep the historical OP_NOP4 behavior.
                     if (!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY)) {
+                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) {
+                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                        }
                         break;
                     }
 
@@ -2720,6 +2724,7 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_output_spk_single_hashes = GetOutputScriptPubKeysSHA256(txTo);
 
         std::vector<rawElementsBuffer> simplicityRawAnnex(txTo.witness.vtxinwit.size());
+        std::vector<rawElementsBuffer> simplicityRawFullAnnex(txTo.witness.vtxinwit.size());
         std::vector<rawElementsInput> simplicityRawInput(txTo.vin.size());
         for (size_t i = 0; i < txTo.vin.size(); ++i) {
             simplicityRawInput[i].prevTxid = txTo.vin[i].prevout.hash.begin();
@@ -2734,12 +2739,16 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
             simplicityRawInput[i].issuance.amount = txTo.vin[i].assetIssuance.nAmount.vchCommitment.empty() ? NULL : txTo.vin[i].assetIssuance.nAmount.vchCommitment.data();
             simplicityRawInput[i].issuance.inflationKeys = txTo.vin[i].assetIssuance.nInflationKeys.vchCommitment.empty() ? NULL : txTo.vin[i].assetIssuance.nInflationKeys.vchCommitment.data();
             simplicityRawInput[i].annex = NULL;
+            simplicityRawInput[i].fullAnnex = NULL;
             if (i < txTo.witness.vtxinwit.size()) {
                 Span<const valtype> stack{txTo.witness.vtxinwit[i].scriptWitness.stack};
                 if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
                     simplicityRawAnnex[i].buf = stack.back().data()+1;
                     simplicityRawAnnex[i].len = stack.back().size()-1;
                     simplicityRawInput[i].annex = &simplicityRawAnnex[i];
+                    simplicityRawFullAnnex[i].buf = stack.back().data();
+                    simplicityRawFullAnnex[i].len = stack.back().size();
+                    simplicityRawInput[i].fullAnnex = &simplicityRawFullAnnex[i];
                 }
                 simplicityRawInput[i].issuance.amountRangePrf.buf = txTo.witness.vtxinwit[i].vchIssuanceAmountRangeproof.data();
                 simplicityRawInput[i].issuance.amountRangePrf.len = txTo.witness.vtxinwit[i].vchIssuanceAmountRangeproof.size();
@@ -3249,6 +3258,17 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
 {
     simplicity_err error;
     elementsTapEnv* simplicityTapEnv = simplicity_elements_mallocTapEnv(&simplicityRawTap);
+    rawElementsBlockEnv simplicityRawBlock{};
+    if (txdata->m_bmm_parent_mtp.has_value()) {
+        simplicityRawBlock.bmmParentMtp = *txdata->m_bmm_parent_mtp;
+        simplicityRawBlock.bmmParentMtpPresent = true;
+    }
+    if (txdata->m_prior_active_bmm_parent_checkpoint.has_value()) {
+        std::copy(txdata->m_prior_active_bmm_parent_checkpoint->begin(),
+                  txdata->m_prior_active_bmm_parent_checkpoint->end(),
+                  simplicityRawBlock.priorActiveBmmParentCheckpoint);
+        simplicityRawBlock.priorActiveBmmParentCheckpointPresent = true;
+    }
 
     assert(txdata->m_simplicity_tx_data);
     assert(simplicityTapEnv);
@@ -3383,7 +3403,7 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
         ecx_root.current_sidechain_height =
             *txdata->m_current_sidechain_height;
     }
-    if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &ecx_root, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
+    if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &ecx_root, &simplicityRawBlock, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
         assert(!"simplicity_elements_execSimplicity internal error");
     }
     simplicity_elements_freeTapEnv(simplicityTapEnv);
@@ -3535,9 +3555,11 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         // BIP341 Taproot: 32-byte non-P2SH witness v1 program (which encodes a P2C-tweaked pubkey)
         if (!(flags & SCRIPT_VERIFY_TAPROOT)) return set_success(serror);
         if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+        const valtype* tap_annex{nullptr};
         if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
             // Drop annex (this is non-standard; see IsWitnessStandard)
             const valtype& annex = SpanPopBack(stack);
+            tap_annex = &annex;
             execdata.m_annex_hash = (CHashWriter(SER_GETHASH, 0) << annex).GetSHA256();
             execdata.m_annex_present = true;
         } else {
@@ -3572,9 +3594,55 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if ((flags & SCRIPT_VERIFY_SIMPLICITY) && (control[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSIMPLICITY) {
                 if (stack.size() != 2 || script_bytes.size() != 32) return set_error(serror, SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH);
                 // Tapsimplicity (leaf version 0xbe)
+                bool has_usdd_sp1_verifier_credit{false};
+                if (tap_annex != nullptr && (flags & SCRIPT_VERIFY_USDD_SP1_ANNEX)) {
+                    const PrecomputedTransactionData* txdata = checker.GetPrecomputedTransactionData();
+                    switch (usdd::GateUsddSp1ProofAnnex(
+                        *tap_annex, script_bytes,
+                        txdata != nullptr &&
+                            txdata->m_prior_active_bmm_parent_checkpoint.has_value())) {
+                    case usdd::Sp1ConsensusGateResult::NOT_USDD:
+                        break;
+                    case usdd::Sp1ConsensusGateResult::MALFORMED:
+                        return set_error(serror, SCRIPT_ERR_USDD_SP1_ANNEX);
+                    case usdd::Sp1ConsensusGateResult::WRONG_CONTROLLER_CMR:
+                        return set_error(
+                            serror,
+                            SCRIPT_ERR_USDD_SP1_WRONG_CONTROLLER_CMR);
+                    case usdd::Sp1ConsensusGateResult::WRONG_GUEST_PROGRAM_ID:
+                        return set_error(
+                            serror,
+                            SCRIPT_ERR_USDD_SP1_WRONG_GUEST_PROGRAM_ID);
+                    case usdd::Sp1ConsensusGateResult::MALFORMED_PUBLIC_VALUES:
+                        return set_error(
+                            serror,
+                            SCRIPT_ERR_USDD_SP1_MALFORMED_PUBLIC_VALUES);
+                    case usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED:
+                        return set_error(
+                            serror,
+                            SCRIPT_ERR_USDD_SP1_DEPLOYMENT_UNCONFIGURED);
+                    case usdd::Sp1ConsensusGateResult::WRONG_INBOUND_MINT_DOMAIN:
+                        return set_error(
+                            serror,
+                            SCRIPT_ERR_USDD_SP1_WRONG_INBOUND_MINT_DOMAIN);
+                    case usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING:
+                        return set_error(serror, SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING);
+                    case usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE:
+                        return set_error(serror, SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE);
+                    case usdd::Sp1ConsensusGateResult::READY_FOR_JET:
+                        if constexpr (!ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE) {
+                            has_usdd_sp1_verifier_credit = true;
+                        }
+                        break;
+                    }
+                }
                 const valtype& simplicity_program = SpanPopBack(stack);
                 const valtype& simplicity_witness = SpanPopBack(stack);
-                const int64_t budget = ::GetSerializeSize(witness.stack, PROTOCOL_VERSION) + VALIDATION_WEIGHT_OFFSET;
+                int64_t budget = ::GetSerializeSize(witness.stack, PROTOCOL_VERSION) + VALIDATION_WEIGHT_OFFSET;
+                if (has_usdd_sp1_verifier_credit &&
+                    !usdd::ComputeUsddSp1VerifierBudget(budget, budget)) {
+                    return set_error(serror, SCRIPT_ERR_USDD_SP1_BUDGET);
+                }
                 rawElementsTapEnv simplicityRawTap;
                 simplicityRawTap.controlBlock = control.data();
                 simplicityRawTap.pathLen = (control.size() - TAPROOT_CONTROL_BASE_SIZE) / TAPROOT_CONTROL_NODE_SIZE;

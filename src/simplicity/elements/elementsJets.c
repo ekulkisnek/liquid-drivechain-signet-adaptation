@@ -1,4 +1,10 @@
+#if defined(HAVE_CONFIG_H)
+#include <config/bitcoin-config.h>
+#endif
+
 #include "elementsJets.h"
+
+#include <simplicity/elements/env.h>
 
 #include "ops.h"
 #include "txEnv.h"
@@ -569,6 +575,13 @@ bool simplicity_elements_parse_sp1_groth16_v6_incremental_successor_annex(
   return true;
 }
 
+/* A production build defines HAVE_USDD_SP1_VERIFIER only when it links the
+ * pinned Rust verifier ABI and provides this exact-annex accessor.  Ordinary
+ * upstream/library builds remain safely unavailable and return False. */
+#if defined(HAVE_USDD_SP1_VERIFIER)
+#include "../../script/usdd_sp1_verifier_ffi.h"
+#endif
+
 /* Read a 256-bit hash value from the 'src' frame, advancing the cursor 256 cells.
  *
  * Precondition: '*src' is a valid read frame for 256 more cells;
@@ -1056,6 +1069,34 @@ bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(
   return true;
 }
 
+bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(
+  frameItem* dst,
+  frameItem src,
+  const txEnv* env
+) {
+  sha256_midstate expectedProgramId;
+  sha256_midstate expectedPublicValuesHash;
+  unsigned char expectedProgramIdBytes[32];
+  unsigned char expectedPublicValuesHashBytes[32];
+  const sigInput* input;
+  bool valid;
+
+  readHash(&expectedProgramId, &src);
+  readHash(&expectedPublicValuesHash, &src);
+  sha256_fromMidstate(expectedProgramIdBytes, expectedProgramId.s);
+  sha256_fromMidstate(expectedPublicValuesHashBytes, expectedPublicValuesHash.s);
+  input = &env->tx->input[env->ix];
+  valid = simplicity_elements_verify_sp1_groth16_v6_incremental_successor_annex_sha256(
+    input->annex,
+    input->annexLen,
+    expectedProgramIdBytes,
+    expectedPublicValuesHashBytes,
+    env->verifySp1Groth16,
+    env->verifySp1Groth16Context);
+  writeBit(dst, valid);
+  return true;
+}
+
 /* Write an outpoint value to the 'dst' frame, advancing the cursor 288 cells.
  *
  * Precondition: '*dst' is a valid write frame for 288 more cells;
@@ -1247,6 +1288,41 @@ bool simplicity_input_pegin(frameItem* dst, frameItem src, const txEnv* env) {
   } else {
     skipBits(dst, 257);
   }
+  return true;
+}
+
+/* input_is_pegin : TWO^32 |- TWO
+ *
+ * This total predicate is true only for an existing peg-in input.  Invalid
+ * indexes and ordinary inputs are false so a fixed controller leaf can admit
+ * both the two-input normal form and the three-input refill form without an
+ * unexecuted Option branch.
+ */
+bool simplicity_input_is_pegin(frameItem* dst, frameItem src, const txEnv* env) {
+  const uint_fast32_t i = simplicity_read32(&src);
+  const bool pegin = env && env->tx && i < env->tx->numInputs
+                  && env->tx->input[i].isPegin;
+  writeBit(dst, pegin);
+  return true;
+}
+
+/* fe_is_square_total : TWO^256 |- TWO
+ *
+ * This is the total predicate corresponding to the tag of fe_square_root.
+ * Keeping the tag and discarding the optional square root avoids placing an
+ * unreachable CASE branch in fixed-shape controller leaves while preserving
+ * exactly the pinned field-normalization semantics.
+ */
+bool simplicity_fe_is_square_total(frameItem* dst, frameItem src, const txEnv* env) {
+  UWORD scratch[ROUND_UWORD(257)] = {0};
+  frameItem scratchDst = initWriteFrame(257, scratch + ROUND_UWORD(257));
+  frameItem scratchSrc;
+
+  if (!simplicity_fe_square_root(&scratchDst, src, env)) {
+    return false;
+  }
+  scratchSrc = initReadFrame(257, scratch);
+  writeBit(dst, readBit(&scratchSrc));
   return true;
 }
 
@@ -1566,6 +1642,101 @@ bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env) {
 bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env) {
   (void) src; // src is unused;
   write32s(dst, env->tx->txid.s, 8);
+  return true;
+}
+
+/* current_bmm_parent_mtp : ONE |- S TWO^64 */
+bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (writeBit(dst, env->bmmParentMtpPresent)) {
+    simplicity_write64(dst, env->bmmParentMtp);
+  } else {
+    skipBits(dst, 64);
+  }
+  return true;
+}
+
+/* current_bmm_parent_mtp_required : ONE |- TWO^64
+ *
+ * V11 fixed-shape controller leaves require an authenticated parent MTP.
+ * Missing context fails the jet instead of producing an Option branch whose
+ * unchosen path would violate mandatory anti-DoS execution coverage. Keep this
+ * native implementation separate from the ECX jet above: the latter reads the
+ * authenticated prior-active ECX root, not this block's native BMM context.
+ */
+bool simplicity_native_current_bmm_parent_mtp_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env || !env->bmmParentMtpPresent) {
+    return false;
+  }
+  simplicity_write64(dst, env->bmmParentMtp);
+  return true;
+}
+
+/* prior_active_bmm_parent_checkpoint_required
+ *   : ONE |- TWO^256 * (TWO^64 * (TWO^64 * TWO^256))
+ *
+ * The 640 result bits are the exact canonical wire bytes:
+ * display-hash || height-be || MTP-be || chainwork-be.  The endpoint is one
+ * atomic value; missing or malformed transport context fails the jet and the
+ * legacy MTP field is never consulted.
+ */
+bool simplicity_prior_active_bmm_parent_checkpoint_required(
+    frameItem* dst, frameItem src, const txEnv* env) {
+  (void) src;
+  if (!env || !env->priorActiveBmmParentCheckpointPresent
+           || !env->priorActiveBmmParentCheckpointValid) {
+    return false;
+  }
+  write8s(dst, env->priorActiveBmmParentCheckpoint, 80);
+  return true;
+}
+
+/* issuance_is_none : TWO^32 |- TWO
+ *
+ * This total predicate is true only for an existing input with no issuance.
+ * Invalid indexes and every issuance type are false, so a controller cannot
+ * hide issuance behind an unexecuted Option branch.
+ */
+bool simplicity_issuance_is_none(frameItem* dst, frameItem src, const txEnv* env) {
+  const uint_fast32_t i = simplicity_read32(&src);
+  const bool none = env && env->tx && i < env->tx->numInputs
+                 && NO_ISSUANCE == env->tx->input[i].issuance.type;
+  writeBit(dst, none);
+  return true;
+}
+
+/* verify_sp1_compressed_sha256 : TWO^256 * TWO^256 |- TWO
+ *
+ * Input is (frozen program ID, SHA256(exact canonical journal)).  Only the
+ * pinned Rust ABI's ACCEPTED status for the exact current-input annex writes
+ * True.  Missing verifier support and every error are explicit False.
+ */
+bool simplicity_verify_sp1_compressed_sha256(frameItem* dst, frameItem src, const txEnv* env) {
+  unsigned char expectedProgramId[32];
+  unsigned char expectedPublicValuesSha256[32];
+  bool accepted = false;
+
+  read8s(expectedProgramId, sizeof(expectedProgramId), &src);
+  read8s(expectedPublicValuesSha256, sizeof(expectedPublicValuesSha256), &src);
+
+#if defined(HAVE_USDD_SP1_VERIFIER)
+  if (env && env->tx && usdd_sp1_verifier_abi_version() == USDD_SP1_VERIFIER_ABI_VERSION) {
+    rawElementsBuffer annex = {0};
+    if (simplicity_elements_getInputFullAnnex(env->tx, (uint32_t)env->ix, &annex) &&
+        annex.buf && 0 < annex.len && 0x50 == annex.buf[0]) {
+      accepted = USDD_SP1_VERIFIER_ACCEPTED == usdd_sp1_verify_annex(
+          USDD_SP1_VERIFIER_ABI_VERSION,
+          annex.buf, annex.len,
+          expectedProgramId, sizeof(expectedProgramId),
+          expectedPublicValuesSha256, sizeof(expectedPublicValuesSha256));
+    }
+  }
+#else
+  (void) env;
+#endif
+
+  writeBit(dst, accepted);
   return true;
 }
 

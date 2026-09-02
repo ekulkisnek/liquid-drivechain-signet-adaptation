@@ -27,6 +27,8 @@ static constexpr uint8_t DB_BLOCK_FILES{'f'};
 static constexpr uint8_t DB_BLOCK_INDEX{'b'};
 // Separate from CDiskBlockIndex to preserve every legacy block-index byte.
 static constexpr uint8_t DB_ECX_BOND_V2_CAPITAL{'E'};
+static constexpr uint8_t DB_DRIVECHAIN_ANCHOR{'D'};
+static constexpr uint8_t DB_USDD_WITHDRAWAL_ACCUMULATOR{'U'};
 
 static constexpr uint8_t DB_BEST_BLOCK{'B'};
 static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
@@ -314,6 +316,21 @@ bool CBlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockF
         } else {
             batch.Erase(capital_key);
         }
+        const auto anchor_key = std::make_pair(DB_DRIVECHAIN_ANCHOR, (*it)->GetBlockHash());
+        if ((*it)->m_drivechain_anchor.has_value()) {
+            assert((*it)->m_drivechain_anchor->IsSane());
+            batch.Write(anchor_key, *(*it)->m_drivechain_anchor);
+        } else {
+            batch.Erase(anchor_key);
+        }
+        const auto accumulator_key =
+            std::make_pair(DB_USDD_WITHDRAWAL_ACCUMULATOR, (*it)->GetBlockHash());
+        if ((*it)->m_usdd_withdrawal_accumulator.has_value()) {
+            assert((*it)->m_usdd_withdrawal_accumulator->IsSane());
+            batch.Write(accumulator_key, *(*it)->m_usdd_withdrawal_accumulator);
+        } else {
+            batch.Erase(accumulator_key);
+        }
     }
     return WriteBatch(batch, true);
 }
@@ -384,6 +401,9 @@ const CBlockIndex *CBlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTr
     pindexNew->nNonce         = pindexTrimmed->nNonce;
     pindexNew->nStatus        = pindexTrimmed->nStatus;
     pindexNew->nTx            = pindexTrimmed->nTx;
+    pindexNew->m_drivechain_anchor = pindexTrimmed->m_drivechain_anchor;
+    pindexNew->m_usdd_withdrawal_accumulator =
+        pindexTrimmed->m_usdd_withdrawal_accumulator;
 
     pindexNew->proof               = tmp.proof;
     pindexNew->m_dynafed_params    = tmp.m_dynafed_params;
@@ -403,6 +423,7 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
 
     int n_untrimmed = 0;
     int n_total = 0;
+    std::vector<CBlockIndex*> accumulator_indices;
 
     // Load m_block_index
     while (pcursor->Valid()) {
@@ -436,6 +457,34 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
 
+                DrivechainAnchor drivechain_anchor;
+                if (Read(std::make_pair(DB_DRIVECHAIN_ANCHOR, pindexNew->GetBlockHash()), drivechain_anchor)) {
+                    if (!drivechain_anchor.IsSane()) {
+                        return error("%s: malformed persisted drivechain anchor for %s", __func__, pindexNew->GetBlockHash().GetHex());
+                    }
+                    pindexNew->m_drivechain_anchor = drivechain_anchor;
+                }
+
+                const auto accumulator_key = std::make_pair(
+                    DB_USDD_WITHDRAWAL_ACCUMULATOR, pindexNew->GetBlockHash());
+                usdd::WithdrawalAccumulatorState accumulator;
+                if (Exists(accumulator_key)) {
+                    if (!Read(accumulator_key, accumulator) || !accumulator.IsSane()) {
+                        return error("%s: malformed persisted USDD withdrawal accumulator for %s",
+                                     __func__, pindexNew->GetBlockHash().GetHex());
+                    }
+                    pindexNew->m_usdd_withdrawal_accumulator = accumulator;
+                    accumulator_indices.push_back(pindexNew);
+                } else if (pindexNew->GetBlockHash() == consensusParams.hashGenesisBlock) {
+                    pindexNew->m_usdd_withdrawal_accumulator =
+                        usdd::WithdrawalAccumulatorState::Empty();
+                    accumulator_indices.push_back(pindexNew);
+                } else if (pindexNew->IsValid(BLOCK_VALID_SCRIPTS)) {
+                    return error(
+                        "%s: missing derived USDD withdrawal accumulator for validated block %s; reindex required",
+                        __func__, pindexNew->GetBlockHash().GetHex());
+                }
+
                 pindexNew->proof               = diskindex.proof;
                 pindexNew->m_dynafed_params    = diskindex.m_dynafed_params;
                 pindexNew->m_signblock_witness = diskindex.m_signblock_witness;
@@ -464,6 +513,28 @@ bool CBlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, 
             }
         } else {
             break;
+        }
+    }
+
+    const auto empty_accumulator = usdd::WithdrawalAccumulatorState::Empty();
+    for (const CBlockIndex* pindex : accumulator_indices) {
+        const auto& accumulator = *pindex->m_usdd_withdrawal_accumulator;
+        if (!pindex->pprev) {
+            if (pindex->GetBlockHash() != consensusParams.hashGenesisBlock ||
+                !(accumulator == empty_accumulator)) {
+                return error("%s: nonempty or misplaced genesis USDD withdrawal accumulator", __func__);
+            }
+            continue;
+        }
+        if (!pindex->pprev->m_usdd_withdrawal_accumulator.has_value() ||
+            accumulator.count < pindex->pprev->m_usdd_withdrawal_accumulator->count) {
+            return error("%s: discontinuous USDD withdrawal accumulator at %s",
+                         __func__, pindex->GetBlockHash().GetHex());
+        }
+        const auto& previous = *pindex->pprev->m_usdd_withdrawal_accumulator;
+        if (accumulator.count == previous.count && !(accumulator == previous)) {
+            return error("%s: USDD withdrawal accumulator changed without an appended leaf at %s",
+                         __func__, pindex->GetBlockHash().GetHex());
         }
     }
 

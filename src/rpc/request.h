@@ -49,6 +49,17 @@ bool ReadMainchainAuthCookieFile(
     const fs::path& path,
     std::string& cookie,
     std::string* error = nullptr);
+/** Compatibility name for the same strict, rotating-cookie reader. */
+bool ReadNativeDrivechainCookieFile(
+    const fs::path& path, std::string& cookie, std::string* error = nullptr);
+/** Read a private, owner-only regular file without following symlinks. */
+bool ReadPrivateRpcAuthFile(
+    const fs::path& path, std::string& contents, std::string* error = nullptr);
+/** Explicit static credentials for a loopback parent; not a cookie fallback. */
+bool ReadMainchainRpcCredentialFile(
+    const fs::path& path, std::string& credentials, std::string* error = nullptr);
+/** Return the parent-node cookie path relative to Bitcoin's data directory. */
+std::string GetDefaultMainchainAuthCookieFile(const std::string& chain);
 /** Needs to know cookiedir path info -cli doesn't require */
 bool GetMainchainAuthCookie(std::string *cookie_out);
 

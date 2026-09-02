@@ -13,6 +13,8 @@
 bool simplicity_version(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_lock_time(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_input_pegin(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_input_is_pegin(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_fe_is_square_total(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_input_prev_outpoint(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_input_asset(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_input_amount(frameItem* dst, frameItem src, const txEnv* env);
@@ -37,6 +39,7 @@ bool simplicity_output_surjection_proof(frameItem* dst, frameItem src, const txE
 bool simplicity_output_range_proof(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_total_fee(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_genesis_block_hash(frameItem* dst, frameItem src, const txEnv* env);
+#ifndef ECX_SIMPLICITY_CATALOGUE_FROZEN
 bool simplicity_prior_active_exchange_state_root_required(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_prior_active_forced_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_prior_active_deposit_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
@@ -57,8 +60,7 @@ bool simplicity_current_sidechain_height_required(frameItem* dst, frameItem src,
 /** TWO^32 |- ONE. Fail unless the supplied index is the current input, index
  * >= 2, non-pegin/nonissuance, and uses the frozen insurance-reserve script.
  * N-to-M confidential reserve conservation remains in the txid-bound proof
- * and Elements CT kernel. This implementation is not decoder-addressable
- * until its reviewed CMR/catalogue entry is generated and frozen. */
+ * and Elements CT kernel. Catalogue decoding is independently opt-in. */
 bool simplicity_bond_v2_insurance_reserve_input_required(
   frameItem* dst,
   frameItem src,
@@ -73,9 +75,16 @@ bool simplicity_verify_sp1_groth16_sha256(frameItem* dst, frameItem src, const t
 bool simplicity_verify_sp1_groth16_v3_public_values_v4_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_verify_sp1_groth16_v4_public_values_v5_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
+#endif
 bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_native_current_bmm_parent_mtp_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_prior_active_bmm_parent_checkpoint_required(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_issuance_is_none(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_verify_sp1_compressed_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_pegin(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_prev_outpoint(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_asset(frameItem* dst, frameItem src, const txEnv* env);

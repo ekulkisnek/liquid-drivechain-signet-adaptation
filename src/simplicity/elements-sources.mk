@@ -102,5 +102,6 @@ ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitive.h
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitiveEnumJet.inc
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitiveEnumTy.inc
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitiveInitTy.inc
+ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitiveJetCost.inc
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/primitiveJetNode.inc
 ELEMENTS_SIMPLICITY_LIB_HEADERS_INT += %reldir%/elements/txEnv.h

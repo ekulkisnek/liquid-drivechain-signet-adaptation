@@ -1,5 +1,22 @@
 #include "txEnv.h"
 
+#include <string.h>
+
+static bool all_zero(const unsigned char* bytes, size_t len) {
+  unsigned char aggregate = 0;
+  for (size_t i = 0; i < len; ++i) aggregate |= bytes[i];
+  return aggregate == 0;
+}
+
+static bool valid_prior_active_bmm_parent_checkpoint(
+    bool present, const unsigned char endpoint[80]) {
+  if (!endpoint) return !present;
+  if (!present) return all_zero(endpoint, 80);
+  return !all_zero(endpoint, 32)
+      && !all_zero(endpoint + 40, 8)
+      && !all_zero(endpoint + 48, 32);
+}
+
 /* Construct a txEnv structure from its components.
  * This function will precompute any cached values.
  *
@@ -8,7 +25,11 @@
  *               NULL != genesisHash
  *               ix < tx->numInputs
  */
-txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot, const sha256_midstate* genesisHash, const ecx_prior_active_root_env* ecxRoot, uint_fast32_t ix) {
+txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
+                                      const sha256_midstate* genesisHash, const ecx_prior_active_root_env* ecxRoot, uint_fast32_t ix,
+                                      bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp,
+                                      bool priorActiveBmmParentCheckpointPresent,
+                                      const unsigned char priorActiveBmmParentCheckpoint[80]) {
   txEnv result = { .tx = tx
                  , .taproot = taproot
                  , .genesisHash = *genesisHash
@@ -29,6 +50,14 @@ txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const eleme
                  , .verifySp1Groth16 = ecxRoot->verify_sp1_groth16
                  , .verifySp1Groth16Context = ecxRoot->verify_sp1_groth16_context
                  , .ix = ix
+                 , .bmmParentMtp = bmmParentMtp
+                 , .bmmParentMtpPresent = bmmParentMtpPresent
+                 , .priorActiveBmmParentCheckpointPresent =
+                     priorActiveBmmParentCheckpointPresent
+                 , .priorActiveBmmParentCheckpointValid =
+                     valid_prior_active_bmm_parent_checkpoint(
+                         priorActiveBmmParentCheckpointPresent,
+                         priorActiveBmmParentCheckpoint)
                  };
   sha256_toMidstate(result.priorActiveExchangeStateRoot.s, ecxRoot->root_wire);
   sha256_toMidstate(result.priorActiveForcedInboxRoot.s, ecxRoot->forced_inbox_root_wire);
@@ -52,6 +81,10 @@ txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const eleme
                     ecxRoot->incremental_successor_transition_cmr_wire);
   sha256_toMidstate(result.priorActiveBondInboxRoot.s,
                     ecxRoot->prior_active_bond_inbox_root_wire);
+  if (priorActiveBmmParentCheckpoint) {
+    memcpy(result.priorActiveBmmParentCheckpoint,
+           priorActiveBmmParentCheckpoint, 80);
+  }
   sha256_context ctx = sha256_init(result.sigAllHash.s);
   sha256_hash(&ctx, genesisHash);
   sha256_hash(&ctx, genesisHash);

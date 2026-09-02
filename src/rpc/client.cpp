@@ -213,6 +213,13 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getdrivechainpegevents", 0, "start_height" },
     { "getdrivechainpegevents", 1, "count" },
     { "getdrivechainpegevents", 2, "include_l1" },
+    { "sendtomainchain", 4, "mainchainfee"},
+    { "getdrivechainwithdrawalbundle", 1, "vout"},
+    { "getdrivechainwithdrawalbundle", 3, "minconfirmations"},
+    { "verifydrivechainwithdrawalbundle", 2, "minconfirmations"},
+    { "submitdrivechainwithdrawal", 1, "vout"},
+    { "submitdrivechainwithdrawal", 3, "minconfirmations"},
+    { "getusddwithdrawalproof", 0, "index"},
     { "dumpissuanceblindingkey", 1, "vin" },
     { "importissuanceblindingkey", 1, "vin" },
     { "rawissueasset", 1, "issuances" },
@@ -245,6 +252,9 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "updatepsbtpegin", 2, "value" },
     { "claimpegin", 3, "fee_rate" },
     { "createrawpegin", 3, "fee_rate" },
+    { "importdrivechaindeposit", 1, "mainchain_vout" },
+    { "importdrivechaindeposit", 4, "value_sats" },
+    { "importdrivechaindeposit", 5, "fee_sats" },
 
 };
 // clang-format on

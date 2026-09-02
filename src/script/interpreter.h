@@ -12,6 +12,7 @@
 #include <primitives/transaction.h>
 
 #include <optional>
+#include <array>
 #include <vector>
 #include <stdint.h>
 
@@ -311,12 +312,20 @@ struct PrecomputedTransactionData
     //! ELEMENTS: parent genesis hash
     const uint256 m_hash_genesis_block;
     /**
-     * Median time past of the mainchain parent authenticated by this block's
-     * mined BIP301 commitment.  It is absent outside block validation (notably
-     * in today's mempool path) and must never be synthesized from wall clock
-     * time or an unauthenticated RPC response.
+     * Median time past of the authenticated mainchain parent. Block validation
+     * supplies the mined BIP301 context; mempool validation supplies the
+     * authenticated active-tip anchor. It remains absent from context-free
+     * execution and must never be synthesized from wall clock time or an
+     * unauthenticated RPC response.
      */
     std::optional<uint64_t> m_bmm_parent_mtp;
+    /**
+     * Exact V11 atomic prior-active BMM parent endpoint.  Bytes are hash in
+     * RPC/display order, then height/MTP/chainwork in big-endian order.
+     * Absence is distinct from an all-zero value, which the C environment
+     * rejects as malformed.
+     */
+    std::optional<std::array<unsigned char, 80>> m_prior_active_bmm_parent_checkpoint;
     CHashWriter m_tapsighash_hasher;
 
     explicit PrecomputedTransactionData(const uint256& hash_genesis_block);

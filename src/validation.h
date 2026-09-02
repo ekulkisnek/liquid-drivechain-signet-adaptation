@@ -29,6 +29,7 @@
 #include <util/translation.h>
 
 #include <atomic>
+#include <array>
 #include <map>
 #include <memory>
 #include <optional>
@@ -47,6 +48,10 @@ class CChainParams;
 class CTxMemPool;
 class ChainstateManager;
 struct ChainTxData;
+struct DrivechainBmmBlockContext;
+struct DrivechainParentBlockContext;
+enum class DrivechainAnchorStatus;
+enum class DrivechainBmmStatus;
 struct DisconnectedBlockTransactions;
 struct PrecomputedTransactionData;
 struct LockPoints;
@@ -54,6 +59,13 @@ struct AssumeutxoData;
 namespace node {
 class SnapshotMetadata;
 } // namespace node
+
+/** Optional P2P admission detail for dynamic BIP301 failures. */
+struct DrivechainBlockAdmissionInfo {
+    std::optional<DrivechainBmmStatus> bmm_status;
+    uint256 parent_hash;
+    uint256 successor_hash;
+};
 
 /** Default for -minrelaytxfee, minimum relay fee for transactions */
 static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 100;
@@ -143,6 +155,64 @@ extern arith_uint256 nMinimumChainWork;
 
 /** Best header we've seen so far (used for getheaders queries' starting points). */
 extern CBlockIndex *pindexBestHeader;
+
+/**
+ * Whether a block index is eligible to influence drivechain header sync.
+ * Ordinary networks retain their existing header-only behavior.
+ */
+bool IsDrivechainHeaderAuthenticated(const CBlockIndex* index,
+                                     const Consensus::Params& consensus)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+/**
+ * Return the parent MTP that mempool script checks may use. Only a non-genesis
+ * active tip with a sane authenticated DrivechainAnchor supplies context.
+ */
+std::optional<uint64_t> GetDrivechainMempoolParentMtp(
+    const CBlockIndex* tip,
+    const Consensus::Params& consensus)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+using PriorActiveBmmParentCheckpoint = std::array<unsigned char, 80>;
+using V11AtomicBmmScriptCacheSuffix = std::array<unsigned char, 115>;
+
+/**
+ * Encode the versioned V11 atomic-parent contribution to the script cache.
+ *
+ * The historical nine-byte MTP prefix is deliberately not part of this
+ * helper. Callers append this exact 115-byte suffix immediately after that
+ * prefix. An absent endpoint is committed as tag zero plus 80 zero bytes.
+ */
+V11AtomicBmmScriptCacheSuffix EncodeV11AtomicBmmScriptCacheSuffix(
+    const std::optional<PriorActiveBmmParentCheckpoint>& endpoint);
+
+/**
+ * Canonically project the P member of one already-authenticated persisted
+ * DrivechainAnchor.  This codec performs no fork-choice authentication; its
+ * output must not be exposed to Simplicity until the caller has independently
+ * established ACTIVE under the pinned snapshot source.
+ */
+std::optional<PriorActiveBmmParentCheckpoint>
+EncodePriorActiveBmmParentCheckpoint(const DrivechainAnchor& anchor);
+
+/**
+ * Return the atomic parent endpoint committed by an authenticated child tip.
+ *
+ * This is the only validation-owned projection into the V11 Simplicity
+ * environment. It deliberately refuses an unauthenticated, failed,
+ * header-only, genesis, or malformed child index instead of exposing the pure
+ * encoder directly to consensus callers.
+ */
+std::optional<PriorActiveBmmParentCheckpoint>
+GetPriorActiveBmmParentCheckpoint(const CBlockIndex* authenticated_child_tip,
+                                  const Consensus::Params& consensus);
+
+/** Pure authorization rule for replacing a persisted orphaned BIP301 anchor. */
+bool IsDrivechainAnchorReplacementAllowed(
+    DrivechainAnchorStatus old_status,
+    const DrivechainAnchor& old_anchor,
+    const DrivechainAnchor& replacement,
+    const DrivechainAnchor* predecessor_anchor = nullptr);
 
 /** Documentation for argument 'checklevel'. */
 extern const std::vector<std::string> CHECKLEVEL_DOC;
@@ -350,6 +420,9 @@ void InitScriptExecutionCache();
 /** Context-independent validity checks */
 bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
 
+/** Enforce the deterministic per-block USDD SP1 proof-verification lane. */
+bool CheckUsddSp1AnnexBlockResources(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams);
+
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
 bool TestBlockValidity(BlockValidationState& state,
                        const CChainParams& chainparams,
@@ -359,6 +432,24 @@ bool TestBlockValidity(BlockValidationState& state,
                        bool fCheckPOW = true,
                        bool fCheckMerkleRoot = true,
                        bool allow_incomplete_candidate = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+/**
+ * Check a block template before its hash can have a mined BIP301 commitment.
+ * This performs the same transaction and script validation as
+ * TestBlockValidity, but uses only the candidate's authenticated parent-chain
+ * context. It must never be used for block acceptance, relay, or persistence.
+ */
+bool TestBlockCandidateValidity(BlockValidationState& state,
+                                const CChainParams& chainparams,
+                                CChainState& chainstate,
+                                const CBlock& block,
+                                CBlockIndex* pindexPrev,
+                                bool fCheckPOW = true,
+                                bool fCheckMerkleRoot = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+/** Return the consensus script flags selected for a block index. Test-only. */
+unsigned int GetBlockScriptFlagsForTesting(const CBlockIndex* pindex,
+                                           const Consensus::Params& consensusparams);
 
 /** Update uncommitted block structures (currently: only the witness reserved value). This is safe for submitted blocks. */
 void UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPrev, const Consensus::Params& consensusParams);
@@ -484,6 +575,9 @@ protected:
      * const, which latches this for caching purposes.
      */
     mutable std::atomic<bool> m_cached_finished_ibd{false};
+
+    /** Authenticated parent generation against which native mempool peg-ins were checked. */
+    std::atomic<uint64_t> m_drivechain_mempool_parent_epoch{0};
 
     //! Optional mempool that is kept in sync with the chain.
     //! Only the active chainstate has a mempool.
@@ -650,7 +744,28 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(!m_chainstate_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
-    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /**
+     * Fail-closed startup reconciliation for native-drivechain anchors.
+     * Unlike ActivateBestChain(), parent-view unavailability is an error here:
+     * startup must not expose a stale child-chain tip through P2P or RPC.
+     */
+    bool ReconcileDrivechainAnchorsForStartup(BlockValidationState& state)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_chainstate_mutex)
+        LOCKS_EXCLUDED(::cs_main);
+
+    /**
+     * Revalidate native peg-ins against one already-warmed replay generation.
+     * Invalid entries are removed only after a complete stable pass;
+     * temporary parent unavailability keeps them but leaves mining fenced.
+     */
+    bool RevalidateDrivechainMempoolForParentEpoch(
+        uint64_t expected_epoch,
+        std::string* error = nullptr) LOCKS_EXCLUDED(::cs_main);
+
+    /** Whether native peg-ins may be selected by BlockAssembler right now. */
+    bool IsDrivechainMempoolCurrentForMining() const;
+
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, DrivechainBlockAdmissionInfo* drivechain_info = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     // Block (dis)connection on a given view:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
@@ -723,6 +838,26 @@ public:
     std::string ToString() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 private:
+    friend bool TestBlockCandidateValidity(BlockValidationState& state,
+                                           const CChainParams& chainparams,
+                                           CChainState& chainstate,
+                                           const CBlock& block,
+                                           CBlockIndex* pindexPrev,
+                                           bool fCheckPOW,
+                                           bool fCheckMerkleRoot);
+
+    bool ConnectBlockInternal(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
+                              CCoinsViewCache& view, std::set<std::pair<uint256, COutPoint>>* setPeginsSpent,
+                              bool fJustCheck, const DrivechainParentBlockContext* candidate_context,
+                              const DrivechainBmmBlockContext* finalized_context = nullptr,
+                              bool allow_incomplete_candidate = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /** Candidates suppressed only by mutable parent-chain state, never invalidity. */
+    std::set<CBlockIndex*> m_drivechain_suppressed_candidates GUARDED_BY(cs_main);
+
+    bool ReconcileDrivechainAnchors(BlockValidationState& state, bool& blocks_disconnected, bool& stalled)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+
 bool ActivateBestChainStep(BlockValidationState& state, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace, bool& fStall) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
     bool ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions& disconnectpool, bool& fStall) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
 
@@ -856,7 +991,8 @@ private:
         BlockValidationState& state,
         const CChainParams& chainparams,
         CBlockIndex** ppindex,
-        bool* duplicate = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+        bool* duplicate = nullptr,
+        bool full_block_authenticated = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     friend CChainState;
 
 public:
@@ -965,7 +1101,7 @@ public:
      * @param[out]  new_block A boolean which is set to indicate if the block was first received via this call
      * @returns     If the block was processed, independently of block validity
      */
-    bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock>& block, bool force_processing, bool* new_block) LOCKS_EXCLUDED(cs_main);
+    bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<const CBlock>& block, bool force_processing, bool* new_block, DrivechainBlockAdmissionInfo* drivechain_info = nullptr) LOCKS_EXCLUDED(cs_main);
 
     /**
      * Process incoming block headers.
@@ -979,6 +1115,17 @@ public:
      * @param[out] ppindex If set, the pointer will be set to point to the last new block index object for the given headers
      */
     bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& block, BlockValidationState& state, const CChainParams& chainparams, const CBlockIndex** ppindex = nullptr, bool* all_duplicate = nullptr) LOCKS_EXCLUDED(cs_main);
+
+    /**
+     * Validate an unknown native-drivechain header without storing it. The
+     * caller may use the result only to request the corresponding full block.
+     */
+    bool CheckDrivechainEphemeralHeader(
+        const CBlockHeader& header,
+        BlockValidationState& state,
+        const CChainParams& chainparams,
+        const CBlockIndex** predecessor = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /**
      * Try to add a transaction to the memory pool.
@@ -1008,6 +1155,15 @@ public:
         Reset();
     }
 };
+
+/** Pure generation comparison shared by mining policy and focused tests. */
+constexpr bool IsDrivechainMempoolEpochCurrent(
+    const uint64_t authenticated_epoch,
+    const uint64_t mempool_epoch)
+{
+    return authenticated_epoch != 0 &&
+           authenticated_epoch == mempool_epoch;
+}
 
 using FopenFn = std::function<FILE*(const fs::path&, const char*)>;
 

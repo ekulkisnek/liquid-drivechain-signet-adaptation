@@ -208,19 +208,18 @@ struct Params {
     uint16_t drivechain_unused_slot_activation_threshold{0};
     uint16_t drivechain_used_slot_proposal_max_age{0};
     uint16_t drivechain_used_slot_activation_threshold{0};
+    uint16_t drivechain_withdrawal_bundle_max_age{0};
+    uint16_t drivechain_withdrawal_bundle_inclusion_threshold{0};
     uint32_t drivechain_parent_state_replay_version{0};
     uint32_t drivechain_annex_feature_version{0};
     /**
-     * Frozen launch-manifest bit retained for network identity compatibility.
-     * Current software enables withdrawals when the authenticated parent replay
-     * version implements M3/M4/M6, without changing the existing genesis.
+     * True only when parent replay fully validates BIP300 M3/M4/M6 voting and
+     * CTIP decreases for all active slots.
      */
     bool drivechain_m6_withdrawal_validation{false};
     bool DrivechainWithdrawalValidationEnabled() const
     {
-        return drivechain_slot.has_value() &&
-               (drivechain_m6_withdrawal_validation ||
-                drivechain_parent_state_replay_version >= 2);
+        return drivechain_slot.has_value() && drivechain_m6_withdrawal_validation;
     }
     /** Apply the fail-closed USDD SP1 annex envelope rules to Simplicity spends. */
     bool enable_usdd_sp1_annex = false;

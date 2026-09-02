@@ -12,13 +12,130 @@
 #include <ecx_exchange_state.h>
 #include <primitives/pak.h>
 #include <script/pegins.h>
+#include <script/usdd_sp1_annex.h>
+#include <usdd_sp1_resources.h>
+#include <serialize.h>
 #include <span.h>
 #include <chainparams.h> // Peg-out enforcement
+#include <chainparamsbase.h>
 
 #include <limits>
 
 // ELEMENTS:
 CAsset policyAsset;
+
+namespace {
+
+bool UsddSp1AnnexPolicyEnabled()
+{
+    const CChainParams& params = Params();
+    return params.NetworkIDString() == CBaseChainParams::ELEMENTS &&
+           params.GetConsensus().drivechain_slot.has_value() &&
+           params.GetConsensus().enable_usdd_sp1_annex;
+}
+
+/**
+ * Classify BIP341-shaped annex items before UTXO lookup and return the exact
+ * witness weight attributable to one canonical USDD proof annex. The caller
+ * can subtract only this amount from total transaction weight; all other
+ * witness bytes remain subject to the ordinary standardness cap.
+ */
+bool GetUsddSp1AnnexPolicyWeight(const CTransaction& tx,
+                                 uint64_t& annex_weight,
+                                 std::string& reason)
+{
+    annex_weight = 0;
+    const usdd::Sp1AnnexResourceUsage resource_usage =
+        usdd::GetUsddSp1AnnexResourceUsage(tx);
+    if (resource_usage.oversized || resource_usage.malformed) {
+        reason = "usdd-sp1-annex";
+        return false;
+    }
+    if (resource_usage.wrong_spend_shape) {
+        reason = "usdd-sp1-annex-shape";
+        return false;
+    }
+    if (resource_usage.wrong_controller_cmr) {
+        reason = "usdd-sp1-annex-controller-cmr";
+        return false;
+    }
+    if (resource_usage.wrong_guest_program_id) {
+        reason = "usdd-sp1-annex-guest-program-id";
+        return false;
+    }
+    if (resource_usage.malformed_public_values) {
+        reason = "usdd-sp1-annex-public-values";
+        return false;
+    }
+    if (resource_usage.deployment_unconfigured) {
+        reason = "usdd-sp1-deployment-unconfigured";
+        return false;
+    }
+    if (resource_usage.wrong_inbound_mint_domain) {
+        reason = "usdd-sp1-annex-inbound-domain";
+        return false;
+    }
+
+    bool found{false};
+    for (const auto& input_witness : tx.witness.vtxinwit) {
+        const auto& stack = input_witness.scriptWitness.stack;
+        if (stack.size() < 2 || stack.back().empty() ||
+            stack.back()[0] != usdd::SP1_ANNEX_TAG) {
+            continue;
+        }
+        if (!UsddSp1AnnexPolicyEnabled()) {
+            reason = "usdd-sp1-annex";
+            return false;
+        }
+        usdd::Sp1ProofAnnexView parsed;
+        if (usdd::ParseUsddSp1ProofAnnex(stack.back(), parsed) !=
+            usdd::Sp1AnnexError::OK) {
+            reason = "usdd-sp1-annex";
+            return false;
+        }
+        if (found) {
+            reason = "usdd-sp1-annex-multiple";
+            return false;
+        }
+        if (stack.size() != usdd::SP1_TAPSIMPLICITY_WITNESS_ITEMS ||
+            stack[2].size() != 32) {
+            reason = "usdd-sp1-annex-shape";
+            return false;
+        }
+        const auto& control = stack[3];
+        if (control.size() < usdd::SP1_TAPROOT_CONTROL_BASE_SIZE ||
+            control.size() > usdd::SP1_TAPROOT_CONTROL_MAX_SIZE ||
+            (control.size() - usdd::SP1_TAPROOT_CONTROL_BASE_SIZE) %
+                    usdd::SP1_TAPROOT_CONTROL_NODE_SIZE !=
+                0 ||
+            (control[0] & usdd::SP1_TAPROOT_LEAF_MASK) !=
+                usdd::SP1_TAPSIMPLICITY_LEAF_VERSION) {
+            reason = "usdd-sp1-annex-shape";
+            return false;
+        }
+        if constexpr (!ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE) {
+            if (usdd::CheckUsddSp1ProofIdentity(
+                    stack[2], parsed.guest_program_id, parsed.public_values) !=
+                usdd::Sp1ProofIdentityResult::MATCH) {
+                // Historical profiles retain their frozen CMR/program lane.
+                reason = "usdd-sp1-annex-identity";
+                return false;
+            }
+        }
+        found = true;
+
+        // Witness bytes have weight one. Removing an annex deletes its compact
+        // byte length and payload, and can also shrink the stack-item-count
+        // CompactSize at an encoding boundary.
+        annex_weight = GetSizeOfCompactSize(stack.back().size()) +
+                       stack.back().size() +
+                       GetSizeOfCompactSize(stack.size()) -
+                       GetSizeOfCompactSize(stack.size() - 1);
+    }
+    return true;
+}
+
+} // namespace
 
 CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
 {
@@ -114,7 +231,6 @@ bool IsStandardTx(
     // almost as much to process as they cost the sender in fees, because
     // computing signature hashes is O(ninputs*txsize). Limiting transactions
     // to MAX_STANDARD_TX_WEIGHT mitigates CPU exhaustion attacks.
-    unsigned int sz = GetTransactionWeight(tx);
     std::string bond_inbox_error;
     const bool maybe_bond_inbox_source = ecx_consensus != nullptr &&
         std::any_of(tx.vout.begin(), tx.vout.end(), [](const CTxOut& output) {
@@ -127,12 +243,19 @@ bool IsStandardTx(
     const bool canonical_bond_inbox_source = maybe_bond_inbox_source &&
         ecx::IsCanonicalBondInboxSourceTransaction(
             tx, bond_inbox_error, *ecx_consensus);
-    /* Bond-inbox bundles are encrypted availability data and are witness-
-     * discounted.  The only larger standard transaction is an exact,
-     * signature-valid, configuration-bound source capped at 768 KiB full
-     * serialization / 576 KiB witness and exactly one marker.  Up to eight
-     * distinct source transactions may be admitted by a block. */
-    if (sz > MAX_STANDARD_TX_WEIGHT && !canonical_bond_inbox_source) {
+    const uint64_t total_weight = GetTransactionWeight(tx);
+    uint64_t usdd_annex_weight{0};
+    if (Params().GetConsensus().drivechain_slot.has_value() &&
+        !GetUsddSp1AnnexPolicyWeight(tx, usdd_annex_weight, reason)) {
+        return false;
+    }
+    // Exceptions are independently bounded and cannot be combined to bypass
+    // either application's cap. Ordinary non-annex bytes retain their limit.
+    if (usdd_annex_weight > total_weight ||
+        (canonical_bond_inbox_source && usdd_annex_weight != 0) ||
+        (total_weight - usdd_annex_weight > MAX_STANDARD_TX_WEIGHT &&
+         !canonical_bond_inbox_source) ||
+        (usdd_annex_weight != 0 && total_weight > usdd::SP1_PROOF_TX_MAX_WEIGHT)) {
         reason = "tx-size";
         return false;
     }
@@ -270,6 +393,20 @@ bool IsWitnessStandard(
         ecx::IsCanonicalBondInboxSourceTransaction(
             tx, bond_inbox_error, *ecx_consensus);
 
+    const usdd::Sp1AnnexResourceUsage resource_usage =
+        usdd::GetUsddSp1AnnexResourceUsage(tx);
+    if (resource_usage.oversized || resource_usage.malformed ||
+        resource_usage.wrong_spend_shape ||
+        resource_usage.wrong_controller_cmr ||
+        resource_usage.wrong_guest_program_id ||
+        resource_usage.malformed_public_values ||
+        resource_usage.deployment_unconfigured ||
+        resource_usage.wrong_inbound_mint_domain ||
+        resource_usage.namespace_annexes > usdd::SP1_ANNEXES_PER_BLOCK) {
+        return false;
+    }
+
+    bool found_usdd_sp1_annex{false};
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
         // We don't care if witness for this input is empty, since it must not be bloated.
@@ -304,6 +441,49 @@ bool IsWitnessStandard(
         if (!prevScript.IsWitnessProgram(witnessversion, witnessprogram))
             return false;
 
+        Span stack{tx.witness.vtxinwit[i].scriptWitness.stack};
+        const bool has_annex = stack.size() >= 2 && !stack.back().empty() &&
+                               stack.back()[0] == usdd::SP1_ANNEX_TAG;
+        const bool is_native_taproot = witnessversion == 1 &&
+            witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh;
+        if (has_annex && Params().GetConsensus().drivechain_slot.has_value()) {
+            if (!is_native_taproot || !UsddSp1AnnexPolicyEnabled() ||
+                found_usdd_sp1_annex) {
+                return false;
+            }
+            if (stack.size() != usdd::SP1_TAPSIMPLICITY_WITNESS_ITEMS ||
+                stack[2].size() != 32) {
+                return false;
+            }
+            const auto& proof_control = stack[3];
+            if (proof_control.size() < usdd::SP1_TAPROOT_CONTROL_BASE_SIZE ||
+                proof_control.size() > usdd::SP1_TAPROOT_CONTROL_MAX_SIZE ||
+                (proof_control.size() - usdd::SP1_TAPROOT_CONTROL_BASE_SIZE) %
+                        usdd::SP1_TAPROOT_CONTROL_NODE_SIZE !=
+                    0 ||
+                (proof_control[0] & usdd::SP1_TAPROOT_LEAF_MASK) !=
+                    usdd::SP1_TAPSIMPLICITY_LEAF_VERSION) {
+                return false;
+            }
+            usdd::Sp1ProofAnnexView parsed;
+            if (usdd::ParseUsddSp1ProofAnnex(stack.back(), parsed) !=
+                usdd::Sp1AnnexError::OK) {
+                return false;
+            }
+            if constexpr (!ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE) {
+                if (usdd::CheckUsddSp1ProofIdentity(
+                        stack[2], parsed.guest_program_id,
+                        parsed.public_values) !=
+                    usdd::Sp1ProofIdentityResult::MATCH) {
+                    return false;
+                }
+            }
+            found_usdd_sp1_annex = true;
+            SpanPopBack(stack);
+        } else if (has_annex) {
+            SpanPopBack(stack);
+        }
+
         // Check P2WSH standard limits
         if (witnessversion == 0 && witnessprogram.size() == WITNESS_V0_SCRIPTHASH_SIZE) {
             const CScriptWitness& scriptWitness = tx.witness.vtxinwit[i].scriptWitness;
@@ -320,18 +500,14 @@ bool IsWitnessStandard(
 
         // Check policy limits for Taproot spends:
         // - MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE limit for stack item size
-        // - No annexes
-        if (witnessversion == 1 && witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh) {
+        // - At most one canonical USDD SP1 annex on the sole Elements network;
+        //   every other annex is nonstandard
+        if (is_native_taproot) {
             // Missing witness; invalid by consensus rules
             if (i >= tx.witness.vtxinwit.size()) {
                 return false;
             }
             // Taproot spend (non-P2SH-wrapped, version 1, witness program size 32; see BIP 341)
-            Span stack{tx.witness.vtxinwit[i].scriptWitness.stack};
-            const bool has_annex = stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG;
-            if (has_annex) {
-                SpanPopBack(stack);
-            }
             if (stack.size() >= 2) {
                 // Script path spend (2 or more stack elements after removing optional annex)
                 const auto& control_block = SpanPopBack(stack);

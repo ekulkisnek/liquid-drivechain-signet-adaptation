@@ -6,7 +6,7 @@
 
 #include <consensus/amount.h>
 #include <dbwrapper.h>
-#include <elements_drivechain_identity.h>
+#include <hash.h>
 #include <tinyformat.h>
 
 #include <limits>
@@ -19,6 +19,7 @@ static constexpr uint8_t DB_REPLAY_IDENTITY{'I'};
 static constexpr uint8_t DB_REPLAY_TIP{'T'};
 static constexpr uint8_t DB_REPLAY_DEPOSIT{'d'};
 static constexpr uint8_t DB_REPLAY_BMM_EDGE{'e'};
+static constexpr uint8_t DB_REPLAY_SUCCESSFUL_WITHDRAWAL{'w'};
 
 struct DrivechainReplayStoreIdentity {
     uint32_t schema_version{0};
@@ -49,52 +50,78 @@ bool IsSaneTip(const DrivechainParentReplayTip& tip)
                !tip.state.required_activation_block_hash.IsNull()) {
         return false;
     }
-    if (tip.state.ctip.has_value() != (tip.state.ctip_value > 0)) return false;
+    if (!tip.state.ctip && tip.state.ctip_value != 0) return false;
     if (tip.state.ctip && tip.state.active_proposal_hash.IsNull()) return false;
     if (tip.state.ctip_value < 0 || !MoneyRange(tip.state.ctip_value)) return false;
     for (const auto& proposal : tip.state.pending_proposals) {
         if (proposal.first.IsNull() ||
-            proposal.second.proposal_height > tip.height) {
+            proposal.second.proposal_height > tip.height ||
+            proposal.second.votes >
+                tip.height - proposal.second.proposal_height) {
             return false;
         }
     }
-    std::set<uint256> target_m6ids;
+    std::set<uint256> configured_m6ids;
     for (const auto& withdrawal : tip.state.pending_withdrawals) {
         if (withdrawal.proposal_height > tip.height ||
-            !target_m6ids.insert(withdrawal.m6id).second) {
+            withdrawal.votes >
+                static_cast<uint64_t>(tip.height - withdrawal.proposal_height) + 2 ||
+            !configured_m6ids.insert(withdrawal.m6id).second) {
             return false;
         }
     }
-    const uint8_t configured_slot = ElementsDrivechainIdentity::SIDECHAIN_SLOT;
-    if (tip.state.auxiliary_slots.count(configured_slot) != 0) return false;
-    for (const auto& [slot, slot_state] : tip.state.auxiliary_slots) {
-        (void)slot;
-        if (slot_state.ctip.has_value() != (slot_state.ctip_value > 0) ||
-            (slot_state.ctip && slot_state.active_proposal_hash.IsNull()) ||
-            slot_state.ctip_value < 0 || !MoneyRange(slot_state.ctip_value)) {
-            return false;
+    if (tip.state.active_proposal_hash.IsNull() &&
+        !tip.state.pending_withdrawals.empty()) {
+        return false;
+    }
+    std::set<Sidechain::Bitcoin::COutPoint> ctips;
+    if (tip.state.ctip) ctips.insert(*tip.state.ctip);
+    for (const auto& [slot, slot_state] : tip.state.other_slots) {
+        if (slot_state.active_proposal_hash.IsNull() && slot_state.ctip) return false;
+        if (!slot_state.ctip && slot_state.ctip_value != 0) return false;
+        if (slot_state.ctip_value < 0 || !MoneyRange(slot_state.ctip_value)) return false;
+        if (slot_state.ctip && !ctips.insert(*slot_state.ctip).second) return false;
+        for (const auto& proposal : slot_state.pending_proposals) {
+            if (proposal.first.IsNull() ||
+                proposal.second.proposal_height > tip.height ||
+                proposal.second.votes >
+                    tip.height - proposal.second.proposal_height) {
+                return false;
+            }
         }
         std::set<uint256> m6ids;
-        for (const auto& proposal : slot_state.pending_proposals) {
-            if (proposal.second.proposal_height > tip.height) return false;
-        }
         for (const auto& withdrawal : slot_state.pending_withdrawals) {
             if (withdrawal.proposal_height > tip.height ||
+                withdrawal.votes >
+                    static_cast<uint64_t>(tip.height - withdrawal.proposal_height) + 2 ||
                 !m6ids.insert(withdrawal.m6id).second) {
                 return false;
             }
         }
+        if (slot_state.active_proposal_hash.IsNull() &&
+            !slot_state.pending_withdrawals.empty()) {
+            return false;
+        }
     }
+    bool configured_slot_action_seen{false};
     for (const auto& [slot, action] : tip.state.previous_m4_actions) {
-        const bool slot_active = slot == configured_slot
-            ? !tip.state.active_proposal_hash.IsNull()
-            : tip.state.auxiliary_slots.count(slot) != 0 &&
-                  !tip.state.auxiliary_slots.at(slot).active_proposal_hash.IsNull();
-        if (!slot_active ||
-            (action.type != DrivechainM4ActionType::UPVOTE &&
+        if ((action.type != DrivechainM4ActionType::UPVOTE &&
              action.type != DrivechainM4ActionType::ALARM) ||
             (action.type == DrivechainM4ActionType::ALARM && !action.m6id.IsNull())) {
             return false;
+        }
+        const auto other_slot = tip.state.other_slots.find(slot);
+        if (other_slot != tip.state.other_slots.end()) {
+            if (other_slot->second.active_proposal_hash.IsNull()) return false;
+        } else {
+            // other_slots deliberately excludes the configured slot. At most
+            // one action key may therefore be absent from that map, and only
+            // while the top-level configured slot is active.
+            if (configured_slot_action_seen ||
+                tip.state.active_proposal_hash.IsNull()) {
+                return false;
+            }
+            configured_slot_action_seen = true;
         }
     }
     return true;
@@ -117,6 +144,20 @@ bool IsSaneEdge(const uint256& parent_hash,
            edge.successor_height == edge.parent_height + 1 &&
            (!edge.has_canonical_commitment ||
             !edge.committed_sidechain_hash.IsNull());
+}
+
+bool IsSaneSuccessfulWithdrawal(
+    const DrivechainSuccessfulWithdrawal& withdrawal)
+{
+    return !withdrawal.block_hash.IsNull();
+}
+
+auto SuccessfulWithdrawalKey(const uint8_t sidechain_slot,
+                             const uint256& m6id)
+{
+    return std::make_pair(
+        DB_REPLAY_SUCCESSFUL_WITHDRAWAL,
+        std::make_pair(sidechain_slot, m6id));
 }
 
 template <typename Key, typename Value>
@@ -196,11 +237,16 @@ DrivechainReplayStoreLoadStatus DrivechainParentReplayStore::Load(
 
 bool DrivechainParentReplayStore::Reset(
     const uint256& identity,
-    const DrivechainParentReplayTip& genesis,
+    const DrivechainParentReplayTip& seed,
     std::string* error)
 {
-    if (!IsSaneTip(genesis) || genesis.height != 0) {
-        return SetStoreError(error, "refusing to seed persistent parent replay with an invalid genesis tip");
+    // The replay store is a derived cache. Its authenticated seed is normally
+    // parent genesis, but a pruned-light-client profile may instead seed the
+    // exact immutable checkpoint whose complete replay state is committed by
+    // the network identity. Validate the record itself here; the caller owns
+    // authentication of the seed against that identity commitment.
+    if (!IsSaneTip(seed)) {
+        return SetStoreError(error, "refusing to seed persistent parent replay with an invalid tip");
     }
 
     // Release LevelDB's directory lock before opening the same derived index
@@ -214,7 +260,7 @@ bool DrivechainParentReplayStore::Reset(
         CDBBatch batch(*m_db);
         batch.Write(DB_REPLAY_IDENTITY,
                     DrivechainReplayStoreIdentity{SCHEMA_VERSION, identity});
-        batch.Write(DB_REPLAY_TIP, genesis);
+        batch.Write(DB_REPLAY_TIP, seed);
         if (!m_db->WriteBatch(batch, /*fSync=*/true)) {
             return SetStoreError(error, "failed to atomically seed persistent parent replay");
         }
@@ -231,6 +277,8 @@ bool DrivechainParentReplayStore::Append(
     const DrivechainParentReplayTip& next,
     const std::vector<DrivechainMintableDeposit>& deposits,
     const std::optional<std::pair<uint256, DrivechainReplayedBmmEdge>>& edge,
+    const std::vector<DrivechainSuccessfulWithdrawal>& successful_withdrawals,
+    const std::vector<DrivechainWithdrawalProposalIdentity>& withdrawal_proposals,
     std::string* error)
 {
     if (!m_db) {
@@ -247,7 +295,8 @@ bool DrivechainParentReplayStore::Append(
         const auto tip_status = ReadRecord(
             *m_db, DB_REPLAY_TIP, stored_tip, "tip", error);
         if (tip_status != DrivechainReplayStoreReadStatus::FOUND ||
-            stored_tip.height != previous.height || stored_tip.hash != previous.hash) {
+            stored_tip.height != previous.height || stored_tip.hash != previous.hash ||
+            SerializeHash(stored_tip.state) != SerializeHash(previous.state)) {
             return SetStoreError(error, "persistent parent replay tip changed before append");
         }
 
@@ -270,6 +319,37 @@ bool DrivechainParentReplayStore::Append(
                 return SetStoreError(error, "persistent parent replay append contains a duplicate or malformed BMM edge");
             }
         }
+        std::set<std::pair<uint8_t, uint256>> block_withdrawals;
+        for (const auto& withdrawal : successful_withdrawals) {
+            const auto identity = std::make_pair(
+                withdrawal.sidechain_slot, withdrawal.m6id);
+            if (!IsSaneSuccessfulWithdrawal(withdrawal) ||
+                withdrawal.block_height != next.height ||
+                withdrawal.block_hash != next.hash ||
+                !block_withdrawals.insert(identity).second ||
+                m_db->Exists(SuccessfulWithdrawalKey(
+                    withdrawal.sidechain_slot, withdrawal.m6id))) {
+                return SetStoreError(
+                    error,
+                    "persistent parent replay append contains a duplicate or malformed successful withdrawal");
+            }
+        }
+        std::set<std::pair<uint8_t, uint256>> block_proposals;
+        for (const auto& proposal : withdrawal_proposals) {
+            const auto identity = std::make_pair(
+                proposal.sidechain_slot, proposal.m6id);
+            if (!block_proposals.insert(identity).second) {
+                return SetStoreError(
+                    error,
+                    "persistent parent replay append contains a duplicate M3 proposal identity");
+            }
+            if (m_db->Exists(SuccessfulWithdrawalKey(
+                    proposal.sidechain_slot, proposal.m6id))) {
+                return SetStoreError(
+                    error,
+                    "M3 re-proposes a withdrawal that already succeeded on the active parent chain");
+            }
+        }
 
         CDBBatch batch(*m_db);
         for (const auto& deposit : deposits) {
@@ -277,6 +357,12 @@ bool DrivechainParentReplayStore::Append(
         }
         if (edge.has_value()) {
             batch.Write(std::make_pair(DB_REPLAY_BMM_EDGE, edge->first), edge->second);
+        }
+        for (const auto& withdrawal : successful_withdrawals) {
+            batch.Write(
+                SuccessfulWithdrawalKey(
+                    withdrawal.sidechain_slot, withdrawal.m6id),
+                withdrawal);
         }
         batch.Write(DB_REPLAY_TIP, next);
         if (!m_db->WriteBatch(batch, /*fSync=*/true)) {
@@ -337,6 +423,39 @@ DrivechainReplayStoreReadStatus DrivechainParentReplayStore::ReadBmmEdge(
     } catch (const std::exception& e) {
         SetStoreError(error, strprintf(
                                  "persistent parent replay BMM-edge read failed: %s", e.what()));
+        return DrivechainReplayStoreReadStatus::CORRUPT;
+    }
+}
+
+DrivechainReplayStoreReadStatus
+DrivechainParentReplayStore::ReadSuccessfulWithdrawal(
+    const uint8_t sidechain_slot,
+    const uint256& m6id,
+    DrivechainSuccessfulWithdrawal& withdrawal,
+    std::string* error) const
+{
+    if (!m_db) {
+        SetStoreError(error, "persistent parent replay database is not open");
+        return DrivechainReplayStoreReadStatus::CORRUPT;
+    }
+    try {
+        const auto status = ReadRecord(
+            *m_db, SuccessfulWithdrawalKey(sidechain_slot, m6id),
+            withdrawal, "successful withdrawal", error);
+        if (status == DrivechainReplayStoreReadStatus::FOUND &&
+            (!IsSaneSuccessfulWithdrawal(withdrawal) ||
+             withdrawal.sidechain_slot != sidechain_slot ||
+             withdrawal.m6id != m6id)) {
+            SetStoreError(
+                error,
+                "persistent parent replay successful-withdrawal record is internally inconsistent");
+            return DrivechainReplayStoreReadStatus::CORRUPT;
+        }
+        return status;
+    } catch (const std::exception& e) {
+        SetStoreError(error, strprintf(
+                                 "persistent parent replay successful-withdrawal read failed: %s",
+                                 e.what()));
         return DrivechainReplayStoreReadStatus::CORRUPT;
     }
 }

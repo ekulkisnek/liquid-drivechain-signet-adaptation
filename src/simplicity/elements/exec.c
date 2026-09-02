@@ -110,6 +110,7 @@ extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* erro
                                               , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
                                               , const unsigned char* genesisBlockHash
                                               , const ecx_prior_active_root_env* ecxRoot
+                                              , const rawElementsBlockEnv* blockEnv
                                               , int64_t minCost, int64_t budget
                                               , const unsigned char* amr
                                               , const unsigned char* program, size_t program_len
@@ -202,7 +203,11 @@ extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* erro
       simplicity_free(analysis);
     }
     if (IS_OK(*error)) {
-      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ecxRoot, ix);
+      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ecxRoot, ix,
+                                                  blockEnv && blockEnv->bmmParentMtpPresent,
+                                                  blockEnv ? blockEnv->bmmParentMtp : 0,
+                                                  blockEnv && blockEnv->priorActiveBmmParentCheckpointPresent,
+                                                  blockEnv ? blockEnv->priorActiveBmmParentCheckpoint : NULL);
       static_assert(BUDGET_MAX <= UBOUNDED_MAX, "BUDGET_MAX doesn't fit in ubounded.");
       *error = evalTCOProgram( dag, type_dag, (size_t)dag_len
                              , minCost <= BUDGET_MAX ? (ubounded)minCost : BUDGET_MAX
@@ -225,6 +230,6 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
                                               , const unsigned char* witness, size_t witness_len) {
   const ecx_prior_active_root_env absent = {0};
   return simplicity_elements_execSimplicityWithBlockEnv(
-      error, ihr, tx, ix, taproot, genesisBlockHash, &absent,
+      error, ihr, tx, ix, taproot, genesisBlockHash, &absent, NULL,
       minCost, budget, amr, program, program_len, witness, witness_len);
 }

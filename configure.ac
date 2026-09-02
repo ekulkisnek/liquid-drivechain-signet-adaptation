@@ -264,8 +264,33 @@ AC_ARG_ENABLE([liquid],
   [AS_HELP_STRING([--enable-liquid],
   [removed: legacy Liquid config/datadir/pid namespaces are incompatible with the canonical Elements network])],
   [if test "$enableval" != "no"; then
-     AC_MSG_ERROR([--enable-liquid is unsupported; use the canonical Elements filenames and elements-v1 network directory])
+     AC_MSG_ERROR([--enable-liquid is unsupported; use the canonical Elements filenames and canonical network directory])
    fi])
+
+AC_ARG_WITH([usdd-sp1-verifier],
+  [AS_HELP_STRING([--with-usdd-sp1-verifier=ARCHIVE],
+  [link an absolute path to the pinned usdd-sp1-verifier Rust static archive (default: disabled)])],
+  [usdd_sp1_verifier_archive=$withval],
+  [usdd_sp1_verifier_archive=no])
+AC_ARG_VAR([USDD_SP1_VERIFIER_NATIVE_LIBS],
+  [additional native link flags required by the Rust SP1 static archive])
+AC_ARG_WITH([ecx-sp1-verifier],
+  [AS_HELP_STRING([--with-ecx-sp1-verifier=ARCHIVE],
+  [link an absolute path to the ECX SP1 6.3.1 Groth16/custody Rust static archive (default: disabled)])],
+  [ecx_sp1_verifier_archive=$withval],
+  [ecx_sp1_verifier_archive=no])
+AC_ARG_VAR([ECX_SP1_VERIFIER_SYSTEM_LIBS],
+  [native link flags from rustc --print=native-static-libs for the ECX verifier archive])
+AC_ARG_VAR([MACOSX_DEPLOYMENT_TARGET],
+  [minimum macOS version shared by the verifier archive and Elements binaries])
+AC_ARG_ENABLE([usdd-unsafe-prototype-build],
+  [AS_HELP_STRING([--enable-usdd-unsafe-prototype-build],
+  [allow a known macOS verifier deployment-target mismatch for local prototype testing only (default=no)])],
+  [case "$enableval" in
+     yes|no) usdd_unsafe_prototype_build=$enableval ;;
+     *) AC_MSG_ERROR([--enable-usdd-unsafe-prototype-build accepts only yes or no]) ;;
+   esac],
+  [usdd_unsafe_prototype_build=no])
 
 if test "$use_asm" = "yes"; then
   AC_DEFINE([USE_ASM], [1], [Define this symbol to build in assembly routines])
@@ -1797,6 +1822,174 @@ if test "$build_bitcoin_wallet$build_bitcoin_cli$build_bitcoin_tx$build_bitcoin_
   AC_MSG_ERROR([No targets! Please specify at least one of: --with-utils --with-libs --with-daemon --with-gui --enable-bench or --enable-tests])
 fi
 
+USDD_SP1_VERIFIER_LIBS=""
+USDD_SP1_VERIFIER_ARCHIVE=""
+USDD_SP1_VERIFIER_SHARED_LDFLAGS=""
+USDD_SP1_VERIFIER_PKGCONFIG_LIBS=""
+if test "$usdd_sp1_verifier_archive" != "no"; then
+  case "$usdd_sp1_verifier_archive" in
+    /*) ;;
+    *) AC_MSG_ERROR([--with-usdd-sp1-verifier requires an absolute archive path]) ;;
+  esac
+  case "$usdd_sp1_verifier_archive" in
+    *" "*) AC_MSG_ERROR([--with-usdd-sp1-verifier archive path must not contain spaces]) ;;
+  esac
+  if test ! -f "$usdd_sp1_verifier_archive"; then
+    AC_MSG_ERROR([USDD SP1 verifier archive does not exist: $usdd_sp1_verifier_archive])
+  fi
+
+  if test "$TARGET_OS" = "darwin"; then
+    usdd_macos_deployment_target_ok=yes
+    if test -z "$MACOSX_DEPLOYMENT_TARGET"; then
+      usdd_macos_deployment_target_ok=no
+      usdd_macos_deployment_target_error="MACOSX_DEPLOYMENT_TARGET must be explicitly exported for verifier builds"
+    else
+      AC_MSG_CHECKING([whether every USDD verifier object targets macOS $MACOSX_DEPLOYMENT_TARGET])
+      if "$PYTHON" "$srcdir/contrib/devtools/check_macos_deployment_target.py" \
+          --target "$MACOSX_DEPLOYMENT_TARGET" "$usdd_sp1_verifier_archive"; then
+        AC_MSG_RESULT([yes])
+      else
+        AC_MSG_RESULT([no])
+        usdd_macos_deployment_target_ok=no
+        usdd_macos_deployment_target_error="the USDD verifier archive contains a missing or mismatched macOS deployment target"
+      fi
+    fi
+    if test "$usdd_macos_deployment_target_ok" != "yes"; then
+      if test "$usdd_unsafe_prototype_build" = "yes"; then
+        AC_MSG_WARN([unsafe prototype override enabled: $usdd_macos_deployment_target_error; this build is non-redistributable])
+      else
+        AC_MSG_ERROR([$usdd_macos_deployment_target_error; rebuild in a fresh Cargo target directory or use --enable-usdd-unsafe-prototype-build only for a local prototype])
+      fi
+    fi
+  fi
+
+  if test -z "$USDD_SP1_VERIFIER_NATIVE_LIBS"; then
+    case "$TARGET_OS" in
+      darwin) USDD_SP1_VERIFIER_NATIVE_LIBS="-framework Security -framework CoreFoundation -liconv" ;;
+      linux) USDD_SP1_VERIFIER_NATIVE_LIBS="-ldl -lpthread -lm" ;;
+      *) AC_MSG_ERROR([USDD SP1 verifier static linking is not defined for target OS $TARGET_OS]) ;;
+    esac
+  fi
+
+  saved_LIBS="$LIBS"
+  LIBS="$usdd_sp1_verifier_archive $USDD_SP1_VERIFIER_NATIVE_LIBS $LIBS"
+  AC_MSG_CHECKING([whether the pinned USDD SP1 verifier ABI links])
+  usdd_sp1_verifier_link_ok=no
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+    #include <stddef.h>
+    #include <stdint.h>
+    extern uint32_t usdd_sp1_verifier_abi_version(void);
+    extern uint32_t usdd_sp1_verifier_semantic_identity_version(void);
+    extern uint32_t usdd_sp1_verifier_semantic_identity(uint8_t*, size_t);
+    extern uint32_t usdd_sp1_verify_annex(uint32_t, const uint8_t*, size_t,
+                                         const uint8_t*, size_t,
+                                         const uint8_t*, size_t);
+  ]], [[
+    const uint8_t byte = 0;
+    uint8_t semantic_identity[32] = {0};
+    const uint32_t identity_status =
+        usdd_sp1_verifier_semantic_identity(semantic_identity, sizeof(semantic_identity));
+    const uint32_t status = usdd_sp1_verify_annex(
+        1U, &byte, 1U, &byte, 1U, &byte, 1U);
+    return usdd_sp1_verifier_abi_version() == 1U &&
+           usdd_sp1_verifier_semantic_identity_version() == 1U &&
+           identity_status <= 4U && status <= 4U ? 0 : 1;
+  ]])], [
+    usdd_sp1_verifier_link_ok=yes
+  ], [])
+  LIBS="$saved_LIBS"
+  if test "$usdd_sp1_verifier_link_ok" = "yes"; then
+    AC_MSG_RESULT([yes])
+  else
+    AC_MSG_RESULT([no])
+    AC_MSG_ERROR([cannot link the USDD SP1 verifier ABI; set USDD_SP1_VERIFIER_NATIVE_LIBS to the archive's rustc native-static-libs output])
+  fi
+  USDD_SP1_VERIFIER_LIBS="$usdd_sp1_verifier_archive $USDD_SP1_VERIFIER_NATIVE_LIBS"
+  USDD_SP1_VERIFIER_ARCHIVE="$usdd_sp1_verifier_archive"
+  dnl A bare static archive in libelementsconsensus_la_LIBADD is nested inside
+  dnl libelementsconsensus.a by libtool. Pass the archive directly to the
+  dnl shared-library linker instead; the public static library obtains the
+  dnl installed sidecar through Libs.private in pkg-config.
+  USDD_SP1_VERIFIER_SHARED_LDFLAGS="-Wl,$usdd_sp1_verifier_archive $USDD_SP1_VERIFIER_NATIVE_LIBS"
+  USDD_SP1_VERIFIER_PKGCONFIG_LIBS="-lelements-usdd-sp1-verifier -lelements-secp256k1 $USDD_SP1_VERIFIER_NATIVE_LIBS"
+  AC_DEFINE([HAVE_USDD_SP1_VERIFIER], [1],
+    [Define to 1 when the pinned USDD SP1 verifier static archive is linked])
+fi
+AC_SUBST([USDD_SP1_VERIFIER_LIBS])
+AC_SUBST([USDD_SP1_VERIFIER_ARCHIVE])
+AC_SUBST([USDD_SP1_VERIFIER_SHARED_LDFLAGS])
+AC_SUBST([USDD_SP1_VERIFIER_PKGCONFIG_LIBS])
+AM_CONDITIONAL([WITH_USDD_SP1_VERIFIER], [test "$usdd_sp1_verifier_archive" != "no"])
+
+ECX_SP1_VERIFIER_LIB=""
+ECX_SP1_VERIFIER_SHARED_LDFLAGS=""
+ECX_SP1_VERIFIER_PKGCONFIG_LIBS=""
+if test "$ecx_sp1_verifier_archive" != "no"; then
+  case "$ecx_sp1_verifier_archive" in
+    /*) ;;
+    *) AC_MSG_ERROR([--with-ecx-sp1-verifier requires an absolute archive path]) ;;
+  esac
+  case "$ecx_sp1_verifier_archive" in
+    *" "*) AC_MSG_ERROR([--with-ecx-sp1-verifier archive path must not contain spaces]) ;;
+  esac
+  if test ! -f "$ecx_sp1_verifier_archive"; then
+    AC_MSG_ERROR([ECX SP1 verifier archive does not exist: $ecx_sp1_verifier_archive])
+  fi
+  if test "$TARGET_OS" = "darwin"; then
+    if test -z "$MACOSX_DEPLOYMENT_TARGET"; then
+      AC_MSG_ERROR([MACOSX_DEPLOYMENT_TARGET must be explicitly exported for ECX verifier builds])
+    fi
+    AC_MSG_CHECKING([whether every ECX verifier object targets macOS $MACOSX_DEPLOYMENT_TARGET])
+    if "$PYTHON" "$srcdir/contrib/devtools/check_macos_deployment_target.py" \
+        --target "$MACOSX_DEPLOYMENT_TARGET" "$ecx_sp1_verifier_archive"; then
+      AC_MSG_RESULT([yes])
+    else
+      AC_MSG_ERROR([ECX verifier deployment-target mismatch; rebuild the archive in a fresh Cargo target directory])
+    fi
+  fi
+  if test -z "$ECX_SP1_VERIFIER_SYSTEM_LIBS"; then
+    case "$TARGET_OS" in
+      darwin) ECX_SP1_VERIFIER_SYSTEM_LIBS="-liconv -lSystem -lc -lm" ;;
+      linux) ECX_SP1_VERIFIER_SYSTEM_LIBS="-ldl -lpthread -lm" ;;
+      *) AC_MSG_ERROR([set ECX_SP1_VERIFIER_SYSTEM_LIBS for target OS $TARGET_OS]) ;;
+    esac
+  fi
+  saved_LIBS="$LIBS"
+  LIBS="$ecx_sp1_verifier_archive $ECX_SP1_VERIFIER_SYSTEM_LIBS $LIBS"
+  AC_MSG_CHECKING([whether the ECX SP1 6.3.1 Groth16 and custody verifier ABIs link])
+  ecx_sp1_verifier_link_ok=no
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([[
+    #include <stdbool.h>
+    #include <stddef.h>
+    #include <stdint.h>
+    extern bool ecx_sp1_6_3_1_verify_groth16_sha256(
+        void*, const uint8_t*, size_t, const uint32_t*, const uint8_t*);
+    extern bool ecx_witness_availability_verify_custody_receipts_v1(
+        const uint8_t*, size_t, const uint8_t*, size_t, const uint8_t*, size_t);
+  ]], [[
+    const bool proof = ecx_sp1_6_3_1_verify_groth16_sha256(NULL, NULL, 0, NULL, NULL);
+    const bool custody = ecx_witness_availability_verify_custody_receipts_v1(
+        NULL, 0, NULL, 0, NULL, 0);
+    return proof || custody;
+  ]])], [ecx_sp1_verifier_link_ok=yes], [])
+  LIBS="$saved_LIBS"
+  if test "$ecx_sp1_verifier_link_ok" != "yes"; then
+    AC_MSG_RESULT([no])
+    AC_MSG_ERROR([cannot link the ECX SP1 6.3.1 Groth16/custody ABIs; a 6.1.0 or native-USDD archive is not a substitute])
+  fi
+  AC_MSG_RESULT([yes])
+  ECX_SP1_VERIFIER_LIB="$ecx_sp1_verifier_archive"
+  dnl As for USDD, do not nest a Rust archive inside libelementsconsensus.a.
+  ECX_SP1_VERIFIER_SHARED_LDFLAGS="-Wl,$ecx_sp1_verifier_archive $ECX_SP1_VERIFIER_SYSTEM_LIBS"
+  ECX_SP1_VERIFIER_PKGCONFIG_LIBS="-lelements-ecx-sp1-verifier $ECX_SP1_VERIFIER_SYSTEM_LIBS"
+  AC_DEFINE([ECX_ENABLE_SP1_GROTH16_VERIFIER], [1],
+    [Define to 1 when the ECX SP1 6.3.1 Groth16 and custody verifier archive is linked])
+fi
+AC_SUBST([ECX_SP1_VERIFIER_LIB])
+AC_SUBST([ECX_SP1_VERIFIER_SHARED_LDFLAGS])
+AC_SUBST([ECX_SP1_VERIFIER_PKGCONFIG_LIBS])
+AM_CONDITIONAL([WITH_ECX_SP1_VERIFIER], [test "$ecx_sp1_verifier_archive" != "no"])
+
 if test "$enable_fuzz_binary" = "yes"; then
   CHECK_RUNTIME_LIB
 fi
@@ -1979,6 +2172,9 @@ echo "  with upnp       = $use_upnp"
 echo "  with natpmp     = $use_natpmp"
 echo "  use asm         = $use_asm"
 echo "  USDT tracing    = $use_usdt"
+echo "  USDD SP1 verifier = $usdd_sp1_verifier_archive"
+echo "  ECX SP1 6.3.1 verifier = $ecx_sp1_verifier_archive"
+echo "  unsafe USDD prototype build = $usdd_unsafe_prototype_build"
 echo "  sanitizers      = $use_sanitizers"
 echo "  debug enabled   = $enable_debug"
 echo "  gprof enabled   = $enable_gprof"

@@ -364,6 +364,10 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
         m_node.chainman->ActiveChainstate().CoinsTip().SetBestBlock(next->GetBlockHash());
         next->pprev = prev;
         next->nHeight = prev->nHeight + 1;
+        // These synthetic subsidy-height steps contain no transactions. Carry
+        // the real predecessor's withdrawal state, just as empty validated
+        // blocks do; do not bypass the assembler's accumulator checks.
+        next->m_usdd_withdrawal_accumulator = prev->m_usdd_withdrawal_accumulator;
         next->BuildSkip();
         m_node.chainman->ActiveChain().SetTip(next);
     }
@@ -376,6 +380,7 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
         m_node.chainman->ActiveChainstate().CoinsTip().SetBestBlock(next->GetBlockHash());
         next->pprev = prev;
         next->nHeight = prev->nHeight + 1;
+        next->m_usdd_withdrawal_accumulator = prev->m_usdd_withdrawal_accumulator;
         next->BuildSkip();
         m_node.chainman->ActiveChain().SetTip(next);
     }
