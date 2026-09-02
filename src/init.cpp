@@ -30,6 +30,8 @@
 #include <interfaces/chain.h>
 #include <interfaces/init.h>
 #include <interfaces/node.h>
+#include <interfaces/wallet.h>
+#include <key_io.h>
 #include <mainchainrpc.h>
 #include <mapport.h>
 #include <net.h>
@@ -132,6 +134,48 @@ using node::nPruneTarget;
 
 static CThreadInterrupt g_drivechain_l1_block_sync_interrupt;
 static std::thread g_drivechain_l1_block_sync_thread;
+
+bool BuildDrivechainRewardScript(
+    const std::string& address,
+    const std::function<bool(const CTxDestination&)>& is_spendable,
+    CScript& script,
+    std::string* error)
+{
+    script.clear();
+    if (error) error->clear();
+    if (address.empty()) {
+        if (error) *error = "set -drivechainrewardaddress to an address owned by the bidder's loaded Elements wallet";
+        return false;
+    }
+    const CTxDestination destination = DecodeDestination(address);
+    if (!IsValidDestination(destination)) {
+        if (error) *error = "-drivechainrewardaddress is not a valid address on the selected network";
+        return false;
+    }
+
+    // Restrict the automatic bidder to key-hash destinations. A script-hash
+    // address (or a future witness program) could still hide OP_TRUE, and the
+    // coinbase is explicit, so do not silently discard a blinding key.
+    const CPubKey* blinding_key{nullptr};
+    if (const auto* pkh = std::get_if<PKHash>(&destination)) {
+        blinding_key = &pkh->blinding_pubkey;
+    } else if (const auto* wpkh = std::get_if<WitnessV0KeyHash>(&destination)) {
+        blinding_key = &wpkh->blinding_pubkey;
+    } else {
+        if (error) *error = "-drivechainrewardaddress must be an unconfidential P2PKH or P2WPKH address";
+        return false;
+    }
+    if (blinding_key->IsValid()) {
+        if (error) *error = "-drivechainrewardaddress must be unconfidential because coinbase rewards are explicit";
+        return false;
+    }
+    if (!is_spendable || !is_spendable(destination)) {
+        if (error) *error = "-drivechainrewardaddress is not spendable by a loaded private-key-enabled wallet";
+        return false;
+    }
+    script = GetScriptForDestination(destination);
+    return true;
+}
 
 static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
 {
@@ -326,7 +370,26 @@ static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_h
     const uint64_t approving_parent_height{
         static_cast<uint64_t>(parent_height) + 1};
 
-    CScript coinbase_script(OP_TRUE);
+    // Commit the bidder's wallet-controlled payout before hashing the
+    // candidate and paying for its BMM request. A missing/unowned destination
+    // pauses only automatic bidding, not normal node validation or peering.
+    CScript coinbase_script;
+    std::string reward_error;
+    if (!BuildDrivechainRewardScript(
+            gArgs.GetArg("-drivechainrewardaddress", ""),
+            [&node](const CTxDestination& destination) {
+                if (!node.wallet_loader) return false;
+                for (const auto& wallet : node.wallet_loader->getWallets()) {
+                    if (!wallet->privateKeysDisabled() && wallet->isSpendable(destination)) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            coinbase_script, &reward_error)) {
+        LogPrintf("drivechain L1 block sync: automatic BMM bidding paused: %s\n", reward_error);
+        return false;
+    }
     std::unique_ptr<CBlockTemplate> block_template(BlockAssembler(node.chainman->ActiveChainstate(), *node.mempool, Params()).CreateNewBlock(coinbase_script, std::chrono::seconds(0), nullptr, &commitments, approving_parent_height));
     if (!block_template) {
         LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n", parent_height);
@@ -1043,6 +1106,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "BIP301 sidechain slot used for mined BMM commitment enforcement. (default: 24)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainrewardaddress=<address>", "Unconfidential P2PKH/P2WPKH address owned by a loaded private-key-enabled Elements wallet, paid the automatic BMM candidate's fees and subsidy. Required for automatic bidding; absent, invalid, or unowned addresses pause bidding without stopping the node. No anyone-can-spend fallback. This does not refund the mainchain bid.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "CUSF enforcer Connect/JSON address used for BIP301 requests and mined commitment verification. Requests use bounded in-process HTTP and never launch an external command. (default: 127.0.0.1:50051)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmwalletaddr=<host:port>", "BitWindow Connect/JSON wallet bridge used to fund BIP301 bids. (default: 127.0.0.1:30301)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmconnectauthcookie=<file>", "BitWindow local-auth cookie used as a bearer token for the wallet bridge. The token is read from this file and is never placed in process arguments.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
@@ -1284,6 +1348,12 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     // ********************************************************* Step 2: parameter interactions
 
     // also see: InitParameterInteraction()
+
+    if (args.IsArgSet("-drivechainrewardaddress") &&
+        (!chainparams.GetConsensus().elements_mode ||
+         !chainparams.GetConsensus().has_parent_chain)) {
+        return InitError(Untranslated("-drivechainrewardaddress may only be used in an Elements parent-chain configuration"));
+    }
 
     // Error if network-specific options (-addnode, -connect, etc) are
     // specified in default section of config file, but not overridden

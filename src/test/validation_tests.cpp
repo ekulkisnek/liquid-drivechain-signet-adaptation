@@ -10,6 +10,7 @@
 #include <crypto/sha256.h>
 #include <elements_drivechain_identity.h>
 #include <init.h>
+#include <key_io.h>
 #include <mainchainrpc.h>
 #include <net.h>
 #include <net_processing.h>
@@ -452,6 +453,78 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_bid_selection)
     BOOST_CHECK(!ParseDrivechainBmmBid("-1", parsed, &error));
     BOOST_CHECK(!ParseDrivechainBmmBid(
         ToString(MAX_MONEY + 1), parsed, &error));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_reward_script_requires_wallet_owned_key_address)
+{
+    const CPubKey pubkey(ParseHex("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"));
+    const std::vector<CTxDestination> destinations{
+        PKHash(pubkey), WitnessV0KeyHash(pubkey)};
+    for (const auto& destination : destinations) {
+        const std::string address = EncodeDestination(destination);
+        CScript reward_script(OP_TRUE);
+        std::string error{"stale error"};
+        unsigned int ownership_checks{0};
+        BOOST_REQUIRE(BuildDrivechainRewardScript(
+            address,
+            [&](const CTxDestination& decoded) {
+                ++ownership_checks;
+                return decoded == destination;
+            },
+            reward_script, &error));
+        BOOST_CHECK(error.empty());
+        BOOST_CHECK_EQUAL(ownership_checks, 1U);
+        BOOST_CHECK(reward_script == GetScriptForDestination(destination));
+        BOOST_CHECK(reward_script != CScript(OP_TRUE));
+
+        // A valid address alone is not permission to pay a bid. Failure must
+        // erase any previous script, including the old OP_TRUE fallback.
+        BOOST_CHECK(!BuildDrivechainRewardScript(
+            address, [](const CTxDestination&) { return false; },
+            reward_script, &error));
+        BOOST_CHECK(reward_script.empty());
+        BOOST_CHECK(!error.empty());
+        reward_script = CScript(OP_TRUE);
+        BOOST_CHECK(!BuildDrivechainRewardScript(address, {}, reward_script));
+        BOOST_CHECK(reward_script.empty());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_reward_script_rejects_unsafe_destinations)
+{
+    const CPubKey pubkey(ParseHex("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"));
+    WitnessV0KeyHash confidential(pubkey);
+    confidential.blinding_pubkey = pubkey;
+    WitnessUnknown future{};
+    future.version = 2;
+    future.length = 32;
+    future.program[0] = 1;
+    const CScript anyone_can_spend = CScript() << OP_TRUE;
+    const std::vector<std::string> rejected{
+        "", "not-an-address", "51", "null",
+        // A testnet address is not valid on this fixture's mainnet network.
+        "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
+        EncodeDestination(ScriptHash(anyone_can_spend)),
+        EncodeDestination(WitnessV0ScriptHash(anyone_can_spend)),
+        EncodeDestination(WitnessV1Taproot(XOnlyPubKey(pubkey))),
+        EncodeDestination(future),
+        EncodeDestination(confidential),
+    };
+    for (const auto& address : rejected) {
+        CScript reward_script(OP_TRUE);
+        std::string error;
+        bool ownership_checked{false};
+        BOOST_CHECK(!BuildDrivechainRewardScript(
+            address,
+            [&](const CTxDestination&) {
+                ownership_checked = true;
+                return true;
+            },
+            reward_script, &error));
+        BOOST_CHECK(reward_script.empty());
+        BOOST_CHECK(!error.empty());
+        BOOST_CHECK(!ownership_checked);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(elements_production_identity_gate)
