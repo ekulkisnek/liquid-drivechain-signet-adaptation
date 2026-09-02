@@ -6,7 +6,10 @@
 #ifndef BITCOIN_INIT_H
 #define BITCOIN_INIT_H
 
+#include <script/standard.h>
+
 #include <any>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -22,6 +25,19 @@ struct BlockAndHeaderTipInfo;
 namespace node {
 struct NodeContext;
 } // namespace node
+
+/**
+ * Build the automatic bidder's reward script from a locally spendable,
+ * unconfidential P2PKH/P2WPKH address on the selected network. This is mining
+ * policy, not a restriction on other miners' consensus-valid destinations.
+ * The ownership callback must exclude watch-only/private-key-disabled wallets.
+ * On failure, clear the output script; never fall back to OP_TRUE.
+ */
+bool BuildDrivechainRewardScript(
+    const std::string& address,
+    const std::function<bool(const CTxDestination&)>& is_spendable,
+    CScript& script,
+    std::string* error = nullptr);
 
 /** Interrupt threads */
 void Interrupt(node::NodeContext& node);
