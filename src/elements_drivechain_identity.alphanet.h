@@ -2,8 +2,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_ELEMENTS_DRIVECHAIN_IDENTITY_H
-#define BITCOIN_ELEMENTS_DRIVECHAIN_IDENTITY_H
+#ifndef BITCOIN_ELEMENTS_DRIVECHAIN_IDENTITY_ALPHANET_H
+#define BITCOIN_ELEMENTS_DRIVECHAIN_IDENTITY_ALPHANET_H
+
+#ifdef ELEMENTS_DRIVECHAIN_IDENTITY_SELECTED
+#error "Multiple frozen Elements network identities included in one translation unit"
+#endif
+#define ELEMENTS_DRIVECHAIN_IDENTITY_SELECTED
 
 #include <array>
 #include <cstdint>

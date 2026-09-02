@@ -56,7 +56,7 @@ BOOST_AUTO_TEST_CASE(mainchain_cookie_network_defaults)
 {
     BOOST_CHECK_EQUAL(
         GetDefaultMainchainAuthCookieFile(CBaseChainParams::ELEMENTS),
-        "signet/.cookie");
+        ".cookie");
     BOOST_CHECK_EQUAL(
         GetDefaultMainchainAuthCookieFile(CBaseChainParams::LIQUID1),
         ".cookie");

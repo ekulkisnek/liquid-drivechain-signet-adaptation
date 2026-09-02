@@ -721,6 +721,9 @@ bool IsBmmStateInternalOutpoint(const COutPoint& outpoint)
 
 bool BmmProofRequiredAfter(const CBlockIndex* previous)
 {
+    // Native Elements authenticates BMM through the frozen parent replay, not
+    // this historical public-signet proof namespace.
+    if (Params().GetConsensus().drivechain_slot) return false;
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
     // The private replay checkpoint is an explicit test-only substitute for
     // the immutable public sidechain height-2 checkpoint.  Selecting it must
@@ -759,6 +762,14 @@ bool CheckBmmHeaderCommitments(
     const bool allow_incomplete_candidate)
 {
     error.clear();
+    if (Params().GetConsensus().drivechain_slot) {
+        if ((static_cast<uint32_t>(version) & CBlockHeader::BMM_PROOF_HF_MASK) != 0 ||
+            !proof_commitment.IsNull()) {
+            error = "historical signet BMM proof is not valid on native Elements";
+            return false;
+        }
+        return true;
+    }
     if (!previous) return true;
     if (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_1 &&
         block_hash != PUBLIC_SIDECHAIN_BLOCK_2) {
@@ -1106,6 +1117,10 @@ bool GetEffectiveBmmState(
     BmmL1State& state,
     std::string& error)
 {
+    if (Params().GetConsensus().drivechain_slot) {
+        error = "native Elements requires its authenticated parent replay, not signet BMM state";
+        return false;
+    }
     std::string state_error;
     if (GetBmmState(view, state, &state_error)) return true;
     if (!state_error.empty()) {
@@ -1134,6 +1149,14 @@ bool ConnectBmmState(
     const bool allow_incomplete_candidate,
     std::string& error)
 {
+    if (Params().GetConsensus().drivechain_slot) {
+        if (!CheckBmmHeader(block, previous, error, false)) return false;
+        if (!block.m_bmm_proof.empty() || HasPersistedBmmConsensusState(view)) {
+            error = "historical signet BMM state is not valid on native Elements";
+            return false;
+        }
+        return true;
+    }
     if (block.GetHash() == PUBLIC_SIDECHAIN_BLOCK_2 &&
         previous &&
         previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_1) {

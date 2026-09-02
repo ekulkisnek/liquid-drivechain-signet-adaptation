@@ -1,6 +1,17 @@
 # USDD raw-compressed SP1 verifier jet
 
-Status: normative implementation contract; **not implemented or activated**.
+Status: implemented and configured in the current native network identity.
+
+The C jet in `src/simplicity/elements/elementsJets.c` invokes the linked Rust
+`usdd_sp1_verify_annex` ABI. Native startup checks the verifier ABI and frozen
+semantic identity and rejects a missing/mismatched library. Envelope parsing
+alone does not authorize a proof. Configure with the exact compatible
+`--with-usdd-sp1-verifier=/absolute/path/to/libusdd_sp1_verifier.a`.
+
+This implementation status is not a production-readiness claim. Independent
+review, worst-case resource evidence and cross-architecture validation remain
+release requirements. The rules below describe the implemented consensus
+contract, not a future always-false placeholder.
 
 The minimal consensus interface is one Elements environmental jet:
 
@@ -25,11 +36,12 @@ remain a total function for every bit-pattern input and every bounded annex.
 
 The jet reads the current input's exact owned Taproot annex directly from the
 opaque `elementsTransaction` using the authenticated `txEnv` input index.  The
-annex must be present, must include the `0x50` tag, and must not exceed 512 KiB.
+annex must be present, must include the `0x50` tag, and must not exceed
+1,310,720 bytes (1.25 MiB), as frozen in the native identity.
 It is the byte-for-byte copy already checked to equal `0x50` followed by the
 tag-stripped annex body used by the released transaction-hash jets.
 
-A generic Simplicity value containing 512 KiB is neither required nor
+A generic Simplicity value containing the entire annex is neither required nor
 appropriate.  Simplicity has fixed algebraic types, so a variable-length annex
 would otherwise require an indexed-byte environmental API and a very large
 unrolled parser.  That would expand consensus surface without helping the
@@ -44,7 +56,7 @@ The jet must strictly parse the exact V1 envelope documented in
 - any namespace, envelope version, statement kind, proof system, digest mode,
   or flag other than the frozen V1 values;
 - empty public values or proof bytes;
-- public values larger than 16 KiB or a combined annex larger than 512 KiB;
+- public values larger than 16 KiB or a combined annex larger than 1,310,720 bytes;
 - a zero or noncanonical program ID;
 - declared-length mismatch, integer overflow, trailing bytes, or alternate
   encodings;
@@ -88,7 +100,7 @@ verification of a worst-case valid raw-compressed proof.  Early rejection may
 run faster but must not receive a lower consensus charge.  Peak allocation must
 remain below the frozen verifier-memory limit on all supported architectures.
 
-No accepting implementation may be merged until there is:
+Before describing a release as production-ready, retain evidence of:
 
 - a reproducibly built positive raw-compressed proof fixture;
 - independent negative fixtures for every parser and verifier boundary;
@@ -96,14 +108,11 @@ No accepting implementation may be merged until there is:
 - measured worst-case time, memory, proof size, and block-weight results; and
 - an independently reviewed SP1-to-consensus implementation.
 
-The current `VERIFIER_UNAVAILABLE` result is therefore intentional.  Adding a
-jet that always returns false would freeze a useless consensus identity;
-adding one that trusts a host callback would create an invalid mint authority.
+## Frozen activation
 
-## Atomic activation
-
-Activation must atomically freeze the verifier jet and controller CMR, pin the
-one Ethereum guest program ID, and replace the host-level fail-closed annex
-gate.  Before that activation, every USDD proof remains invalid.  After it,
-the controller program—not envelope parsing alone—must require the verifier
-jet's true result.  Non-USDD annex behavior must remain unchanged.
+The current identity pins the jet, Ethereum guest program, SP1 6.3.1 verifier
+semantics and resource schedule. V11 commits a parameterized controller family;
+the executed configuration-bound leaf authenticates concrete controller and
+deployment identities. It is not a mutable host allowlist. The controller
+must require the verifier jet's true result, not merely successful envelope
+parsing. Non-USDD annex behavior remains independent.

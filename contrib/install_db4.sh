@@ -55,7 +55,7 @@ http_get() {
   if [ -f "${2}" ]; then
     echo "File ${2} already exists; not downloading again"
   elif check_exists curl; then
-    curl --insecure --retry 5 "${1}" -o "${2}"
+    curl --fail --location --proto '=https' --proto-redir '=https' --retry 5 "${1}" -o "${2}"
   elif check_exists wget; then
     wget --no-check-certificate "${1}" -O "${2}"
   else

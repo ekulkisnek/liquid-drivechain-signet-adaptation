@@ -5,6 +5,11 @@
 #ifndef BITCOIN_ELEMENTS_DRIVECHAIN_IDENTITY_H
 #define BITCOIN_ELEMENTS_DRIVECHAIN_IDENTITY_H
 
+#ifdef ELEMENTS_DRIVECHAIN_IDENTITY_SELECTED
+#error "Multiple frozen Elements network identities included in one translation unit"
+#endif
+#define ELEMENTS_DRIVECHAIN_IDENTITY_SELECTED
+
 #include <array>
 #include <cstdint>
 #include <limits>

@@ -5,6 +5,16 @@ import tempfile
 import time
 import shutil
 import subprocess
+import os
+import secrets
+
+# The tutorial's parent and child nodes share credentials only within this run.
+_RPC_PASSWORDS = {}
+
+def rpc_password(user):
+    if user not in _RPC_PASSWORDS:
+        _RPC_PASSWORDS[user] = secrets.token_hex(32)
+    return _RPC_PASSWORDS[user]
 
 class Daemon():
     """
@@ -36,6 +46,26 @@ class Daemon():
                     continue
                 self.config[line.split("=")[0]] = line.split("=")[1].strip()
 
+        self.config["rpcpassword"] = rpc_password(self.config["rpcuser"])
+        if "mainchainrpcuser" in self.config:
+            self.config["mainchainrpcpassword"] = rpc_password(self.config["mainchainrpcuser"])
+
+    def write_config(self):
+        with open(self.conf_path, encoding="utf8") as template:
+            lines = template.readlines()
+        # Put generated credentials before any network-specific section.
+        secrets_config = "".join(
+            key + "=" + self.config[key] + "\n"
+            for key in ("rpcpassword", "mainchainrpcpassword") if key in self.config
+        )
+        destination = os.path.join(self.datadir_path, self.daemon + '.conf')
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf8") as config:
+            config.write(secrets_config)
+            for line in lines:
+                if line.partition("=")[0].strip() not in ("rpcpassword", "mainchainrpcpassword"):
+                    config.write(line)
+
     def shutdown(self):
         if self.proc is not None:
             print ("Shutting down %s" % self.name)
@@ -60,7 +90,7 @@ class Daemon():
             self.shutdown()
             # Create datadir and copy config into place
             self.datadir_path = tempfile.mkdtemp()
-            shutil.copyfile(self.conf_path, self.datadir_path + '/' + self.daemon + '.conf')
+            self.write_config()
             print("%s datadir: %s" % (self.name, self.datadir_path))
 
         # Start process
@@ -103,4 +133,3 @@ def sync_all(nodes, timeout_sec = 10):
             return
         time.sleep(1)
     raise Exception("Nodes cannot sync blocks or mempool!")
-

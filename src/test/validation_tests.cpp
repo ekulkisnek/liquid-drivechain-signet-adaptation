@@ -8,6 +8,7 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <crypto/sha256.h>
+#include <drivechain_bmm.h>
 #include <elements_drivechain_identity.h>
 #include <init.h>
 #include <key_io.h>
@@ -1863,6 +1864,11 @@ BOOST_AUTO_TEST_CASE(drivechain_json_rpc_server_is_loopback_only)
     args.ForceSetArg("-rpcuser", "bitwindow");
     args.ForceSetArg("-rpcpassword", "local-only-test-secret");
     BOOST_CHECK(ValidateNativeDrivechainRpcServerConfig(args, &error));
+    args.ForceSetArg("-rest", "1");
+    BOOST_CHECK(!ValidateNativeDrivechainRpcServerConfig(args, &error));
+    BOOST_CHECK(error.find("unauthenticated") != std::string::npos);
+    args.ForceSetArg("-rest", "0");
+    BOOST_CHECK(ValidateNativeDrivechainRpcServerConfig(args, &error));
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_parent_cookie_is_atomic_private_and_canonical)
@@ -2018,6 +2024,18 @@ BOOST_AUTO_TEST_CASE(drivechain_grpc_requires_authenticated_tls)
     BOOST_CHECK(error.find("without a URL scheme") != std::string::npos);
     args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
 
+    for (const std::string& address : {"192.168.1.2:55051", "localhost:55051", "[::]:55051", "rpc.example:55051"}) {
+        args.ForceSetArg("-drivechainbmmgrpcaddr", address);
+        BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    }
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "[::1]:55051");
+    BOOST_CHECK(ValidateDrivechainGrpcTLSConfig(args, &error));
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
+    args.ForceSetArg("-drivechainbmmwalletaddr", "127.0.0.1:30301");
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    args.ForceSetArg("-drivechainbmmwalletaddr", "127.0.0.1:55051");
+    BOOST_CHECK(ValidateDrivechainGrpcTLSConfig(args, &error));
+
     args.ForceSetArg("-drivechainbmmgrpcauthority", "enforcer.local\nplaintext");
     BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
     BOOST_CHECK(error.find("control characters") != std::string::npos);
@@ -2026,7 +2044,7 @@ BOOST_AUTO_TEST_CASE(drivechain_grpc_requires_authenticated_tls)
     args.ForceSetArg("-drivechainbmmgrpcca",
                      fs::PathToString(credentials / "missing-ca.pem"));
     BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
-    BOOST_CHECK(error.find("not a regular file") != std::string::npos);
+    BOOST_CHECK(error.find("non-symlink regular file") != std::string::npos);
     args.ForceSetArg("-drivechainbmmgrpcca", fs::PathToString(ca));
 
 #ifndef WIN32
@@ -2068,6 +2086,35 @@ BOOST_AUTO_TEST_CASE(drivechain_grpc_requires_authenticated_tls)
     BOOST_CHECK(invocation.output.find("-key\n") != std::string::npos);
     BOOST_CHECK(invocation.output.find("-plaintext") == std::string::npos);
     BOOST_CHECK(invocation.output.find("127.0.0.1:55051\n") != std::string::npos);
+
+    const auto read = RunAuthenticatedDrivechainGrpc(
+        args, "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData", "{}",
+        std::chrono::seconds{2}, 4096);
+    BOOST_CHECK(read.started && read.exited && read.exit_code == 0);
+    BOOST_CHECK(read.output.find("-plaintext") == std::string::npos);
+
+    for (const std::string& path : {std::string{}, std::string{"grpcurl"}, fs::PathToString(credentials / "missing")}) {
+        args.ForceSetArg("-drivechainbmmgrpcurl", path);
+        BOOST_CHECK(!ValidateDrivechainGrpcExecutable(args, &error));
+    }
+    const fs::path executable_link = credentials / "grpcurl-link";
+    fs::create_symlink(fake_grpcurl, executable_link);
+    args.ForceSetArg("-drivechainbmmgrpcurl", fs::PathToString(executable_link));
+    BOOST_CHECK(!ValidateDrivechainGrpcExecutable(args, &error));
+    args.ForceSetArg("-drivechainbmmgrpcurl", fs::PathToString(fake_grpcurl));
+    for (const auto mode : {0755, 0770, 0600}) {
+        BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(fake_grpcurl).c_str(), mode), 0);
+        BOOST_CHECK(!ValidateDrivechainGrpcExecutable(args, &error));
+        const auto rejected = RunAuthenticatedDrivechainGrpc(
+            args, "cusf.mainchain.v1.ValidatorService/GetChainTip", "{}",
+            std::chrono::seconds{1}, 1024);
+        BOOST_CHECK(!rejected.started);
+    }
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(fake_grpcurl).c_str(), 0700), 0);
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(credentials).c_str(), 0770), 0);
+    BOOST_CHECK(!ValidateDrivechainGrpcExecutable(args, &error));
+    BOOST_REQUIRE_EQUAL(chmod(fs::PathToString(credentials).c_str(), 0700), 0);
+    BOOST_CHECK(ValidateDrivechainGrpcExecutable(args, &error));
 #endif
 
     const BoundedCommandResult unknown_method = RunAuthenticatedDrivechainGrpc(
@@ -2082,6 +2129,8 @@ BOOST_AUTO_TEST_CASE(drivechain_grpc_requires_authenticated_tls)
         "[]", std::chrono::seconds{1}, 1024);
     BOOST_CHECK(!non_object_payload.started);
     BOOST_CHECK(non_object_payload.error.find("JSON object") != std::string::npos);
+    args.ForceSetArg("-drivechainbmmconnectauthcookie", "obsolete-cookie");
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_reward_script_requires_wallet_owned_key_address)
@@ -2198,6 +2247,32 @@ BOOST_AUTO_TEST_CASE(activates_genesis_from_empty_chain)
     BOOST_REQUIRE(tip != nullptr);
     BOOST_CHECK_EQUAL(tip->nHeight, 0);
     BOOST_CHECK_EQUAL(tip->GetBlockHash(), Params().HashGenesisBlock());
+}
+
+BOOST_AUTO_TEST_CASE(native_parent_replay_cannot_use_historical_signet_bmm)
+{
+    BOOST_REQUIRE(Params().GetConsensus().drivechain_slot.has_value());
+    CBlockIndex previous;
+    const uint256 historical = uint256S("ce77dfe3b037f2e62624da0ee5e33ae3c23b8b18ddf3b87a687bb372a8406998");
+    previous.phashBlock = &historical;
+    previous.nVersion = CBlockHeader::BMM_PROOF_HF_MASK;
+    BOOST_CHECK(!drivechain::BmmProofRequiredAfter(&previous));
+    CCoinsView base;
+    CCoinsViewCache view(&base);
+    drivechain::BmmL1State parent;
+    std::string error;
+    BOOST_CHECK(!drivechain::GetEffectiveBmmState(view, &previous, parent, error));
+    CBlock block;
+    block.nVersion = CBlockHeader::BMM_PROOF_HF_MASK;
+    block.hashBmmProof = uint256::ONE;
+    BOOST_CHECK(!drivechain::CheckBmmHeader(block, &previous, error, true));
+    BOOST_CHECK(!drivechain::ConnectBmmState(block, &previous, view, 1, true, error));
+    block.nVersion = 1;
+    block.hashBmmProof.SetNull();
+    BOOST_CHECK(drivechain::CheckBmmHeader(block, &previous, error, false));
+    BOOST_CHECK(drivechain::ConnectBmmState(block, &previous, view, 1, false, error));
+    block.m_bmm_proof = {1};
+    BOOST_CHECK(!drivechain::ConnectBmmState(block, &previous, view, 1, false, error));
 }
 
 BOOST_AUTO_TEST_CASE(native_alpha_rejects_ecx_deposit_codecs_without_parent_rpc)

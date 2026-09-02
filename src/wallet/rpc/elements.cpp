@@ -10,6 +10,7 @@
 #include <crypto/sha256.h>
 #include <deploymentstatus.h>
 #include <drivechain_peg.h>
+#include <drivechain_settings.h>
 #include <drivechain_withdrawal.h>
 #include <dynafed.h>
 #include <hash.h>
@@ -37,7 +38,6 @@
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
-#include <cstdlib>
 #include <limits>
 #include <optional>
 
@@ -64,22 +64,15 @@ RPCHelpMan signrawtransactionwithwallet();
 namespace {
 static secp256k1_context *secp256k1_ctx;
 
-static std::string GetEnvString(const char* name, const std::string& fallback)
+static CAmount DrivechainWithdrawalFee(const CAmount amount)
 {
-    const char* value = std::getenv(name);
-    return value == nullptr || std::string{value}.empty() ? fallback : std::string{value};
-}
-
-static int GetEnvInt(const char* name, int fallback)
-{
-    const char* value = std::getenv(name);
-    if (value == nullptr || std::string{value}.empty()) return fallback;
-
-    int parsed{fallback};
-    if (!ParseInt32(value, &parsed)) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid integer in %s", name));
+    const CAmount fee = gArgs.GetIntArg(
+        "-drivechainpegoutmainfeesats", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS);
+    if (fee <= 0 || !MoneyRange(fee) || fee >= amount) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "-drivechainpegoutmainfeesats must be positive and less than the withdrawal amount");
     }
-    return parsed;
+    return fee;
 }
 
 static void PushLE32(std::vector<unsigned char>& bytes, uint32_t value)
@@ -275,10 +268,7 @@ static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
     const uint256& previous_child_hash,
     const uint256& exchange_state_root)
 {
-    const CAmount mainchain_fee = GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS", 0);
-    if (mainchain_fee < 0 || mainchain_fee >= amount) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS must be non-negative and less than the withdrawal amount");
-    }
+    const CAmount mainchain_fee = DrivechainWithdrawalFee(amount);
 
     const uint64_t fee_sats = static_cast<uint64_t>(mainchain_fee);
     std::vector<unsigned char> fee_bytes;
@@ -352,14 +342,14 @@ static DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
     return bundle;
 }
 
-static UniValue CallDrivechainConnectJSONResult(
+static UniValue CallAuthenticatedDrivechainJSONResult(
     const std::string& enforcer,
     const std::string& method,
     const UniValue& payload)
 {
     UniValue result;
     std::string error;
-    if (!CallDrivechainConnectJSON(enforcer, method, payload, result, &error)) {
+    if (!CallAuthenticatedDrivechainJSON(enforcer, method, payload, result, &error)) {
         throw JSONRPCError(RPC_MISC_ERROR, strprintf("Drivechain enforcer request failed: %s", error));
     }
     return result;
@@ -429,7 +419,7 @@ static std::string FetchDrivechainWithdrawalBundleEventStatus(const int sidechai
     payload.pushKV("sidechainId", sidechain_id);
     payload.pushKV("endBlockHash", end_block_hash);
 
-    const UniValue peg_data = CallDrivechainConnectJSONResult(
+    const UniValue peg_data = CallAuthenticatedDrivechainJSONResult(
         enforcer,
         "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
         payload);
@@ -468,14 +458,8 @@ static void ClearFinalDrivechainWithdrawalBundle()
         return;
     }
 
-    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
-    if (sidechain_id < 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
-    }
-
-    const std::string enforcer = GetEnvString(
-        "ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER",
-        gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051"));
+    const int sidechain_id = DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT;
+    const std::string enforcer = GetDrivechainGrpcAddress(gArgs);
     std::string mainchain_tip;
     const std::string status = FetchDrivechainWithdrawalBundleEventStatus(sidechain_id, enforcer, current_bundle_hash.GetHex(), mainchain_tip);
     if (status == "succeeded" || status == "failed") {
@@ -525,10 +509,7 @@ public:
 
 static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBundle& bundle)
 {
-    const int sidechain_id = GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24);
-    if (sidechain_id < 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "ELEMENTS_DRIVECHAIN_SIDECHAIN_ID must be non-negative");
-    }
+    const int sidechain_id = DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT;
 
     const std::string tx_base64 = EncodeBase64(MakeUCharSpan(bundle.bytes));
     const std::string tx_hex = HexStr(bundle.bytes);
@@ -538,9 +519,7 @@ static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBu
     payload.pushKV("sidechainId", sidechain_id);
     payload.pushKV("transaction", tx_base64);
 
-    const std::string enforcer = GetEnvString(
-        "ELEMENTS_DRIVECHAIN_PEGOUT_ENFORCER",
-        gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051"));
+    const std::string enforcer = GetDrivechainGrpcAddress(gArgs);
     UniValue result(UniValue::VOBJ);
     result.pushKV("enabled", true);
     result.pushKV("sidechain_id", sidechain_id);
@@ -553,7 +532,7 @@ static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBu
     result.pushKV("withdrawal_bundle_hex", tx_hex);
     result.pushKV(
         "broadcast_response",
-        CallDrivechainConnectJSONResult(
+        CallAuthenticatedDrivechainJSONResult(
             enforcer,
             "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
             payload));
@@ -1206,13 +1185,12 @@ RPCHelpMan sendtomainchain_drivechain()
     };
 }
 
-/** Ordinary Elements/Liquid federated peg-out path. */
+/** Historical ECX BIP300 peg-out path; never selected for a native slot. */
 RPCHelpMan sendtomainchain_legacy()
 {
     return RPCHelpMan{"sendtomainchain",
                 "\nSends sidechain funds to the given mainchain address through the BIP300 drivechain peg-out mechanism.\n"
-                "By default this RPC requires the enforcer to report the submitted withdrawal bundle in L1 two-way-peg data; "
-                "set ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT=0 only for diagnostics.\n"
+                "This RPC requires the authenticated enforcer to report the submitted withdrawal bundle in L1 two-way-peg data.\n"
                 + wallet::HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination address on Bitcoin mainchain, or hex:<scriptPubKey>"},
@@ -1290,10 +1268,11 @@ RPCHelpMan sendtomainchain_legacy()
             std::numeric_limits<uint32_t>::max()) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Cannot determine sidechain height for drivechain withdrawal bundle");
     }
-    if (GetEnvInt("ELEMENTS_DRIVECHAIN_SIDECHAIN_ID", 24) != 24) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "ECX withdrawals are consensus-bound to BIP300 sidechain slot 24");
+    DrivechainWithdrawalFee(nAmount);
+    std::string transport_error;
+    if (!ValidateDrivechainGrpcTLSConfig(gArgs, &transport_error) ||
+        !ValidateDrivechainGrpcExecutable(gArgs, &transport_error)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, transport_error);
     }
     if (chain_tip->pprev == nullptr ||
         (static_cast<uint32_t>(chain_tip->nVersion) &
@@ -1349,14 +1328,12 @@ RPCHelpMan sendtomainchain_legacy()
         checkpoint_exchange_state_root);
     UniValue drivechain_result = BroadcastDrivechainWithdrawalBundle(withdrawal_bundle);
     withdrawal_bundle_creation.Complete(withdrawal_bundle);
-    if (GetEnvInt("ELEMENTS_DRIVECHAIN_PEGOUT_REQUIRE_L1_EVENT", 1) != 0) {
-        drivechain_result.pushKV(
-            "l1_event_verification",
-            VerifyDrivechainWithdrawalBundleEvent(
-                find_value(drivechain_result, "sidechain_id").get_int(),
-                find_value(drivechain_result, "enforcer").get_str(),
-                withdrawal_bundle.m6id.GetHex()));
-    }
+    drivechain_result.pushKV(
+        "l1_event_verification",
+        VerifyDrivechainWithdrawalBundleEvent(
+            find_value(drivechain_result, "sidechain_id").get_int(),
+            find_value(drivechain_result, "enforcer").get_str(),
+            withdrawal_bundle.m6id.GetHex()));
     drivechain_result.pushKV("sidechain_pegout_tx_hex", tx_hex);
     drivechain_result.pushKV("sidechain_withdrawal_vout", static_cast<int>(*withdrawal_vout));
     drivechain_result.pushKV(

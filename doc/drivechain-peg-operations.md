@@ -1,150 +1,108 @@
-# Slot-24 drivechain deposits and withdrawals
+# Native slot-24 deposits and withdrawals
 
-This build runs the Elements sidechain in BIP300 slot 24. Deposits are accepted
-only after the node independently matches the exact mainchain outpoint against
-confirmed, authenticated enforcer data. Withdrawals use a two-phase workflow so
-the M6 proposal is built from the block that actually confirmed the sidechain
-spend.
+This guide applies to the current `-chain=elements` node, not the historical
+Liquid-signet/ECX bridge. Use a fresh `elements-v11` data directory. Do not
+point the current binary at a preserved historical chain.
 
-## Transport and credentials
+## Identity and transport
 
-Elements never sends parent-chain HTTP Basic credentials to a remote host.
-`-mainchainrpchost` must be `localhost` or a numeric loopback address. When the
-Bitcoin node is remote, terminate an authenticated TLS tunnel on loopback and
-point Elements at that local port.
+The frozen identity in `src/elements_drivechain_identity.h` specifies slot 24,
+Bitcoin-mainnet ancestry, an empty signet challenge, and parent checkpoint
+995347 (`000000000000000002838070eb876cd37738a069528efc82d946fbd25e763152`).
+This is not a runtime-selectable signet. Sharing Bitcoin's genesis and address
+prefixes does not prove a connected node follows the intended parent fork.
+Verify the checkpoint, enforcer compatibility revision, proposal identity, and
+activation on the intended parent deployment before funding anything.
 
-All enforcer calls use mutual TLS through `grpcurl`. The default endpoint is
-`127.0.0.1:55051`; this should be a local mTLS proxy if the enforcer itself only
-offers plaintext gRPC. The proxy must authenticate both the enforcer side and
-the Elements client. Place credentials under the network data directory by
-default:
-
-```text
-enforcer-tls/ca.pem
-enforcer-tls/elements-client.pem
-enforcer-tls/elements-client-key.pem
-```
-
-On POSIX systems the credential directory must be owned by the Elements user
-and not group/other-writable. The private key must be a regular, non-symlink
-file owned by that user with no group or other access:
-
-```sh
-chmod 700 /path/to/elements-data/liquid-signet/enforcer-tls
-chmod 600 /path/to/elements-data/liquid-signet/enforcer-tls/*.pem
-```
-
-Use an explicit configuration such as:
-
-```ini
-chain=liquid-signet
-validatepegin=1
-
-# Parent Bitcoin RPC. Keep this endpoint on loopback.
-mainchainrpchost=127.0.0.1
-mainchainrpcport=38332
-mainchainrpccookiefile=/path/to/bitcoin/signet/.cookie
-
-# Authenticated enforcer endpoint.
-drivechainbmmgrpcaddr=127.0.0.1:55051
-drivechainbmmgrpcurl=/absolute/path/to/grpcurl
-drivechainbmmgrpcca=/path/to/enforcer-tls/ca.pem
-drivechainbmmgrpccert=/path/to/enforcer-tls/elements-client.pem
-drivechainbmmgrpckey=/path/to/enforcer-tls/elements-client-key.pem
-# Set this only when the certificate name differs from the endpoint address.
-# drivechainbmmgrpcauthority=enforcer.internal
-
-drivechainbmmslot=24
-drivechainsidechainslot=24
-drivechainpegoutmainfee=10000
-drivechainsidechainnetwork=liquid-signet
-drivechainmainchainnetwork=signet
-drivechainmainchainsignetchallenge=00148835832e28c816b7acd8fdb19772ab2199603a56
-```
-
-Do not point `drivechainbmmgrpcaddr` at an unauthenticated plaintext port. The
-legacy `drivechainpegoutenforcer` option is only an alias; if both endpoint
-options are set, they must be identical.
+Follow [RPC security](drivechain-rpc-security.md). Parent access requires
+authentication on numeric loopback, preferably a private rotating cookie;
+an explicit private credential file is supported for same-host bridges.
+Enforcer requests require a private, explicit grpcurl executable and mutual TLS. Keep
+`drivechainl1blocksync=0` while preparing or auditing the deployment.
+No command below is authorization to spend real funds.
 
 ## Deposit
 
-Create or load an Elements wallet and obtain an address that the selected wallet
-can spend. After the slot-24 deposit is confirmed in canonical L1/enforcer data,
-import the exact outpoint:
+Create/load an Elements wallet and obtain an address that it controls. Create
+the slot-24 M5 deposit through the parent wallet/enforcer, recording the exact
+outpoint and intended destination. The node authenticates parent headers,
+raw blocks, treasury transitions, destination and value from parent replay;
+a bridge assertion or wallet balance is not deposit evidence.
+
+After the required active parent depth (100 blocks in the frozen identity):
 
 ```sh
-elements-cli -chain=liquid-signet -rpcwallet=<wallet> \
-  importdrivechaindeposit \
-  "<mainchain-txid>" "<elements-address>" <value-sats> <sidechain-fee-sats> <mainchain-vout>
+elements-cli -chain=elements -rpcwallet=<wallet> importdrivechaindeposit \
+  "<mainchain-txid>" <mainchain-vout> "<mainchain-block-hash>" \
+  "<elements-address>" <value-sats> <fee-sats>
 ```
 
-The node verifies the mainchain network and signet challenge, active slot-24
-identity, exact txid and vout, destination, value, confirmation, and CTIP state.
-It also prevents replay across restarts. Omitting `mainchain-vout` is allowed
-only when authenticated slot data contains one unambiguous txid/address/value
-match. Supplying it explicitly is preferred for operator auditability.
-
-The returned `txid` is the sidechain transaction. `already_imported` makes
-retries idempotent. If the wallet already knows an unconfirmed import, the RPC
-rebroadcasts it so mempool eviction or restart cannot strand the credit. A
-successful RPC is not a substitute for checking that the transaction confirms
-in a strict-BMM-valid sidechain block and remains in the wallet after restart.
+The final fee argument defaults to zero. A nonzero Elements transaction fee
+requires separately spendable wallet funds; it does not reduce the authenticated
+deposit credit. Record the returned sidechain transaction ID. Check
+`gettransaction`, `listunspent`, and the active confirming block, including
+after restart. A mempool transaction is not confirmed spendable chain state.
+Never substitute a different vout, address, amount, or parent block to work
+around a rejection.
 
 ## Withdrawal
 
-Only one withdrawal bundle may be active at a time. First create the sidechain
-burn transaction:
+Withdrawals remain supported. They burn the pegged asset on Elements and
+propose a deterministic blinded M6 for BIP300 miner voting. A burn is
+irreversible; enforcer acceptance of a proposal does not guarantee payment.
+
+Before creating a burn, check parent synchronization, mTLS connectivity,
+destination ownership/network, available balance, sidechain fees, and the
+explicit parent fee. Parent address prefixes alone cannot distinguish forks.
 
 ```sh
-WITHDRAWAL_TXID=$(elements-cli -chain=liquid-signet -rpcwallet=<wallet> \
-  sendtomainchain "<bitcoin-signet-address>" <amount> false false)
+elements-cli -chain=elements -rpcwallet=<wallet> sendtomainchain \
+  "<parent-address>" <payout-amount> false true <mainchain-fee>
 ```
 
-Wait until that transaction has at least one active sidechain confirmation.
-The confirming block must contain an ECX state root. Then submit its exact,
-height-bound M6:
+Amounts here are coin-denominated, not satoshis. The verbose result identifies
+the transaction and `withdrawal_vout`. With the shown `false` setting,
+`burn_amount = payout_amount + mainchain_fee`; the Elements transaction fee
+is separate. Save the returned IDs and the block hash once confirmed.
+
+Inspect the exact claim without broadcasting:
 
 ```sh
-elements-cli -chain=liquid-signet -rpcwallet=<wallet> \
-  submitdrivechainwithdrawal "$WITHDRAWAL_TXID"
+elements-cli -chain=elements getdrivechainwithdrawalbundle \
+  "<txid>" <withdrawal-vout> "<confirming-elements-blockhash>" 6
 ```
 
-Before contacting the enforcer, the node writes and fsyncs
-`drivechain_withdrawal.dat` in the network data directory. It stores the exact
-M6 bytes and verifies that their transaction identity matches the journal.
-After a crash or enforcer outage, inspect the durable state with:
+Once the burn has six active Elements confirmations, submit that exact claim:
 
 ```sh
-elements-cli -chain=liquid-signet drivechainrecoverwithdrawal
+elements-cli -chain=elements submitdrivechainwithdrawal \
+  "<txid>" <withdrawal-vout> "<confirming-elements-blockhash>" 6
 ```
 
-If the enforcer reports the bundle as failed or missing and the rejection cause
-has been corrected, resubmit the identical M6 bytes with:
+Six is the RPC's default submission depth; keep it explicit for auditability.
+The node checks the active burn block, exact output, deterministic M6, and
+authenticated parent payment state. Miners/operators can independently call:
 
 ```sh
-elements-cli -chain=liquid-signet drivechainrecoverwithdrawal true
+elements-cli -chain=elements verifydrivechainwithdrawalbundle \
+  "<blinded-m6-hex>" "<confirming-elements-blockhash>" 6
 ```
 
-Recovery never rebuilds a new proposal from a later tip. A settled journal is
-terminal and cannot be resubmitted. It is retained as a restart-safe tombstone
-until the next confirmed withdrawal safely replaces it; this prevents the old
-bundle hash in the sidechain tip from becoming active again during the interval
-before another sidechain block is produced. Corrupt journal state fails closed
-and must be investigated rather than deleted merely to unblock another
-withdrawal.
+After a timeout or restart, inspect the same claim before retrying the same
+submission arguments. Do not create another burn to recover an uncertain
+submission. `getdrivechainwithdrawalbundle` reports `m6id`,
+`paid_on_parent_chain`, and, when paid, the parent payment block hash/height.
+Submission rejects an already-paid claim. The historical
+`drivechainrecoverwithdrawal` journal API is not this native RPC path.
 
-## Readiness checks
+## Completion checks
 
-Before moving test funds, verify all of the following:
-
-1. Bitcoin, the enforcer, BMM producer, and Elements agree on the intended
-   LayerTwoLabs signet and slot 24.
-2. Parent RPC is reachable only through loopback and the cookie is readable by
-   the Elements process user.
-3. The mTLS endpoint rejects clients without the configured certificate.
-4. A deposit remains spendable after Elements and enforcer restarts.
-5. A withdrawal sidechain transaction confirms before M6 submission.
-6. `drivechainrecoverwithdrawal` reports the same M6 ID before and after a
-   restart, and eventually reports the authentic L1 success event.
-7. Wallet, Elements UTXO state, enforcer CTIP/event state, and the intended L1
-   payout address agree on values and transaction identities.
+- Parent replay, enforcer, and Elements agree on the frozen network and slot.
+- Deposit UTXOs, amounts and ownership remain correct after restart.
+- Withdrawal M6 ID/bytes match before and after restart.
+- The authentic parent payment spends the expected treasury and pays the exact
+  destination/value. Inspect the parent transaction, not just a UI status.
+- Reorgs or lost depth invalidate confirmation assumptions. Recheck both active
+  chains before reporting finality.
+- BIP300 authorization depends on parent miner voting. A proposal may expire
+  or fail; neither a submitted flag nor a sidechain burn means funds arrived.

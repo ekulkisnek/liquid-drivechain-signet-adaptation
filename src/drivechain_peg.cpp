@@ -15,12 +15,10 @@
 #include <script/standard.h>
 #include <streams.h>
 #include <util/strencodings.h>
-#include <util/system.h>
 
 #include <array>
 #include <limits>
 #include <map>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,82 +33,8 @@ const COutPoint CTIP_STATE_OUTPOINT{
 const std::vector<unsigned char> CTIP_STATE_MARKER{
     'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'c', 't', 'i', 'p', '-', 'v', '1'};
 
-/**
- * Parse the consensus-defined bootstrap CTIP.
- *
- * A chain that has just been activated on the parent has no CTIP coin yet, so
- * every v2 deposit failed with "no authenticated prior CTIP state" and the
- * chain could never be funded at all. The two immutable LayerTwoLabs Signet
- * checkpoints below are historical and cannot authenticate any other chain.
- *
- * The bootstrap is the CTIP established by this sidechain's own M1/M2
- * activation on the parent chain. It is deliberately explicit configuration
- * rather than a compiled-in constant: it differs per deployment, and it must be
- * agreed by every node on the network before the first deposit, exactly like
- * any other genesis parameter.
- *
- * Format: <txid>:<vout>:<value_sats>:<sequence>
- */
-std::optional<CtipState> ParseGenesisCtip(const std::string& spec, std::string& error)
-{
-    if (spec.empty()) return std::nullopt;
-
-    std::vector<std::string> parts;
-    size_t start{0};
-    while (true) {
-        const size_t sep = spec.find(':', start);
-        parts.push_back(spec.substr(start, sep == std::string::npos ? std::string::npos : sep - start));
-        if (sep == std::string::npos) break;
-        start = sep + 1;
-    }
-    if (parts.size() != 4) {
-        error = "-drivechaingenesisctip must be <txid>:<vout>:<value_sats>:<sequence>";
-        return std::nullopt;
-    }
-    if (parts[0].size() != 64 || !IsHex(parts[0])) {
-        error = "-drivechaingenesisctip txid must be 64 hex characters";
-        return std::nullopt;
-    }
-
-    uint32_t vout{0};
-    int64_t value{0};
-    int64_t sequence{0};
-    if (!ParseUInt32(parts[1], &vout)) {
-        error = "-drivechaingenesisctip vout is not a valid index";
-        return std::nullopt;
-    }
-    if (!ParseInt64(parts[2], &value) || value <= 0 || value > MAX_MONEY) {
-        error = "-drivechaingenesisctip value must be a positive satoshi amount within MAX_MONEY";
-        return std::nullopt;
-    }
-    if (!ParseInt64(parts[3], &sequence) || sequence < 0) {
-        error = "-drivechaingenesisctip sequence must be non-negative";
-        return std::nullopt;
-    }
-
-    CtipState state;
-    state.outpoint = COutPoint(uint256S(parts[0]), vout);
-    state.value = static_cast<CAmount>(value);
-    state.sequence_number = sequence;
-    return state;
-}
-
-//! Cached bootstrap CTIP for this process.
-const std::optional<CtipState>& GenesisCtip()
-{
-    static const std::optional<CtipState> cached = [] {
-        std::string error;
-        const std::string spec = gArgs.GetArg("-drivechaingenesisctip", "");
-        auto parsed = ParseGenesisCtip(spec, error);
-        if (!spec.empty() && !parsed) {
-            // Misconfiguration here would silently leave the chain unfundable,
-            // so make it loud rather than falling back to "no bootstrap".
-            throw std::runtime_error(error);
-        }
-        return parsed;
-    }();
-    return cached;
-}
+// Historical ECX CTIP bootstraps are immutable checkpoints below. Native
+// Elements deposits use authenticated parent replay and its frozen bootstrap.
 
 template <typename T>
 bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
@@ -1131,16 +1055,8 @@ bool VerifyDeterministicDeposit(
             error = state_error;
             return false;
         }
-        // No CTIP coin exists yet, so this must be the chain's first deposit.
-        // It is accepted only if it extends the consensus-defined bootstrap
-        // CTIP established by this sidechain's activation on the parent.
-        const std::optional<CtipState>& genesis = GenesisCtip();
-        if (!genesis) {
-            error = "drivechain deposit has no authenticated prior CTIP state and no "
-                    "bootstrap CTIP is configured (-drivechaingenesisctip)";
-            return false;
-        }
-        current = *genesis;
+        error = "drivechain deposit has no authenticated prior CTIP state";
+        return false;
     }
     if (!(current == parsed.previous_state)) {
         error = "drivechain deposit evidence is stale or does not extend the authenticated CTIP state";
@@ -1209,16 +1125,8 @@ bool ConnectDepositState(
             error = state_error;
             return false;
         }
-        // First deposit on a fresh chain; bootstrap from the configured CTIP.
-        // Kept symmetric with VerifyDeterministicDeposit so a transaction can
-        // never validate and then fail to connect.
-        const std::optional<CtipState>& genesis = GenesisCtip();
-        if (!genesis) {
-            error = "cannot connect drivechain deposit over missing CTIP state and no "
-                    "bootstrap CTIP is configured (-drivechaingenesisctip)";
-            return false;
-        }
-        current = *genesis;
+        error = "cannot connect drivechain deposit over missing authenticated CTIP state";
+        return false;
     }
     if (!(current == parsed.previous_state)) {
         error = "cannot connect drivechain deposit over stale CTIP state";
@@ -1265,18 +1173,6 @@ bool DisconnectDepositState(
     if (!(current == parsed.next_state)) {
         error = "drivechain deposit CTIP state is inconsistent during disconnect";
         return false;
-    }
-    // Undoing the chain's first deposit must remove the CTIP coin entirely
-    // rather than persisting the bootstrap value, so that reconnecting takes
-    // the same bootstrap path it took originally. Without this a reorg across
-    // the first deposit would leave a CTIP coin that never existed.
-    const std::optional<CtipState>& genesis = GenesisCtip();
-    if (genesis && parsed.previous_state == *genesis) {
-        if (!inputs.SpendCoin(CTIP_STATE_OUTPOINT)) {
-            error = "bootstrap drivechain CTIP state could not be removed during disconnect";
-            return false;
-        }
-        return true;
     }
     SetCtipState(inputs, parsed.previous_state, height - 1);
     return true;

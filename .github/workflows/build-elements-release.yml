@@ -1,19 +1,21 @@
-name: Build Elements release binaries
+name: Build historical Elements release binaries
 
 on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Exact source commit to build
+        description: Exact 40-character source commit (historical bf8e9e1e recipes only)
         required: true
-        default: bf8e9e1e5a6453b3a0573ff57cf9c92b2b3afe2b
       release_tag:
-        description: Existing GitHub release tag to receive the archives
+        description: Existing draft release tag elements-<first 8 source SHA characters>
         required: true
-        default: elements-bf8e9e1e
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: elements-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -34,16 +36,28 @@ jobs:
             packages: g++-mingw-w64-x86-64-posix
 
     steps:
+      - name: Validate explicit historical release identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" == "elements-${SOURCE_SHA:0:8}" ]]
+          # These recipes predate the pinned SP1 verifier. Never label them as V11.
+          [[ "$SOURCE_SHA" == bf8e9e1e5a6453b3a0573ff57cf9c92b2b3afe2b ]]
+
       - name: Check out release recipes
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: recipes
+          persist-credentials: false
 
       - name: Check out exact source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.source_sha }}
           path: source
+          persist-credentials: false
 
       - name: Install build dependencies
         env:
@@ -61,30 +75,61 @@ jobs:
           ARTIFACT_DIR: ${{ github.workspace }}/artifacts
           LOG_DIR: ${{ github.workspace }}/release-logs
           JOBS: "2"
-        run: |
-          "${{ github.workspace }}/recipes/contrib/release/${{ matrix.script }}"
+          SCRIPT: ${{ matrix.script }}
+        run: '"$GITHUB_WORKSPACE/recipes/contrib/release/$SCRIPT"'
 
       - name: Verify package checksum
+        env:
+          PACKAGE: ${{ matrix.package }}
         run: |
-          sha256sum "artifacts/${{ matrix.package }}"
-          file "artifacts/${{ matrix.package }}"
+          sha256sum "artifacts/$PACKAGE"
+          file "artifacts/$PACKAGE"
 
       - name: Preserve logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-evidence-${{ matrix.script }}
-          path: |
-            artifacts/${{ matrix.package }}
-            release-logs/
+          path: release-logs/
           if-no-files-found: warn
 
-      - name: Upload to draft release
-        if: success()
+      - name: Stage package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-package-${{ matrix.script }}
+          path: artifacts/${{ matrix.package }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: elements-release
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-package-*
+          merge-multiple: true
+          path: artifacts
+      - name: Verify draft and immutable source tag, then upload without replacement
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          gh release upload "${{ inputs.release_tag }}" \
-            "artifacts/${{ matrix.package }}" \
-            --repo "${{ github.repository }}" \
-            --clobber
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" == "elements-${SOURCE_SHA:0:8}" ]]
+          [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" == true ]]
+          object=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object)
+          for depth in 1 2 3 4; do
+            [[ "$(jq -r .type <<< "$object")" == tag ]] || break
+            tag_sha=$(jq -r .sha <<< "$object")
+            object=$(gh api "repos/$GH_REPO/git/tags/$tag_sha" --jq .object)
+          done
+          [[ "$(jq -r .type <<< "$object")" == commit ]]
+          [[ "$(jq -r .sha <<< "$object")" == "$SOURCE_SHA" ]]
+          gh release upload "$RELEASE_TAG" artifacts/*

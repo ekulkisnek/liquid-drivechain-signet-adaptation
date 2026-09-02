@@ -18,13 +18,6 @@
 #include <util/translation.h>
 #include <rpc/request.h>
 
-#include <support/events.h>
-
-#include <rpc/client.h>
-
-#include <event2/buffer.h>
-#include <event2/keyvalq_struct.h>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -32,187 +25,36 @@
 #include <optional>
 #include <vector>
 
-namespace {
-/** Reply structure for request_done to fill in */
-struct HTTPReply
-{
-    HTTPReply(): status(0), error(-1) {}
-
-    int status;
-    int error;
-    std::string body;
-};
-
-const char *http_errorstring(int code)
-{
-    switch(code) {
-#if LIBEVENT_VERSION_NUMBER >= 0x02010300
-    case EVREQ_HTTP_TIMEOUT:
-        return "timeout reached";
-    case EVREQ_HTTP_EOF:
-        return "EOF reached";
-    case EVREQ_HTTP_INVALID_HEADER:
-        return "error while reading header, or invalid header";
-    case EVREQ_HTTP_BUFFER_ERROR:
-        return "error encountered while reading or writing";
-    case EVREQ_HTTP_REQUEST_CANCEL:
-        return "request was canceled";
-    case EVREQ_HTTP_DATA_TOO_LONG:
-        return "response body is larger than allowed";
-#endif
-    default:
-        return "unknown";
-    }
-}
-
-static void http_request_done(struct evhttp_request *req, void *ctx)
-{
-    HTTPReply *reply = static_cast<HTTPReply*>(ctx);
-
-    if (req == NULL) {
-        /* If req is NULL, it means an error occurred while connecting: the
-         * error code will have been passed to http_error_cb.
-         */
-        reply->status = 0;
-        return;
-    }
-
-    reply->status = evhttp_request_get_response_code(req);
-
-    struct evbuffer *buf = evhttp_request_get_input_buffer(req);
-    if (buf)
-    {
-        size_t size = evbuffer_get_length(buf);
-        const char *data = (const char*)evbuffer_pullup(buf, size);
-        if (data)
-            reply->body = std::string(data, size);
-        evbuffer_drain(buf, size);
-    }
-}
-
-#if LIBEVENT_VERSION_NUMBER >= 0x02010300
-static void http_error_cb(enum evhttp_request_error err, void *ctx)
-{
-    HTTPReply *reply = static_cast<HTTPReply*>(ctx);
-    reply->error = err;
-}
-#endif
-
-} // namespace
-
-bool CallDrivechainConnectJSON(
+bool CallAuthenticatedDrivechainJSON(
     const std::string& endpoint,
     const std::string& method,
     const UniValue& request,
     UniValue& response,
     std::string* error)
 {
-    static constexpr uint16_t DEFAULT_DRIVECHAIN_CONNECT_PORT{50051};
-    static constexpr int DRIVECHAIN_CONNECT_TIMEOUT_SECONDS{30};
-    static constexpr size_t MAX_DRIVECHAIN_CONNECT_RESPONSE_BYTES{16U * 1024U * 1024U};
-
-    try {
-        uint16_t port{DEFAULT_DRIVECHAIN_CONNECT_PORT};
-        std::string host;
-        SplitHostPort(endpoint, port, host);
-        if (host.empty() || port == 0 || endpoint.find('\0') != std::string::npos ||
-            endpoint.find_first_of("/?#@\r\n") != std::string::npos) {
-            throw std::runtime_error("drivechain Connect endpoint must be a host[:port] authority");
-        }
-        if (!IsMainchainRPCHostAllowed(host, true)) {
-            throw std::runtime_error("unencrypted drivechain Connect requires a numeric loopback address");
-        }
-        if (method.empty() || method.front() == '/' ||
-            std::count(method.begin(), method.end(), '/') != 1 ||
-            !std::all_of(method.begin(), method.end(), [](const unsigned char c) {
-                return std::isalnum(c) || c == '.' || c == '_' || c == '/';
-            })) {
-            throw std::runtime_error("drivechain Connect method is not a canonical service/method path");
-        }
-        if (!request.isObject()) {
-            throw std::runtime_error("drivechain Connect request must be a JSON object");
-        }
-
-        raii_event_base base = obtain_event_base();
-        raii_evhttp_connection connection = obtain_evhttp_connection_base(base.get(), host, port);
-        evhttp_connection_set_timeout(connection.get(), DRIVECHAIN_CONNECT_TIMEOUT_SECONDS);
-        evhttp_connection_set_max_body_size(connection.get(), MAX_DRIVECHAIN_CONNECT_RESPONSE_BYTES);
-        evhttp_connection_set_max_headers_size(connection.get(), 65536);
-
-        HTTPReply http_response;
-        raii_evhttp_request http_request = obtain_evhttp_request(http_request_done, &http_response);
-        if (http_request == nullptr) {
-            throw std::runtime_error("create drivechain Connect request failed");
-        }
-#if LIBEVENT_VERSION_NUMBER >= 0x02010300
-        evhttp_request_set_error_cb(http_request.get(), http_error_cb);
-#endif
-
-        struct evkeyvalq* headers = evhttp_request_get_output_headers(http_request.get());
-        assert(headers);
-        evhttp_add_header(headers, "Host", endpoint.c_str());
-        evhttp_add_header(headers, "Connection", "close");
-        evhttp_add_header(headers, "Content-Type", "application/json");
-        evhttp_add_header(headers, "Accept", "application/json");
-        evhttp_add_header(headers, "Connect-Protocol-Version", "1");
-        const std::string auth_cookie_path{
-            gArgs.GetArg("-drivechainbmmconnectauthcookie", "")};
-        if (!auth_cookie_path.empty()) {
-            std::string token;
-            if (!ReadPrivateRpcAuthFile(fs::PathFromString(auth_cookie_path), token) || token.empty() ||
-                !std::all_of(token.begin(), token.end(),
-                             [](unsigned char c) { return c >= 33 && c <= 126; })) {
-                throw std::runtime_error("cannot read canonical BitWindow Connect auth cookie");
-            }
-            const std::string authorization{"Bearer " + token};
-            evhttp_add_header(headers, "Authorization", authorization.c_str());
-        }
-
-        const std::string body = request.write();
-        if (body.size() > 1024 * 1024) {
-            throw std::runtime_error("drivechain Connect request exceeds its 1 MiB limit");
-        }
-        struct evbuffer* output_buffer = evhttp_request_get_output_buffer(http_request.get());
-        assert(output_buffer);
-        if (evbuffer_add(output_buffer, body.data(), body.size()) != 0) {
-            throw std::runtime_error("buffer drivechain Connect request failed");
-        }
-
-        const std::string path = "/" + method;
-        if (evhttp_make_request(connection.get(), http_request.get(), EVHTTP_REQ_POST, path.c_str()) != 0) {
-            throw CConnectionFailed("send drivechain Connect request failed");
-        }
-        http_request.release(); // Ownership moved to connection.
-        event_base_dispatch(base.get());
-
-        if (http_response.status == 0) {
-            throw CConnectionFailed(strprintf(
-                "couldn't connect to drivechain enforcer: %s (code %d)",
-                http_errorstring(http_response.error),
-                http_response.error));
-        }
-        if (http_response.status != HTTP_OK) {
-            const std::string detail = http_response.body.substr(0, 4096);
-            throw std::runtime_error(strprintf(
-                "drivechain enforcer returned HTTP %d: %s",
-                http_response.status,
-                detail));
-        }
-        if (http_response.body.empty()) {
-            throw std::runtime_error("drivechain enforcer returned an empty response");
-        }
-        if (!response.read(http_response.body) || !response.isObject()) {
-            throw std::runtime_error("drivechain enforcer returned non-object JSON");
-        }
-        return true;
-    } catch (const std::exception& exception) {
-        if (error != nullptr) {
-            *error = exception.what();
-        }
+    response = UniValue();
+    if (error) error->clear();
+    if (endpoint != GetDrivechainGrpcAddress(gArgs)) {
+        if (error) *error = "enforcer endpoint differs from the configured mTLS endpoint";
         return false;
     }
+    const auto result = RunAuthenticatedDrivechainGrpc(
+        method, request.write(), std::chrono::seconds{30}, 16U * 1024U * 1024U);
+    if (!result.started || !result.exited || result.exit_code != 0 ||
+        result.timed_out || result.cancelled || result.output_truncated ||
+        !result.error.empty()) {
+        if (error) *error = result.error.empty()
+            ? "authenticated enforcer request failed, timed out, or exceeded its output limit"
+            : result.error;
+        return false;
+    }
+    if (!response.read(result.output) || !response.isObject()) {
+        response = UniValue();
+        if (error) *error = "authenticated enforcer returned non-object JSON";
+        return false;
+    }
+    return true;
 }
-
 bool SubmitDrivechainBmmBid(
     const int sidechain_slot,
     const uint64_t bid_sats,
@@ -246,8 +88,8 @@ bool SubmitDrivechainBmmBid(
         request.pushKV("prevBytes", previous);
 
         UniValue response;
-        if (!CallDrivechainConnectJSON(
-                gArgs.GetArg("-drivechainbmmwalletaddr", "127.0.0.1:30301"),
+        if (!CallAuthenticatedDrivechainJSON(
+                GetDrivechainGrpcAddress(gArgs),
                 "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
                 request,
                 response,
@@ -306,8 +148,8 @@ static bool GetDrivechainGrpcJSON(
         }
         return false;
     }
-    return CallDrivechainConnectJSON(
-        gArgs.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:50051"),
+    return CallAuthenticatedDrivechainJSON(
+        GetDrivechainGrpcAddress(gArgs),
         "cusf.mainchain.v1.ValidatorService/" + method,
         payload,
         response,

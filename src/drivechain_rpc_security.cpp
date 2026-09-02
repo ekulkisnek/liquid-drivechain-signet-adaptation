@@ -16,29 +16,6 @@
 #include <unistd.h>
 #endif
 
-static std::string ResolveDrivechainBmmGrpcurlPath(const ArgsManager& args)
-{
-    const std::string configured_path = args.GetArg("-drivechainbmmgrpcurl", "");
-    if (!configured_path.empty()) {
-        return configured_path;
-    }
-
-    const std::vector<fs::path> candidates{
-        args.GetDataDirBase().parent_path() / "assets" / "bin" / "grpcurl",
-        args.GetDataDirBase().parent_path() / "bin" / "grpcurl",
-        fs::PathFromString("/opt/homebrew/bin/grpcurl"),
-        fs::PathFromString("/usr/local/bin/grpcurl"),
-        fs::PathFromString("/usr/bin/grpcurl"),
-    };
-    for (const fs::path& candidate : candidates) {
-        if (fs::exists(candidate)) {
-            return fs::PathToString(candidate);
-        }
-    }
-
-    return "grpcurl";
-}
-
 namespace {
 
 struct DrivechainGrpcTLSConfig {
@@ -76,9 +53,11 @@ bool ValidateReadableRegularFile(const fs::path& path,
                                  const bool private_key,
                                  std::string* error)
 {
-    if (!fs::exists(path) || !fs::is_regular_file(path)) {
+    std::error_code status_error;
+    const auto status = fs::symlink_status(path, status_error);
+    if (status_error || !fs::is_regular_file(status)) {
         if (error) {
-            *error = strprintf("required %s is not a regular file: %s",
+            *error = strprintf("required %s must be a non-symlink regular file: %s",
                                private_key ? "mTLS client key" : "mTLS certificate",
                                fs::PathToString(path));
         }
@@ -150,10 +129,6 @@ bool ValidateReadableRegularFile(const fs::path& path,
         return false;
     }
 #else
-    if (fs::is_symlink(path)) {
-        if (error) *error = "mTLS credential must be a non-symlink regular file";
-        return false;
-    }
     std::ifstream input(path);
     if (!input.good()) {
         if (error) *error = "required mTLS credential is not readable: " + fs::PathToString(path);
@@ -186,12 +161,25 @@ bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error
         if (error) *error = "-drivechainbmmgrpcaddr must contain a non-empty host and nonzero port";
         return false;
     }
+    if (!IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true)) {
+        if (error) *error = "-drivechainbmmgrpcaddr requires numeric loopback (IPv4 127/8 or IPv6 ::1)";
+        return false;
+    }
     // The former peg-out endpoint is a compatibility assertion, not a second
     // transport. BMM bids and withdrawals must use the same authenticated
     // enforcer; silently ignoring a conflicting endpoint would misroute funds.
     if (args.IsArgSet("-drivechainpegoutenforcer") &&
         args.GetArg("-drivechainpegoutenforcer", "") != config.address) {
         if (error) *error = "-drivechainpegoutenforcer and -drivechainbmmgrpcaddr must select the same authenticated endpoint";
+        return false;
+    }
+    if (args.IsArgSet("-drivechainbmmwalletaddr") &&
+        args.GetArg("-drivechainbmmwalletaddr", "") != config.address) {
+        if (error) *error = "-drivechainbmmwalletaddr and -drivechainbmmgrpcaddr must select the same authenticated endpoint";
+        return false;
+    }
+    if (args.IsArgSet("-drivechainbmmconnectauthcookie")) {
+        if (error) *error = "Connect bearer authentication is no longer supported; configure enforcer mTLS";
         return false;
     }
     if (!config.authority.empty() &&
@@ -203,6 +191,29 @@ bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error
     return ValidateReadableRegularFile(config.ca_certificate, false, error) &&
            ValidateReadableRegularFile(config.client_certificate, false, error) &&
            ValidateReadableRegularFile(config.client_key, true, error);
+}
+
+bool ValidateDrivechainGrpcExecutable(const ArgsManager& args, std::string* error)
+{
+    if (error) error->clear();
+    const fs::path path = fs::PathFromString(args.GetArg("-drivechainbmmgrpcurl", ""));
+    if (path.empty() || !path.is_absolute()) {
+        if (error) *error = "-drivechainbmmgrpcurl must explicitly name an absolute executable path; PATH search is disabled";
+        return false;
+    }
+#ifndef WIN32
+    // grpcurl can read the client key and custody requests. Apply the same
+    // owner/directory/no-follow checks as the private key before each exec.
+    if (!ValidateReadableRegularFile(path, true, error)) return false;
+    if (access(fs::PathToString(path).c_str(), X_OK) != 0) {
+        if (error) *error = "configured grpcurl is not executable";
+        return false;
+    }
+    return true;
+#else
+    if (error) *error = "secure grpcurl execution is not implemented on Windows";
+    return false;
+#endif
 }
 
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
@@ -217,6 +228,11 @@ BoundedCommandResult RunAuthenticatedDrivechainGrpc(
     static const std::set<std::string> ALLOWED_METHODS{
         "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
         "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+        "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
+        "cusf.mainchain.v1.ValidatorService/GetChainInfo",
+        "cusf.mainchain.v1.ValidatorService/GetChainTip",
+        "cusf.mainchain.v1.ValidatorService/GetSidechains",
+        "cusf.mainchain.v1.ValidatorService/GetCtip",
     };
     if (ALLOWED_METHODS.count(method) == 0) {
         failure.error = "refusing an unrecognized enforcer gRPC method";
@@ -233,13 +249,14 @@ BoundedCommandResult RunAuthenticatedDrivechainGrpc(
         failure.error = "enforcer gRPC payload must be one JSON object";
         return failure;
     }
-    if (!ValidateDrivechainGrpcTLSConfig(args, &config_error)) {
+    if (!ValidateDrivechainGrpcTLSConfig(args, &config_error) ||
+        !ValidateDrivechainGrpcExecutable(args, &config_error)) {
         failure.error = config_error;
         return failure;
     }
     const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
     std::vector<std::string> argv{
-        ResolveDrivechainBmmGrpcurlPath(args),
+        args.GetArg("-drivechainbmmgrpcurl", ""),
         "-cacert", fs::PathToString(config.ca_certificate),
         "-cert", fs::PathToString(config.client_certificate),
         "-key", fs::PathToString(config.client_key),
@@ -275,6 +292,10 @@ bool ValidateNativeDrivechainRpcServerConfig(const ArgsManager& args,
                                              std::string* error)
 {
     if (error) error->clear();
+    if (args.GetBoolArg("-rest", false)) {
+        if (error) *error = "unauthenticated REST is not permitted on a native drivechain node";
+        return false;
+    }
     const int64_t configured_port = args.GetIntArg(
         "-rpcport", BaseParams().RPCPort());
     if (configured_port <= 0 ||

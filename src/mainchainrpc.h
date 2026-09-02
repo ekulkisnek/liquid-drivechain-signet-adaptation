@@ -330,6 +330,11 @@ bool ValidateDrivechainGrpcTLSConfig(
     const ArgsManager& args,
     std::string* error = nullptr);
 
+/** Validate the explicitly configured, private, non-symlink grpcurl executable. */
+bool ValidateDrivechainGrpcExecutable(
+    const ArgsManager& args,
+    std::string* error = nullptr);
+
 /** Call an allowlisted enforcer method using mutual TLS and direct argv. */
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
     const ArgsManager& args,
@@ -385,13 +390,13 @@ private:
 
 UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
 /**
- * Call a unary CUSF Connect RPC over bounded in-process HTTP/JSON.
+ * Call an allowlisted unary CUSF RPC through the bounded, authenticated gRPC transport.
  *
- * The endpoint is a host[:port] authority (no URL scheme) and method is the
- * fully-qualified service/method path without a leading slash. This function
- * never invokes a shell or external executable.
+ * The endpoint must exactly match the configured loopback host:port (no URL
+ * scheme); method is the fully-qualified service/method path without a leading
+ * slash. Invokes the explicitly configured grpcurl executable without a shell.
  */
-bool CallDrivechainConnectJSON(
+bool CallAuthenticatedDrivechainJSON(
     const std::string& endpoint,
     const std::string& method,
     const UniValue& request,

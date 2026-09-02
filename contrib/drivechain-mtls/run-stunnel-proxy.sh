@@ -64,14 +64,28 @@ if [[ -z $certificate_key || $certificate_key != "$private_key" ]]; then
   exit 1
 fi
 
-case "$listen" in
-  127.*:*|'[::1]':*) ;;
-  *) echo "refusing non-loopback TLS listen endpoint: $listen" >&2; exit 1 ;;
-esac
-case "$upstream" in
-  127.*:*|'[::1]':*) ;;
-  *) echo "refusing non-loopback plaintext upstream: $upstream" >&2; exit 1 ;;
-esac
+is_loopback_endpoint() {
+  local endpoint=$1 octet port
+  if [[ $endpoint =~ ^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3}):([0-9]{1,5})$ ]]; then
+    port=${BASH_REMATCH[4]}
+    for octet in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; do
+      [[ $octet == 0 || $octet != 0* ]] || return 1
+      ((10#$octet <= 255)) || return 1
+    done
+  elif [[ $endpoint =~ ^\[::1\]:([0-9]{1,5})$ ]]; then
+    port=${BASH_REMATCH[1]}
+  else
+    return 1
+  fi
+  ((10#$port >= 1 && 10#$port <= 65535))
+}
+
+is_loopback_endpoint "$listen" || {
+  echo "refusing non-loopback or invalid TLS listen endpoint: $listen" >&2; exit 1
+}
+is_loopback_endpoint "$upstream" || {
+  echo "refusing non-loopback or invalid plaintext upstream: $upstream" >&2; exit 1
+}
 
 configuration=$(mktemp "${TMPDIR:-/tmp}/elements-enforcer-stunnel.XXXXXX")
 trap 'rm -f "$configuration"' EXIT

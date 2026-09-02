@@ -1,5 +1,13 @@
 # Deterministic Drivechain BMM Proof
 
+**Historical Liquid-signet/ECX format only.** This document describes the old
+height-2 signet checkpoint, not the current `-chain=elements` native network.
+The native network uses `drivechain_parent_replay.cpp` and the frozen identity
+in `elements_drivechain_identity.h`; native validation rejects this legacy
+header/proof extension and cannot bootstrap from the signet checkpoint below.
+See [current operations](drivechain-peg-operations.md). Do not use this document
+to configure a native parent node or to alter its consensus parameters.
+
 LayerTwoLabs public-signet sidechain blocks after height 2 commit the L1
 successor evidence that proves their BIP301 blind-merge-mining commitment was
 mined. Block validation is deterministic and does not call Bitcoin RPC, invoke

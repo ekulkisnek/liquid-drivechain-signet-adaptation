@@ -22,7 +22,7 @@ files=(
   elements-client-key.pem elements-client.pem
 )
 for file in "${files[@]}"; do
-  if [[ -e "$destination/$file" ]]; then
+  if [[ -e "$destination/$file" || -L "$destination/$file" ]]; then
     echo "refusing to overwrite $destination/$file" >&2
     exit 1
   fi
@@ -31,7 +31,7 @@ done
 temporary=$(mktemp -d "$destination/.issue.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT
 
-openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+openssl req -x509 -newkey rsa:3072 -sha256 -days 365 -nodes \
   -subj '/CN=Elements Drivechain Local CA' \
   -keyout "$destination/ca-key.pem" -out "$destination/ca.pem"
 
@@ -42,9 +42,9 @@ cat >"$temporary/server.ext" <<'EOF'
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=DNS:enforcer.local,IP:127.0.0.1
+subjectAltName=DNS:enforcer.local,IP:127.0.0.1,IP:::1
 EOF
-openssl x509 -req -sha256 -days 825 \
+openssl x509 -req -sha256 -days 90 \
   -in "$temporary/server.csr" -CA "$destination/ca.pem" \
   -CAkey "$destination/ca-key.pem" -CAcreateserial \
   -extfile "$temporary/server.ext" -out "$destination/server.pem"
@@ -59,7 +59,7 @@ keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=clientAuth
 subjectAltName=DNS:elements-client
 EOF
-openssl x509 -req -sha256 -days 825 \
+openssl x509 -req -sha256 -days 90 \
   -in "$temporary/client.csr" -CA "$destination/ca.pem" \
   -CAkey "$destination/ca-key.pem" -CAserial "$destination/ca.srl" \
   -extfile "$temporary/client.ext" -out "$destination/elements-client.pem"

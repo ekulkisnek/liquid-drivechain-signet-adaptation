@@ -146,8 +146,8 @@ bool GetAuthCookie(std::string *cookie_out)
 
 std::string GetDefaultMainchainAuthCookieFile(const std::string& chain)
 {
-    // The sole production Elements chain is anchored to Bitcoin Signet.
-    if (chain == CBaseChainParams::ELEMENTS) return "signet/.cookie";
+    // Native Elements freezes mainnet ancestry, not historical L2L Signet.
+    if (chain == CBaseChainParams::ELEMENTS) return ".cookie";
 
     // These paths exist only for inherited unit/functional-test contexts.
     if (chain == CBaseChainParams::LIQUID1) return ".cookie";

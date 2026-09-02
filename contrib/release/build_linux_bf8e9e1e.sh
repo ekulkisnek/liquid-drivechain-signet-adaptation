@@ -81,6 +81,7 @@ else
   UNIT_STATUS=build_failed
 fi
 echo "unit_tests=$UNIT_STATUS"
+test "$UNIT_STATUS" = passed
 
 echo "elementsd_version_begin"
 src/elementsd --version
