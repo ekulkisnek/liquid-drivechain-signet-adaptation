@@ -51,6 +51,7 @@
 #include <primitives/pak.h> // CPAKList
 
 class Chainstate;
+class DrivechainAnchorSnapshot;
 class CTxMemPool;
 class ChainstateManager;
 struct ChainTxData;
@@ -916,6 +917,12 @@ private:
 
     /** Candidates suppressed only by mutable parent-chain state, never invalidity. */
     std::set<CBlockIndex*> m_drivechain_suppressed_candidates GUARDED_BY(cs_main);
+
+    /** Complete startup-only authentication, never a generic parent replay cache. */
+    std::shared_ptr<const DrivechainAnchorSnapshot> m_drivechain_anchor_snapshot GUARDED_BY(cs_main);
+
+    bool PrepareDrivechainAnchorSnapshot(std::string* error)
+        EXCLUSIVE_LOCKS_REQUIRED(m_chainstate_mutex) LOCKS_EXCLUDED(cs_main);
 
     bool ReconcileDrivechainAnchors(BlockValidationState& state, bool& blocks_disconnected, bool& stalled)
         EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);

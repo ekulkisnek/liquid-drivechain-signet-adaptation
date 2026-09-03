@@ -17,6 +17,7 @@
 #include <script/script.h>
 #include <signet.h>
 #include <streams.h>
+#include <util/signalinterrupt.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <rpc/request.h>
@@ -67,6 +68,8 @@ struct DrivechainParentBudgetState {
 };
 
 thread_local DrivechainParentBudgetState g_drivechain_parent_budget;
+thread_local std::optional<std::chrono::steady_clock::time_point> g_drivechain_anchor_warm_deadline;
+thread_local const util::SignalInterrupt* g_drivechain_anchor_warm_interrupt{nullptr};
 thread_local uint32_t g_drivechain_untrusted_parent_admission_depth{0};
 std::atomic<int64_t> g_drivechain_parent_rpc_unavailable_until{0};
 static constexpr auto DRIVECHAIN_PARENT_RPC_BACKOFF{std::chrono::seconds{5}};
@@ -124,6 +127,14 @@ bool DrivechainParentBudgetActive()
 
 void CheckDrivechainParentDeadline()
 {
+    if (g_drivechain_anchor_warm_deadline.has_value()) {
+        if (g_drivechain_anchor_warm_interrupt && *g_drivechain_anchor_warm_interrupt) {
+            throw CConnectionFailed("drivechain anchor snapshot authentication interrupted");
+        }
+        if (std::chrono::steady_clock::now() >= *g_drivechain_anchor_warm_deadline) {
+            throw CConnectionFailed("drivechain anchor snapshot authentication deadline exhausted");
+        }
+    }
     if (DrivechainParentBudgetActive() &&
         std::chrono::steady_clock::now() >= g_drivechain_parent_budget.deadline) {
         throw CConnectionFailed("drivechain parent validation work budget exhausted");
@@ -388,6 +399,23 @@ static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const Un
         timeval timeout{};
         timeout.tv_sec = seconds.count();
         timeout.tv_usec = microseconds.count();
+        evhttp_connection_set_timeout_tv(evcon.get(), &timeout);
+    } else if (g_drivechain_anchor_warm_deadline.has_value()) {
+        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            *g_drivechain_anchor_warm_deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::microseconds::zero()) {
+            throw CConnectionFailed("drivechain anchor snapshot authentication deadline exhausted");
+        }
+        const int64_t configured = gArgs.GetIntArg("-mainchainrpctimeout", DEFAULT_HTTP_CLIENT_TIMEOUT);
+        // Zero/negative means no configured timeout. The aggregate deadline
+        // still applies, even when a caller configured an arbitrarily long RPC.
+        if (configured > 0 && configured < std::chrono::ceil<std::chrono::seconds>(remaining).count()) {
+            remaining = std::chrono::seconds{configured};
+        }
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+        timeval timeout{};
+        timeout.tv_sec = seconds.count();
+        timeout.tv_usec = (remaining - seconds).count();
         evhttp_connection_set_timeout_tv(evcon.get(), &timeout);
     } else {
         evhttp_connection_set_timeout(
@@ -3470,6 +3498,137 @@ DrivechainAnchorStatus IsDrivechainAnchorActive(const DrivechainAnchor& anchor,
         return DrivechainAnchorStatus::ACTIVE;
     } catch (const std::exception& e) {
         return SetAnchorError(error, DrivechainAnchorStatus::UNAVAILABLE, e.what());
+    }
+}
+
+bool DrivechainAnchorSnapshot::Matches(const int slot, const uint256& parent_tip,
+                                       const uint64_t epoch) const
+{
+    return !m_parent_tip.IsNull() && m_parent_tip == parent_tip && EpochMatches(slot, epoch);
+}
+
+bool DrivechainAnchorSnapshot::EpochMatches(const int slot, const uint64_t epoch) const
+{
+    return m_slot >= 0 && m_slot <= 255 && m_slot == slot && m_epoch != 0 && m_epoch == epoch;
+}
+
+bool DrivechainAnchorSnapshot::Add(const DrivechainAnchor& anchor,
+                                   const DrivechainAnchorStatus status)
+{
+    if (status != DrivechainAnchorStatus::ACTIVE || !anchor.IsSane() ||
+        m_parent_tip.IsNull() || !EpochMatches(m_slot, m_epoch)) return false;
+    std::vector<unsigned char> encoded;
+    VectorWriter{encoded, 0} << anchor;
+    const auto [it, inserted] = m_active_anchors.emplace((HashWriter{} << anchor).GetHash(), encoded);
+    return inserted || it->second == encoded;
+}
+
+bool DrivechainAnchorSnapshot::Contains(const DrivechainAnchor& anchor,
+                                        const int slot, const uint64_t epoch) const
+{
+    if (!EpochMatches(slot, epoch) || !anchor.IsSane()) return false;
+    const auto found = m_active_anchors.find((HashWriter{} << anchor).GetHash());
+    if (found == m_active_anchors.end()) return false;
+    std::vector<unsigned char> encoded;
+    VectorWriter{encoded, 0} << anchor;
+    return found->second == encoded;
+}
+
+namespace {
+bool ReadDrivechainAnchorSnapshotTip(uint256& tip, std::string* error)
+{
+    const UniValue result = CallMainChainRPCChecked("getbestblockhash", UniValue(UniValue::VARR));
+    if (!ParseCanonicalHash(result, tip) || tip.IsNull()) {
+        return SetError(error, "parent getbestblockhash returned a noncanonical tip");
+    }
+    return true;
+}
+} // namespace
+
+bool CheckDrivechainAnchorSnapshotEpoch(const DrivechainAnchorSnapshot& snapshot,
+                                        const int sidechain_slot, std::string* error)
+{
+    try {
+        CheckDrivechainParentDeadline();
+        if (!snapshot.EpochMatches(sidechain_slot, GetDrivechainParentReplayEpoch())) {
+            return SetError(error, "authenticated parent generation changed during anchor snapshot use");
+        }
+        return true;
+    } catch (const std::exception& e) {
+        return SetError(error, e.what());
+    }
+}
+
+bool CheckDrivechainAnchorSnapshot(const DrivechainAnchorSnapshot& snapshot,
+                                   const int sidechain_slot, std::string* error)
+{
+    if (!CheckConfiguredDrivechainSlot(sidechain_slot, error) ||
+        !CheckDrivechainAnchorSnapshotEpoch(snapshot, sidechain_slot, error)) return false;
+    try {
+        uint256 tip;
+        if (!ReadDrivechainAnchorSnapshotTip(tip, error)) return false;
+        // Epoch alone is insufficient: the warmer may not yet have observed
+        // a reorg. Even benign extension requires a freshly authenticated set.
+        if (!snapshot.Matches(sidechain_slot, tip, GetDrivechainParentReplayEpoch())) {
+            return SetError(error, "active parent tip changed during anchor snapshot use");
+        }
+        return CheckDrivechainAnchorSnapshotEpoch(snapshot, sidechain_slot, error);
+    } catch (const std::exception& e) {
+        return SetError(error, e.what());
+    }
+}
+
+bool WarmDrivechainAnchorSnapshot(
+    const std::vector<DrivechainAnchor>& anchors, const int sidechain_slot,
+    const util::SignalInterrupt& interrupt,
+    std::shared_ptr<const DrivechainAnchorSnapshot>& result, std::string* error)
+{
+    result.reset();
+    if (error) error->clear();
+    if (DrivechainParentBudgetActive() || g_drivechain_anchor_warm_deadline.has_value()) {
+        return SetError(error, "bulk anchor authentication cannot run inside a parent validation budget");
+    }
+    if (interrupt) return SetError(error, "drivechain anchor snapshot authentication interrupted");
+    if (!CheckConfiguredDrivechainSlot(sidechain_slot, error)) return false;
+    struct DeadlineScope {
+        explicit DeadlineScope(const util::SignalInterrupt& interrupt) {
+            g_drivechain_anchor_warm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{120};
+            g_drivechain_anchor_warm_interrupt = &interrupt;
+        }
+        ~DeadlineScope() {
+            g_drivechain_anchor_warm_deadline.reset();
+            g_drivechain_anchor_warm_interrupt = nullptr;
+        }
+    } deadline_scope{interrupt};
+    try {
+        CheckDrivechainParentDeadline();
+        const uint64_t epoch = GetDrivechainParentReplayEpoch();
+        if (epoch == 0) return SetError(error, "anchor snapshot requires authenticated parent replay");
+        uint256 tip;
+        if (!ReadDrivechainAnchorSnapshotTip(tip, error)) return false;
+        auto snapshot = std::make_shared<DrivechainAnchorSnapshot>(sidechain_slot, tip, epoch);
+        for (const DrivechainAnchor& anchor : anchors) {
+            CheckDrivechainParentDeadline();
+            if (!snapshot->EpochMatches(sidechain_slot, GetDrivechainParentReplayEpoch())) {
+                return SetError(error, "parent replay changed while authenticating anchor snapshot");
+            }
+            if (snapshot->Contains(anchor, sidechain_slot, epoch)) continue;
+            std::string anchor_error;
+            const DrivechainAnchorStatus status = IsDrivechainAnchorActive(anchor, sidechain_slot, &anchor_error);
+            if (status == DrivechainAnchorStatus::UNAVAILABLE) {
+                return SetError(error, "cannot authenticate complete anchor snapshot: " + anchor_error);
+            }
+            if (status == DrivechainAnchorStatus::ACTIVE && !snapshot->Add(anchor, status)) {
+                return SetError(error, "authenticated anchor snapshot contains malformed identity");
+            }
+            // Never retain ORPHANED as a rollback authority: reconciliation
+            // must freshly establish those active-height mismatches itself.
+        }
+        if (!CheckDrivechainAnchorSnapshot(*snapshot, sidechain_slot, error)) return false;
+        result = std::move(snapshot);
+        return true;
+    } catch (const std::exception& e) {
+        return SetError(error, e.what());
     }
 }
 

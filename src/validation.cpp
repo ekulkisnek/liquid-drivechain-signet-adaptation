@@ -5396,6 +5396,69 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     return true;
 }
 
+bool Chainstate::PrepareDrivechainAnchorSnapshot(std::string* error)
+{
+    AssertLockHeld(m_chainstate_mutex);
+    AssertLockNotHeld(cs_main);
+    const auto slot = m_chainman.GetParams().GetConsensus().drivechain_slot;
+    if (!slot.has_value()) return true;
+    if (m_chainman.m_interrupt) {
+        if (error) *error = "drivechain anchor snapshot authentication interrupted";
+        return false;
+    }
+
+    std::vector<DrivechainAnchor> anchors;
+    std::shared_ptr<const DrivechainAnchorSnapshot> previous;
+    {
+        LOCK(cs_main);
+        previous = m_drivechain_anchor_snapshot;
+        // Copy values before releasing cs_main. Visit shared ancestry once,
+        // even when reindex loaded every historical block as a candidate.
+        // Absent anchors remain uncached and fail closed in reconciliation.
+        std::set<const CBlockIndex*> visited;
+        const auto append_path = [&](const CBlockIndex* index) {
+            for (; index && index->nHeight > 0; index = index->pprev) {
+                if (!visited.insert(index).second) break;
+                if (index->m_drivechain_anchor.has_value()) anchors.push_back(*index->m_drivechain_anchor);
+                if (m_chain.Contains(index)) break;
+            }
+        };
+        append_path(m_chain.Tip());
+        for (const CBlockIndex* index : setBlockIndexCandidates) append_path(index);
+        for (const CBlockIndex* index : m_drivechain_suppressed_candidates) append_path(index);
+        // Drop the startup cache once the backlog has drained. Normal
+        // synchronized operation requires only the active tip, not bulk
+        // authentication of untrusted P2P candidate collections.
+        if (anchors.size() <= 1) {
+            m_drivechain_anchor_snapshot.reset();
+            return true;
+        }
+    }
+
+    // A reuse probe also performs RPC. Bound it even though cs_main is not
+    // held; a configured unlimited/long RPC timeout must not hang startup.
+    const bool previous_current = previous && [&] {
+        DrivechainParentValidationBudget probe_budget{/*enable=*/true};
+        return CheckDrivechainAnchorSnapshot(*previous, *slot, error);
+    }();
+    if (previous_current) {
+        const uint64_t epoch = GetDrivechainParentReplayEpoch();
+        if (std::all_of(anchors.begin(), anchors.end(), [&](const DrivechainAnchor& anchor) {
+                return previous->Contains(anchor, *slot, epoch);
+            })) return true;
+    }
+    // Parent extension also refreshes the complete set outside consensus
+    // locks. Failure must never fall back to the previous generation.
+    std::shared_ptr<const DrivechainAnchorSnapshot> prepared;
+    if (!WarmDrivechainAnchorSnapshot(anchors, *slot, m_chainman.m_interrupt, prepared, error)) return false;
+    {
+        LOCK(cs_main);
+        m_drivechain_anchor_snapshot = std::move(prepared);
+    }
+    LogPrintf("authenticated %u persisted drivechain anchors outside consensus locks\n", anchors.size());
+    return true;
+}
+
 bool Chainstate::ReconcileDrivechainAnchors(BlockValidationState& state, bool& blocks_disconnected, bool& stalled)
 {
     AssertLockHeld(cs_main);
@@ -5410,6 +5473,16 @@ bool Chainstate::ReconcileDrivechainAnchors(BlockValidationState& state, bool& b
     // held; stale replay work is left to the background warmer.
     DrivechainParentValidationBudget parent_budget{/*enable=*/true};
 
+    const auto snapshot = m_drivechain_anchor_snapshot;
+    if (snapshot) {
+        std::string snapshot_error;
+        if (!CheckDrivechainAnchorSnapshot(*snapshot, *slot, &snapshot_error)) {
+            LogPrintf("drivechain anchor snapshot unavailable: %s\n", snapshot_error);
+            stalled = true;
+            return true;
+        }
+    }
+
     struct CachedStatus {
         DrivechainAnchorStatus status{DrivechainAnchorStatus::UNAVAILABLE};
         std::string error;
@@ -5417,6 +5490,12 @@ bool Chainstate::ReconcileDrivechainAnchors(BlockValidationState& state, bool& b
     std::map<const CBlockIndex*, CachedStatus> status_cache;
     const auto get_status = [&](const CBlockIndex* index) -> const CachedStatus& {
         auto [it, inserted] = status_cache.try_emplace(index);
+        // Check even repeated ancestry lookups: an earlier cached result is
+        // not permission to outlive this pass's deadline or replay generation.
+        if (snapshot && !CheckDrivechainAnchorSnapshotEpoch(*snapshot, *slot, &it->second.error)) {
+            it->second.status = DrivechainAnchorStatus::UNAVAILABLE;
+            return it->second;
+        }
         if (!inserted) return it->second;
         if (!index || index->nHeight == 0) {
             it->second.status = DrivechainAnchorStatus::ACTIVE;
@@ -5424,6 +5503,10 @@ bool Chainstate::ReconcileDrivechainAnchors(BlockValidationState& state, bool& b
         }
         if (!index->m_drivechain_anchor.has_value()) {
             it->second.error = "persisted drivechain anchor is absent";
+            return it->second;
+        }
+        if (snapshot && snapshot->Contains(*index->m_drivechain_anchor, *slot, GetDrivechainParentReplayEpoch())) {
+            it->second.status = DrivechainAnchorStatus::ACTIVE;
             return it->second;
         }
         it->second.status = IsDrivechainAnchorActive(*index->m_drivechain_anchor, *slot, &it->second.error);
@@ -5888,6 +5971,15 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
         // probably have a DEBUG_LOCKORDER test for this in the future.
         if (m_chainman.m_options.signals) LimitValidationInterfaceQueue(*m_chainman.m_options.signals);
 
+        // Only a startup-seeded backlog enters this path. Refresh outside
+        // cs_main/mempool locks if the parent tip or exact anchor set changed.
+        if (WITH_LOCK(cs_main, return bool{m_drivechain_anchor_snapshot};)) {
+            std::string snapshot_error;
+            if (!PrepareDrivechainAnchorSnapshot(&snapshot_error)) {
+                return state.Error("cannot refresh startup drivechain anchors: " + snapshot_error);
+            }
+        }
+
         {
             LOCK(cs_main);
             {
@@ -6046,6 +6138,10 @@ bool Chainstate::ReconcileDrivechainAnchorsForStartup(
     AssertLockNotHeld(::cs_main);
 
     LOCK(m_chainstate_mutex);
+    std::string snapshot_error;
+    if (!PrepareDrivechainAnchorSnapshot(&snapshot_error)) {
+        return state.Error("cannot prepare startup drivechain anchors: " + snapshot_error);
+    }
     LOCK(::cs_main);
     LOCK(MempoolMutex());
 

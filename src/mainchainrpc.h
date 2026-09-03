@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <stdexcept>
@@ -39,6 +40,9 @@ struct BmmL1State;
 struct BmmProof;
 }
 struct DrivechainAnchor;
+namespace util {
+class SignalInterrupt;
+}
 
 /** True only when slot is the BIP300/301 slot configured for this network. */
 bool IsDrivechainSidechainSlot(int slot);
@@ -534,6 +538,48 @@ DrivechainBmmStatus GetDrivechainBmmBlockStatus(const CBlock& block,
 DrivechainAnchorStatus IsDrivechainAnchorActive(const DrivechainAnchor& anchor,
                                                 int sidechain_slot,
                                                 std::string* error = nullptr);
+
+/**
+ * Positive-only startup authentication results, bound to one exact parent tip
+ * and replay generation. The complete serialized anchor is the identity, not
+ * merely its P/Q hashes. Callers must freshly fence the parent tip before a
+ * reconciliation pass and check its generation/deadline on every lookup.
+ * This is not a replay snapshot and must never widen a child's exact Q-bound
+ * deposit context. ORPHANED results are deliberately not retained here.
+ */
+class DrivechainAnchorSnapshot
+{
+    int m_slot;
+    uint256 m_parent_tip;
+    uint64_t m_epoch;
+    std::map<uint256, std::vector<unsigned char>> m_active_anchors;
+
+public:
+    DrivechainAnchorSnapshot(int slot, const uint256& parent_tip, uint64_t epoch)
+        : m_slot(slot), m_parent_tip(parent_tip), m_epoch(epoch) {}
+
+    bool Matches(int slot, const uint256& parent_tip, uint64_t epoch) const;
+    bool EpochMatches(int slot, uint64_t epoch) const;
+    bool Add(const DrivechainAnchor& anchor, DrivechainAnchorStatus status);
+    bool Contains(const DrivechainAnchor& anchor, int slot, uint64_t epoch) const;
+    size_t Size() const { return m_active_anchors.size(); }
+};
+
+/** Authenticate a complete collection outside consensus locks, within 120s.
+ * Interrupted, stale or unavailable collections are never published. */
+bool WarmDrivechainAnchorSnapshot(
+    const std::vector<DrivechainAnchor>& anchors, int sidechain_slot,
+    const util::SignalInterrupt& interrupt,
+    std::shared_ptr<const DrivechainAnchorSnapshot>& result,
+    std::string* error = nullptr);
+
+/** Fresh RPC tip fence plus generation/deadline validation before each pass. */
+bool CheckDrivechainAnchorSnapshot(const DrivechainAnchorSnapshot& snapshot,
+                                    int sidechain_slot, std::string* error = nullptr);
+
+/** In-memory generation/deadline validation before every cached lookup. */
+bool CheckDrivechainAnchorSnapshotEpoch(const DrivechainAnchorSnapshot& snapshot,
+                                         int sidechain_slot, std::string* error = nullptr);
 
 /** Validate exactly one M7 carrying the expected opaque critical hash. */
 bool MatchDrivechainBmmCommitmentInBlock(const Sidechain::Bitcoin::CBlock& block,
