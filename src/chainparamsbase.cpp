@@ -3,12 +3,17 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#if defined(HAVE_CONFIG_H)
+#include <config/bitcoin-config.h>
+#endif
+
 #include <chainparamsbase.h>
 
 #include <elements_drivechain_identity.h>
 
+#include <common/args.h>
 #include <tinyformat.h>
-#include <util/system.h>
+#include <util/chaintype.h>
 
 #include <assert.h>
 
@@ -22,6 +27,7 @@ const std::string CBaseChainParams::LIQUIDTESTNET = "liquidtestnet";
 const std::string CBaseChainParams::ELEMENTS = "elements";
 
 const std::string CBaseChainParams::DEFAULT = CBaseChainParams::ELEMENTS;
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 void SetupChainParamsBaseOptions(ArgsManager& argsman)
 {
@@ -29,6 +35,7 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
     argsman.AddArg("-regtest", "Select internal regtest parameters for test/library contexts; the production elementsd startup gate rejects this mode.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-testactivationheight=name@height.", "Set the activation height of 'name' (segwit, bip34, dersig, cltv, csv). (regtest-only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-testnet", "Select internal test parameters; installed Elements programs reject this mode.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
+    argsman.AddArg("-testnet4", "Select internal testnet4 parameters; installed Elements programs reject this mode.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-vbparams=deployment:start:end[:min_activation_height]", "Use given start/end times and min_activation_height for specified version bits deployment (regtest or custom only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
     argsman.AddArg("-seednode=<ip>", "Use specified node as seed node. This option can be specified multiple times to connect to multiple nodes. (custom only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CHAINPARAMS);
 
@@ -70,7 +77,7 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
 
 void EnsureElementsProductionChain(const ArgsManager& args)
 {
-    if (args.GetChainName() != CBaseChainParams::ELEMENTS) {
+    if (args.GetChainTypeString() != CBaseChainParams::ELEMENTS) {
         throw std::runtime_error(
             "This program only supports the canonical -chain=elements production network");
     }
@@ -85,44 +92,63 @@ const CBaseChainParams& BaseParams()
 }
 
 /**
- * Port numbers for incoming Tor connections (8334, 18334, 38334, 18445) have
+ * Port numbers for incoming Tor connections (8334, 18334, 38334, 48334, 18445) have
  * been chosen arbitrarily to keep ranges of used ports tight.
  */
-std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain)
+std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainTypeMeta chain)
 {
-    if (chain == CBaseChainParams::MAIN) {
-        return std::make_unique<CBaseChainParams>("", 8332, 18332, 8334);
-    } else if (chain == CBaseChainParams::TESTNET) {
-        return std::make_unique<CBaseChainParams>("testnet3", 18332, 8332, 18334);
-    } else if (chain == CBaseChainParams::SIGNET) {
-        return std::make_unique<CBaseChainParams>("signet", 38332, 18332, 38334);
-    } else if (chain == CBaseChainParams::REGTEST) {
-        return std::make_unique<CBaseChainParams>("regtest", 18443, 18332, 18445);
-    } else if (chain == CBaseChainParams::LIQUID1) {
-        return std::make_unique<CBaseChainParams>("liquidv1", 7041, 8332, 37041);
-    } else if (chain == CBaseChainParams::LIQUID1TEST) {
-        return std::make_unique<CBaseChainParams>("liquidv1test", 7040, 18332, 37040);  // Use same ports as customparams
-    } else if (chain == CBaseChainParams::LIQUIDTESTNET) {
-        return std::make_unique<CBaseChainParams>(chain, 7039, 18331, 37039);
-    } else if (chain == CBaseChainParams::ELEMENTS) {
-        // Dedicated Elements Drivechain ports. The mainchain RPC port is the
-        // LayerTwo-Labs Signet RPC port.
+    if (chain.chain_name == "usdd") {
+        throw std::runtime_error("The pre-launch 'usdd' chain identity is unsupported; use -chain=elements");
+    }
+    switch (chain.chain_type) {
+    case ChainType::ELEMENTS:
         return std::make_unique<CBaseChainParams>(
             ElementsDrivechainIdentity::DATA_DIR,
             ElementsDrivechainIdentity::RPC_PORT,
             ElementsDrivechainIdentity::MAINCHAIN_RPC_PORT,
             ElementsDrivechainIdentity::ONION_TARGET_PORT);
-    } else if (chain == "usdd") {
-        throw std::runtime_error(
-            "The pre-launch 'usdd' chain identity is unsupported; use -chain=elements");
+    case ChainType::MAIN:
+        return std::make_unique<CBaseChainParams>("", 8332, 18332);
+    case ChainType::TESTNET:
+        return std::make_unique<CBaseChainParams>("testnet3", 18332, 8332);
+    case ChainType::TESTNET4:
+        return std::make_unique<CBaseChainParams>("testnet4", 48332, 8332);
+    case ChainType::SIGNET:
+        return std::make_unique<CBaseChainParams>("signet", 38332, 18332);
+    case ChainType::REGTEST:
+        return std::make_unique<CBaseChainParams>("regtest", 18443, 18332);
+    case ChainType::LIQUID1:
+        return std::make_unique<CBaseChainParams>("liquidv1", 7041, 8332);
+    case ChainType::LIQUID1TEST:
+        return std::make_unique<CBaseChainParams>("liquidv1test", 7040, 18332);  // Use same ports as customparams
+    case ChainType::LIQUIDTESTNET:
+        return std::make_unique<CBaseChainParams>("liquidtestnet", 7039, 18331);
+    case ChainType::CUSTOM:
+        return std::make_unique<CBaseChainParams>(chain.chain_name, 7040, 18332);
     }
+    return std::make_unique<CBaseChainParams>(chain.chain_name, 7040, 18332);
+}
 
-    // ELEMENTS:
-    return std::make_unique<CBaseChainParams>(chain, 7040, 18332, 37040);
+void SelectBaseParams(const ChainTypeMeta chain)
+{
+    globalChainBaseParams = CreateBaseChainParams(chain);
+    gArgs.SelectConfigNetwork(chain.chain_name);
+}
+
+// ELEMENTS
+std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain) {
+    return CreateBaseChainParams(ChainTypeMetaFrom(chain));
+}
+void SelectBaseParams(const ChainType chain) {
+    SelectBaseParams(ChainTypeMetaFrom(chain));
+}
+
+std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const std::string& chain)
+{
+    return CreateBaseChainParams(ChainTypeMetaFrom(chain));
 }
 
 void SelectBaseParams(const std::string& chain)
 {
-    globalChainBaseParams = CreateBaseChainParams(chain);
-    gArgs.SelectConfigNetwork(chain);
+    SelectBaseParams(ChainTypeMetaFrom(chain));
 }

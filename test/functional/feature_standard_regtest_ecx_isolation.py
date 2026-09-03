@@ -10,6 +10,9 @@ from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 class StandardRegtestEcxIsolationTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 1
@@ -105,4 +108,4 @@ class StandardRegtestEcxIsolationTest(BitcoinTestFramework):
 
 
 if __name__ == "__main__":
-    StandardRegtestEcxIsolationTest().main()
+    StandardRegtestEcxIsolationTest(__file__).main()

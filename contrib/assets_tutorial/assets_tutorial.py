@@ -71,7 +71,7 @@ try:
     e1.getinfo()
     print ("ERROR: was able to start an elementsd without a working bitcoind")
     sys.exit(1)
-except:
+except Exception:
     pass
 
 # 1b. Start bitcoind, then elementsd. Initially, the bitcoind may be warming up and

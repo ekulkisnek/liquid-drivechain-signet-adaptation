@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2020 The Bitcoin Core developers
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -10,6 +10,7 @@
 #include <script/script.h>
 #include <serialize.h>
 #include <uint256.h>
+#include <util/time.h>
 
 // ELEMENTS:
 // Globals to avoid circular dependencies.
@@ -22,21 +23,19 @@ public:
     CScript challenge{};
     CScript solution{};
 
-    CProof() {}
+    CProof() = default;
     CProof(CScript challengeIn, CScript solutionIn) : challenge(challengeIn), solution(solutionIn) {}
 
     template <typename Stream>
     inline void Serialize(Stream& s) const {
         s << *(CScriptBase*)(&challenge);
-        if (!(s.GetType() & SER_GETHASH))
-            s << *(CScriptBase*)(&solution);
+        s << *(CScriptBase*)(&solution);
     }
 
     template <typename Stream>
     inline void Unserialize(Stream& s) const {
         s >> *(CScriptBase*)(&challenge);
-        if (!(s.GetType() & SER_GETHASH))
-            s >> *(CScriptBase*)(&solution);
+        s >> *(CScriptBase*)(&solution);
     }
 
     void SetNull()
@@ -76,7 +75,7 @@ public:
 
     // Each constructor sets its own serialization type implicitly based on which
     // arguments are given
-    DynaFedParamEntry() {};
+    DynaFedParamEntry() = default;
     DynaFedParamEntry(const CScript& signblockscript_in, const uint32_t sbs_wit_limit_in, const uint256 elided_root_in) : m_signblockscript(signblockscript_in), m_signblock_witness_limit(sbs_wit_limit_in), m_elided_root(elided_root_in) { m_serialize_type = 1; };
     DynaFedParamEntry(const CScript& signblockscript_in, const uint32_t sbs_wit_limit_in, const CScript& fedpeg_program_in, const CScript& fedpegscript_in, const std::vector<std::vector<unsigned char>> extension_space_in) : m_signblockscript(signblockscript_in), m_signblock_witness_limit(sbs_wit_limit_in), m_fedpeg_program(fedpeg_program_in), m_fedpegscript(fedpegscript_in), m_extension_space(extension_space_in) { m_serialize_type = 2; };
 
@@ -180,7 +179,7 @@ public:
     // Proposed rules for next epoch
     DynaFedParamEntry m_proposed{};
 
-    DynaFedParams() {};
+    DynaFedParams() = default;
     DynaFedParams(const DynaFedParamEntry& current, const DynaFedParamEntry& proposed)  : m_current(current), m_proposed(proposed) {};
 
     SERIALIZE_METHODS(DynaFedParams, obj) { READWRITE(obj.m_current, obj.m_proposed); }
@@ -262,8 +261,7 @@ public:
     static const uint32_t INBOX_CURSOR_HF_MASK = 1 << 16;
 
     template <typename Stream>
-    inline void Serialize(Stream& s) const {
-        const bool fAllowWitness = !(s.GetVersion() & SERIALIZE_TRANSACTION_NO_WITNESS);
+    inline void Serialize(Stream& s, const TransactionSerParams& params) const {
         const bool has_withdrawal_bundle_hash = g_con_elementsmode &&
             !hashWithdrawalBundle.IsNull();
         // Bits 16--20 are ordinary BIP9/unknown-version bits on Bitcoin-mode
@@ -329,7 +327,7 @@ public:
                 s << sourceBacklogOldestParentHeight;
             }
             // We do not serialize witness for hashes, or weight calculation
-            if (!(s.GetType() & SER_GETHASH) && fAllowWitness) {
+            if (params.allow_witness) {
                 s << m_signblock_witness.stack;
             }
         } else {
@@ -371,10 +369,14 @@ public:
         }
     }
 
+    // ELEMENTS:
+    // Backwards-compatible overload for serializers that don't pass
+    // TransactionSerParams. Default to include witness.
     template <typename Stream>
-    inline void Unserialize(Stream& s) {
-        const bool fAllowWitness = !(s.GetVersion() & SERIALIZE_TRANSACTION_NO_WITNESS);
+    inline void Serialize(Stream& s) const { Serialize(s, TX_WITH_WITNESS); }
 
+    template <typename Stream>
+    inline void Unserialize(Stream& s, const TransactionSerParams& params) {
         // Detect dynamic federation block serialization using "HF bit",
         // or the signed bit which is invalid in Bitcoin
         bool is_dyna = false;
@@ -445,7 +447,7 @@ public:
                 sourceBacklogOldestParentHeight = 0;
             }
             // We do not serialize witness for hashes, or weight calculation
-            if (!(s.GetType() & SER_GETHASH) && fAllowWitness) {
+            if (params.allow_witness) {
                 s >> m_signblock_witness.stack;
             }
         } else {
@@ -503,6 +505,12 @@ public:
         }
     }
 
+    // ELEMENTS:
+    // Backwards-compatible overload for unserializers that don't pass
+    // TransactionSerParams. Default to include witness.
+    template <typename Stream>
+    inline void Unserialize(Stream& s) { Unserialize(s, TX_WITH_WITNESS); }
+
     void SetNull()
     {
         nVersion = 0;
@@ -553,6 +561,11 @@ public:
         return (static_cast<uint32_t>(nVersion) & DEPOSIT_INBOX_HF_MASK) != 0;
     }
 
+    NodeSeconds Time() const
+    {
+        return NodeSeconds{std::chrono::seconds{nTime}};
+    }
+
     int64_t GetBlockTime() const
     {
         return (int64_t)nTime;
@@ -567,8 +580,10 @@ public:
     std::vector<CTransactionRef> vtx;
     std::vector<unsigned char> m_bmm_proof;
 
-    // memory only
-    mutable bool fChecked;
+    // Memory-only flags for caching expensive checks
+    mutable bool fChecked;                            // CheckBlock()
+    mutable bool m_checked_witness_commitment{false}; // CheckWitnessCommitment()
+    mutable bool m_checked_merkle_root{false};        // CheckMerkleRoot()
 
     CBlock()
     {
@@ -583,8 +598,7 @@ public:
 
     SERIALIZE_METHODS(CBlock, obj)
     {
-        READWRITEAS(CBlockHeader, obj);
-        READWRITE(obj.vtx);
+        READWRITE(AsBase<CBlockHeader>(obj), obj.vtx);
         // Version bit 20 is an ordinary BIP9/unknown bit in Bitcoin mode. The
         // BMM proof vector is part of the block body only on Elements chains;
         // otherwise treating the bit as a length-prefixed field changes the
@@ -602,6 +616,8 @@ public:
         vtx.clear();
         m_bmm_proof.clear();
         fChecked = false;
+        m_checked_witness_commitment = false;
+        m_checked_merkle_root = false;
     }
 
     CBlockHeader GetBlockHeader() const
@@ -637,17 +653,25 @@ public:
  */
 struct CBlockLocator
 {
+    /** Historically CBlockLocator's version field has been written to network
+     * streams as the negotiated protocol version and to disk streams as the
+     * client version, but the value has never been used.
+     *
+     * Hard-code to the highest protocol version ever written to a network stream.
+     * SerParams can be used if the field requires any meaning in the future,
+     **/
+    static constexpr int DUMMY_VERSION = 70016;
+
     std::vector<uint256> vHave;
 
-    CBlockLocator() {}
+    CBlockLocator() = default;
 
-    explicit CBlockLocator(const std::vector<uint256>& vHaveIn) : vHave(vHaveIn) {}
+    explicit CBlockLocator(std::vector<uint256>&& have) : vHave(std::move(have)) {}
 
     SERIALIZE_METHODS(CBlockLocator, obj)
     {
-        int nVersion = s.GetVersion();
-        if (!(s.GetType() & SER_GETHASH))
-            READWRITE(nVersion);
+        int nVersion = DUMMY_VERSION;
+        READWRITE(nVersion);
         READWRITE(obj.vHave);
     }
 

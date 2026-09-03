@@ -5,7 +5,7 @@
 #include <chainparamsbase.h>
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
-#include <fs.h>
+#include <util/fs.h>
 #include <logging.h>
 #include <pegins.h>
 #include <primitives/bitcoin/transaction.h>
@@ -13,7 +13,8 @@
 #include <primitives/block.h>
 #include <script/script.h>
 #include <streams.h>
-#include <util/system.h>
+#include <common/args.h>
+#include <util/fs_helpers.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <rpc/request.h>
@@ -96,11 +97,11 @@ bool SubmitDrivechainBmmBid(
                 error)) {
             return false;
         }
-        const UniValue& txid_value = find_value(response.get_obj(), "txid");
+        const UniValue& txid_value = response.get_obj()["txid"];
         if (!txid_value.isObject()) {
             throw std::runtime_error("BMM wallet response has no transaction id");
         }
-        const UniValue& hex = find_value(txid_value.get_obj(), "hex");
+        const UniValue& hex = txid_value.get_obj()["hex"];
         if (!hex.isStr() || !IsHex(hex.get_str()) || hex.get_str().size() != 64) {
             throw std::runtime_error("BMM wallet returned a malformed transaction id");
         }
@@ -115,11 +116,11 @@ bool SubmitDrivechainBmmBid(
 static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
 {
     const UniValue reply = CallMainChainRPC(method, params);
-    const UniValue& error = find_value(reply, "error");
+    const UniValue& error = reply["error"];
     if (!error.isNull()) {
         throw std::runtime_error(strprintf("%s returned error: %s", method, error.write()));
     }
-    const UniValue& result = find_value(reply, "result");
+    const UniValue& result = reply["result"];
     if (result.isNull()) {
         throw std::runtime_error(strprintf("%s returned no result", method));
     }
@@ -128,11 +129,11 @@ static UniValue CallMainChainRPCChecked(const std::string& method, const UniValu
 
 static const UniValue& FindField(const UniValue& obj, const std::string& lower_camel, const std::string& snake_case)
 {
-    const UniValue& lower_value = find_value(obj.get_obj(), lower_camel);
+    const UniValue& lower_value = obj.get_obj()[lower_camel];
     if (!lower_value.isNull()) {
         return lower_value;
     }
-    return find_value(obj.get_obj(), snake_case);
+    return obj.get_obj()[snake_case];
 }
 
 static bool GetDrivechainGrpcJSON(
@@ -263,7 +264,7 @@ bool VerifyDrivechainDeposit(
         UniValue genesis_params(UniValue::VARR);
         genesis_params.push_back(0);
         const uint256 mainchain_genesis = uint256S(CallMainChainRPCChecked("getblockhash", genesis_params).get_str());
-        const uint256 mainchain_tip = uint256S(find_value(mainchain_info.get_obj(), "bestblockhash").get_str());
+        const uint256 mainchain_tip = uint256S(mainchain_info.get_obj()["bestblockhash"].get_str());
 
         UniValue enforcer_chain_info(UniValue::VOBJ);
         UniValue enforcer_tip(UniValue::VOBJ);
@@ -383,8 +384,8 @@ bool BuildDrivechainDepositEvidence(
 
         Sidechain::Bitcoin::CMutableTransaction deposit_tx;
         {
-            CDataStream stream(evidence.deposit_tx, SER_NETWORK, PROTOCOL_VERSION);
-            stream >> deposit_tx;
+            DataStream stream{evidence.deposit_tx};
+            stream >> TX_WITH_WITNESS(deposit_tx);
             if (!stream.empty() || deposit_tx.GetHash() != authenticated.outpoint.hash ||
                 authenticated.outpoint.n >= deposit_tx.vout.size()) {
                 throw std::runtime_error("L1 deposit transaction does not contain the authenticated outpoint");
@@ -412,8 +413,8 @@ bool BuildDrivechainDepositEvidence(
                 if (!previous_result.isStr() || !IsHex(previous_result.get_str())) continue;
                 const std::vector<unsigned char> previous_bytes = ParseHex(previous_result.get_str());
                 Sidechain::Bitcoin::CMutableTransaction previous_tx;
-                CDataStream stream(previous_bytes, SER_NETWORK, PROTOCOL_VERSION);
-                stream >> previous_tx;
+                DataStream stream{previous_bytes};
+                stream >> TX_WITH_WITNESS(previous_tx);
                 if (!stream.empty() || input.prevout.n >= previous_tx.vout.size() ||
                     !IsDrivechainCtipScript(
                         previous_tx.vout[input.prevout.n].scriptPubKey,
@@ -438,7 +439,7 @@ bool BuildDrivechainDepositEvidence(
 
         UniValue chain_info_params(UniValue::VARR);
         const UniValue chain_info = CallMainChainRPCChecked("getblockchaininfo", chain_info_params);
-        const int64_t tip_height = find_value(chain_info.get_obj(), "blocks").get_int64();
+        const int64_t tip_height = chain_info.get_obj()["blocks"].getInt<int64_t>();
         if (tip_height < authenticated.confirmation_height ||
             tip_height - authenticated.confirmation_height > 2016) {
             throw std::runtime_error("deposit confirmation is outside the bounded v2 L1 header window");
@@ -457,7 +458,7 @@ bool BuildDrivechainDepositEvidence(
             }
             const std::vector<unsigned char> header_bytes = ParseHex(header_result.get_str());
             Sidechain::Bitcoin::CBlockHeader header;
-            CDataStream stream(header_bytes, SER_NETWORK, PROTOCOL_VERSION);
+            DataStream stream{header_bytes};
             stream >> header;
             if (!stream.empty()) {
                 throw std::runtime_error("serialized L1 header contains trailing data");
@@ -521,7 +522,7 @@ bool BuildDrivechainBmmProof(
             block_params.push_back(1);
             const UniValue block{
                 CallMainChainRPCChecked("getblock", block_params)};
-            const UniValue& transactions = find_value(block.get_obj(), "tx");
+            const UniValue& transactions = block.get_obj()["tx"];
             if (!transactions.isArray() ||
                 transactions.empty() ||
                 !transactions[0].isStr()) {

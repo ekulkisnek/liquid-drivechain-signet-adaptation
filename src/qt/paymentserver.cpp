@@ -1,10 +1,6 @@
-// Copyright (c) 2011-2021 The Bitcoin Core developers
+// Copyright (c) 2011-2022 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
-
-#if defined(HAVE_CONFIG_H)
-#include <config/bitcoin-config.h>
-#endif
 
 #include <qt/paymentserver.h>
 
@@ -13,11 +9,11 @@
 #include <qt/optionsmodel.h>
 
 #include <chainparams.h>
+#include <common/args.h>
 #include <interfaces/node.h>
 #include <key_io.h>
-#include <node/ui_interface.h>
+#include <node/interface_ui.h>
 #include <policy/policy.h>
-#include <util/system.h>
 #include <wallet/wallet.h>
 
 #include <cstdlib>
@@ -76,22 +72,11 @@ void PaymentServer::ipcParseCommandLine(int argc, char* argv[])
     for (int i = 1; i < argc; i++)
     {
         QString arg(argv[i]);
-        if (arg.startsWith("-"))
-            continue;
+        if (arg.startsWith("-")) continue;
 
         if (arg.startsWith(ELEMENTS_IPC_PREFIX, Qt::CaseInsensitive))
         {
-            if (savedPaymentRequests.contains(arg)) continue;
             savedPaymentRequests.insert(arg);
-
-            SendCoinsRecipient r;
-            if (GUIUtil::parseBitcoinURI(arg, &r) && !r.address.isEmpty())
-            {
-                const auto elementsParams = CreateChainParams(gArgs, CBaseChainParams::ELEMENTS);
-                if (IsValidDestinationString(r.address.toStdString(), *elementsParams)) {
-                    SelectParams(CBaseChainParams::ELEMENTS);
-                }
-            }
         }
     }
 }
@@ -135,11 +120,8 @@ bool PaymentServer::ipcSendCommandLine()
     return fResult;
 }
 
-PaymentServer::PaymentServer(QObject* parent, bool startLocalServer) :
-    QObject(parent),
-    saveURIs(true),
-    uriServer(nullptr),
-    optionsModel(nullptr)
+PaymentServer::PaymentServer(QObject* parent, bool startLocalServer)
+    : QObject(parent)
 {
     // Install global event filter to catch QFileOpenEvents
     // on Mac: sent when you click elements: links
@@ -167,9 +149,7 @@ PaymentServer::PaymentServer(QObject* parent, bool startLocalServer) :
     }
 }
 
-PaymentServer::~PaymentServer()
-{
-}
+PaymentServer::~PaymentServer() = default;
 
 //
 // OSX-specific way of handling elements: URIs

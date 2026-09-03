@@ -5,6 +5,7 @@
 #include <pegins.h>
 #include <limits>
 
+#include <addresstype.h>
 #include <arith_uint256.h>
 #include <block_proof.h>
 #include <chainparams.h>
@@ -19,10 +20,8 @@
 #include <primitives/bitcoin/merkleblock.h>
 #include <secp256k1.h>
 #include <script/interpreter.h>
-#include <script/standard.h>
 #include <streams.h>
 #include <util/moneystr.h>
-#include <util/system.h>
 #include <dynafed.h>
 
 //
@@ -38,15 +37,15 @@ class Secp256k1Ctx
 {
 public:
     Secp256k1Ctx() {
-        assert(secp256k1_ctx_validation == NULL);
+        assert(secp256k1_ctx_validation == nullptr);
         secp256k1_ctx_validation = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
-        assert(secp256k1_ctx_validation != NULL);
+        assert(secp256k1_ctx_validation != nullptr);
     }
 
     ~Secp256k1Ctx() {
-        assert(secp256k1_ctx_validation != NULL);
+        assert(secp256k1_ctx_validation != nullptr);
         secp256k1_context_destroy(secp256k1_ctx_validation);
-        secp256k1_ctx_validation = NULL;
+        secp256k1_ctx_validation = nullptr;
     }
 };
 static Secp256k1Ctx instance_of_secp256k1ctx;
@@ -66,8 +65,8 @@ template <typename T>
 static bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
 {
     try {
-        CDataStream stream(bytes, SER_NETWORK, PROTOCOL_VERSION);
-        stream >> value;
+        DataStream stream(bytes);
+        stream >> TX_WITH_WITNESS(value);
         return stream.empty();
     } catch (...) {
         return false;
@@ -77,8 +76,8 @@ static bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value
 template <typename T>
 static std::vector<unsigned char> SerializeEvidenceField(const T& value)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
-    stream << value;
+    DataStream stream;
+    stream << TX_WITH_WITNESS(value);
     return std::vector<unsigned char>(
         UCharCast(stream.data()),
         UCharCast(stream.data()) + stream.size());
@@ -92,7 +91,7 @@ static bool ReadPeginWitnessPrefix(const CScriptWitness& pegin_witness, CAmount&
         return false;
     }
 
-    CDataStream stream(stack[0], SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream(stack[0]);
     try {
         stream >> value;
     } catch (...) {
@@ -224,8 +223,8 @@ template<typename T>
 static bool CheckPeginTx(const std::vector<unsigned char>& tx_data, T& pegtx, const COutPoint& prevout, const CAmount claim_amount, const CScript& claim_script, const std::vector<std::pair<CScript, CScript>>& fedpegscripts)
 {
     try {
-        CDataStream pegtx_stream(tx_data, SER_NETWORK, PROTOCOL_VERSION);
-        pegtx_stream >> pegtx;
+        DataStream pegtx_stream(tx_data);
+        pegtx_stream >> TX_WITH_WITNESS(pegtx);
         if (!pegtx_stream.empty()) {
             return false;
         }
@@ -264,7 +263,6 @@ static bool CheckPeginTx(const std::vector<unsigned char>& tx_data, T& pegtx, co
             return true;
         }
         CScript tweaked_fedpegscript = calculate_contract(scripts.second, claim_script);
-        // TODO: Remove script/standard.h dep for GetScriptFor*
         CScript expected_script(GetScriptForDestination(WitnessV0ScriptHash(tweaked_fedpegscript)));
         if (scripts.first.IsPayToScriptHash()) {
             expected_script = GetScriptForDestination(ScriptHash(expected_script));
@@ -282,8 +280,8 @@ static bool GetBlockAndTxFromMerkleBlock(uint256& block_hash, uint256& tx_hash, 
     try {
         std::vector<uint256> tx_hashes;
         std::vector<unsigned int> tx_indices;
-        CDataStream merkle_block_stream(merkle_block_raw, SER_NETWORK, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS);
-        merkle_block_stream >> merkle_block;
+        DataStream merkle_block_stream{merkle_block_raw};
+        merkle_block_stream >> TX_NO_WITNESS(merkle_block);
         block_hash = merkle_block.header.GetHash();
 
         if (!merkle_block_stream.empty()) {
@@ -962,7 +960,7 @@ std::vector<std::pair<CScript, CScript>> GetValidFedpegScripts(const CBlockIndex
     // to see if we're on a boundary. If so, put that epoch's fedpegscript in place
     if (nextblock_validation && epoch_age == epoch_length - 1) {
         DynaFedParamEntry next_param = ComputeNextBlockFullCurrentParameters(pblockindex, params);
-        fedpegscripts.push_back(std::make_pair(next_param.m_fedpeg_program, next_param.m_fedpegscript));
+        fedpegscripts.emplace_back(next_param.m_fedpeg_program, next_param.m_fedpegscript);
     }
 
     // Next we walk backwards up to M epoch starts
@@ -984,9 +982,9 @@ std::vector<std::pair<CScript, CScript>> GetValidFedpegScripts(const CBlockIndex
             ForceUntrimHeader(p_epoch_start);
         }
         if (!p_epoch_start->dynafed_params().IsNull()) {
-            fedpegscripts.push_back(std::make_pair(p_epoch_start->dynafed_params().m_current.m_fedpeg_program, p_epoch_start->dynafed_params().m_current.m_fedpegscript));
+            fedpegscripts.emplace_back(p_epoch_start->dynafed_params().m_current.m_fedpeg_program, p_epoch_start->dynafed_params().m_current.m_fedpegscript);
         } else {
-            fedpegscripts.push_back(std::make_pair(GetScriptForDestination(ScriptHash(GetScriptForDestination(WitnessV0ScriptHash(params.fedpegScript)))), params.fedpegScript));
+            fedpegscripts.emplace_back(GetScriptForDestination(ScriptHash(GetScriptForDestination(WitnessV0ScriptHash(params.fedpegScript)))), params.fedpegScript);
         }
     }
     // Only return up to the latest total_valid_epochs fedpegscripts, which are enforced
@@ -998,7 +996,7 @@ template<typename T_tx_ref, typename T_merkle_block>
 CScriptWitness CreatePeginWitnessInner(const CAmount& value, const CAsset& asset, const uint256& genesis_hash, const CScript& claim_script, const T_tx_ref& tx_ref, const T_merkle_block& merkle_block)
 {
     std::vector<unsigned char> value_bytes;
-    CVectorWriter ss_val(0, 0, value_bytes, 0);
+    VectorWriter ss_val(value_bytes, 0);
     try {
         ss_val << value;
     } catch (...) {
@@ -1006,14 +1004,14 @@ CScriptWitness CreatePeginWitnessInner(const CAmount& value, const CAsset& asset
     }
 
     // Strip witness data for proof inclusion since only TXID-covered fields matters
-    CDataStream ss_tx(SER_NETWORK, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS);
-    ss_tx << tx_ref;
+    DataStream ss_tx{};
+    ss_tx << TX_NO_WITNESS(tx_ref);
     const auto* ss_tx_ptr = UCharCast(ss_tx.data());
     std::vector<unsigned char> tx_data_stripped(ss_tx_ptr, ss_tx_ptr + ss_tx.size());
 
     // Serialize merkle block
-    CDataStream ss_txout_proof(SER_NETWORK, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS);
-    ss_txout_proof << merkle_block;
+    DataStream ss_txout_proof{};
+    ss_txout_proof << TX_NO_WITNESS(merkle_block);
     const auto* ss_txout_ptr = UCharCast(ss_txout_proof.data());
     std::vector<unsigned char> txout_proof_bytes(ss_txout_ptr, ss_txout_ptr + ss_txout_proof.size());
 
@@ -1021,9 +1019,9 @@ CScriptWitness CreatePeginWitnessInner(const CAmount& value, const CAsset& asset
     CScriptWitness pegin_witness;
     std::vector<std::vector<unsigned char>>& stack = pegin_witness.stack;
     stack.push_back(value_bytes);
-    stack.push_back(std::vector<unsigned char>(asset.begin(), asset.end()));
-    stack.push_back(std::vector<unsigned char>(genesis_hash.begin(), genesis_hash.end()));
-    stack.push_back(std::vector<unsigned char>(claim_script.begin(), claim_script.end()));
+    stack.emplace_back(asset.begin(), asset.end());
+    stack.emplace_back(genesis_hash.begin(), genesis_hash.end());
+    stack.emplace_back(claim_script.begin(), claim_script.end());
     stack.push_back(tx_data_stripped);
     stack.push_back(txout_proof_bytes);
     return pegin_witness;
@@ -1050,7 +1048,7 @@ CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value,
         throw std::invalid_argument("Drivechain deposit address must contain 1..128 bytes.");
     }
     std::vector<unsigned char> value_bytes;
-    CVectorWriter ss_val(0, 0, value_bytes, 0);
+    VectorWriter ss_val(value_bytes, 0);
     try {
         ss_val << value;
     } catch (...) {
@@ -1064,7 +1062,7 @@ CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value,
     stack.push_back(std::vector<unsigned char>(genesis_hash.begin(), genesis_hash.end()));
     stack.push_back(std::vector<unsigned char>(claim_script.begin(), claim_script.end()));
     stack.push_back(DRIVECHAIN_DEPOSIT_MARKER);
-    stack.push_back(std::vector<unsigned char>(mainchain_outpoint.hash.begin(), mainchain_outpoint.hash.end()));
+    stack.push_back(std::vector<unsigned char>(mainchain_outpoint.hash.ToUint256().begin(), mainchain_outpoint.hash.ToUint256().end()));
     stack.push_back(std::vector<unsigned char>(mainchain_block_hash.begin(), mainchain_block_hash.end()));
     stack.push_back(address);
     return pegin_witness;
@@ -1073,7 +1071,7 @@ CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value,
 CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value, const CAsset& asset, const uint256& genesis_hash, const CScript& claim_script, const uint256& mainchain_txid)
 {
     std::vector<unsigned char> value_bytes;
-    CVectorWriter ss_val(0, 0, value_bytes, 0);
+    VectorWriter ss_val(value_bytes, 0);
     try {
         ss_val << value;
     } catch (...) {
@@ -1099,7 +1097,7 @@ CScriptWitness CreateDrivechainDepositPeginWitness(
     const DrivechainDepositEvidence& evidence)
 {
     std::vector<unsigned char> value_bytes;
-    CVectorWriter value_writer(0, 0, value_bytes, 0);
+    VectorWriter value_writer(value_bytes, 0);
     value_writer << value;
 
     CScriptWitness pegin_witness;
@@ -1122,41 +1120,56 @@ bool DecomposePeginWitness(const CScriptWitness& witness, CAmount& value, CAsset
 {
     const auto& stack = witness.stack;
 
-    if (stack.size() < 5) return false;
+    if (stack.size() != 6) return false;
+    if (stack[1].size() != 32) return false; // asset
+    if (stack[2].size() != 32) return false; // parent genesis hash
 
-    CDataStream stream(stack[0], SER_NETWORK, PROTOCOL_VERSION);
-    stream >> value;
+    CAmount tmp_value{0};
+    CAsset tmp_asset;
+    uint256 tmp_genesis_hash;
+    CScript tmp_claim_script;
+    std::variant<std::monostate, Sidechain::Bitcoin::CTransactionRef, CTransactionRef> tmp_tx;
+    std::variant<std::monostate, Sidechain::Bitcoin::CMerkleBlock, CMerkleBlock> tmp_merkle_block;
 
-    CAsset tmp_asset(stack[1]);
+    try {
+        DataStream stream{stack[0]};
+        stream >> tmp_value;
+
+        tmp_asset = CAsset(stack[1]);
+        tmp_genesis_hash = uint256(stack[2]);
+        tmp_claim_script = CScript(stack[3].begin(), stack[3].end());
+
+        DataStream ss_tx(stack[4]);
+        if (Params().GetConsensus().ParentChainHasPow()) {
+            Sidechain::Bitcoin::CTransactionRef btc_tx;
+            ss_tx >> TX_WITH_WITNESS(btc_tx);
+            tmp_tx = btc_tx;
+        } else {
+            CTransactionRef elem_tx;
+            ss_tx >> TX_WITH_WITNESS(elem_tx);
+            tmp_tx = elem_tx;
+        }
+
+        DataStream ss_proof(stack[5]);
+        if (Params().GetConsensus().ParentChainHasPow()) {
+            Sidechain::Bitcoin::CMerkleBlock tx_proof;
+            ss_proof >> TX_WITH_WITNESS(tx_proof);
+            tmp_merkle_block = tx_proof;
+        } else {
+            CMerkleBlock tx_proof;
+            ss_proof >> TX_WITH_WITNESS(tx_proof);
+            tmp_merkle_block = tx_proof;
+        }
+    } catch (const std::exception&) {
+        // Malformed encoding. Report failure rather than propagating
+        return false;
+    }
+
+    value = tmp_value;
     asset = tmp_asset;
-
-    uint256 gh(stack[2]);
-    genesis_hash = gh;
-
-    CScript s(stack[3].begin(), stack[3].end());
-    claim_script = s;
-
-    CDataStream ss_tx(stack[4], SER_NETWORK, PROTOCOL_VERSION);
-    if (Params().GetConsensus().ParentChainHasPow()) {
-        Sidechain::Bitcoin::CTransactionRef btc_tx;
-        ss_tx >> btc_tx;
-        tx = btc_tx;
-    } else {
-        CTransactionRef elem_tx;
-        ss_tx >> elem_tx;
-        tx = elem_tx;
-    }
-
-    CDataStream ss_proof(stack[5], SER_NETWORK, PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS);
-    if (Params().GetConsensus().ParentChainHasPow()) {
-        Sidechain::Bitcoin::CMerkleBlock tx_proof;
-        ss_proof >> tx_proof;
-        merkle_block = tx_proof;
-    } else {
-        CMerkleBlock tx_proof;
-        ss_proof >> tx_proof;
-        merkle_block = tx_proof;
-    }
-
+    genesis_hash = tmp_genesis_hash;
+    claim_script = tmp_claim_script;
+    tx = std::move(tmp_tx);
+    merkle_block = std::move(tmp_merkle_block);
     return true;
 }

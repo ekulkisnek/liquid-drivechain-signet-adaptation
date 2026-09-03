@@ -12,7 +12,8 @@
 #include <tinyformat.h>
 #include <txdb.h>
 #include <util/readwritefile.h>
-#include <util/system.h>
+#include <common/args.h>
+#include <util/fs_helpers.h>
 #include <validation.h>
 
 #include <cstdio>
@@ -201,7 +202,7 @@ bool CheckLegacyHeaderTreeSafeToBind(
         CBlockHeader::DEPOSIT_INBOX_HF_MASK |
         CBlockHeader::INBOX_CURSOR_HF_MASK};
     for (const auto& entry : chainman.BlockIndex()) {
-        const CBlockIndex* index{entry.second};
+        const CBlockIndex* index{&entry.second};
         if (!index) continue;
         if ((static_cast<uint32_t>(index->nVersion) & ecx_bmm_mask) != 0 ||
             index->GetBlockHash() == drivechain::LayerTwoLabsPublicSidechainBlock2()) {
@@ -232,7 +233,7 @@ bool AuditPersistedConsensusHeaders(
 {
     size_t audited{0};
     for (const auto& entry : chainman.BlockIndex()) {
-        const CBlockIndex* index{entry.second};
+        const CBlockIndex* index{&entry.second};
         if (!index || !index->pprev) continue;
 
         std::string header_error;
@@ -353,7 +354,7 @@ bool BindEcxDeploymentIdentityIfNeeded(
             if (!CheckEcxDeploymentIdentity(error)) return false;
             return AuditPersistedConsensusHeaders(chainman, error);
         }
-        if (fReindex && HasMaterialChainData()) {
+        if (!chainman.m_blockman.m_blockfiles_indexed && HasMaterialChainData()) {
             error =
                 "cannot first-bind an ECX consensus identity while a block-index reindex is in progress; "
                 "restore the pre-reindex database and start once without reindex";
@@ -371,7 +372,7 @@ bool BindEcxDeploymentIdentityIfNeeded(
             return false;
         }
 
-        for (CChainState* chainstate : chainman.GetAll()) {
+        for (Chainstate* chainstate : chainman.GetAll()) {
             const CCoinsViewDB& coins{chainstate->CoinsDB()};
             if (ecx::HasPersistedExchangeConsensusState(coins) ||
                 drivechain::HasPersistedBmmConsensusState(coins)) {

@@ -8,7 +8,6 @@
 #include <primitives/txwitness.h>
 #include <span.h>
 #include <streams.h>
-#include <version.h>
 
 #include <algorithm>
 #include <array>
@@ -341,10 +340,8 @@ bool ParseNativeWithdrawalM6Commitment(
 std::vector<unsigned char> SerializeNativeWithdrawalM6Legacy(
     const Sidechain::Bitcoin::CMutableTransaction& transaction)
 {
-    CDataStream stream(SER_NETWORK,
-                       PROTOCOL_VERSION |
-                           Sidechain::Bitcoin::SERIALIZE_TRANSACTION_NO_WITNESS);
-    stream << transaction;
+    DataStream stream;
+    stream << TX_NO_WITNESS(transaction);
     const auto bytes = MakeUCharSpan(stream);
     return {bytes.begin(), bytes.end()};
 }
@@ -386,10 +383,8 @@ bool DeserializeNativeWithdrawalM6Legacy(
         return SetError(error, "blinded M6 has noncanonical output lengths or trailing bytes");
     }
     try {
-        CDataStream stream(bytes, SER_NETWORK,
-                           PROTOCOL_VERSION |
-                               Sidechain::Bitcoin::SERIALIZE_TRANSACTION_NO_WITNESS);
-        stream >> transaction;
+        DataStream stream{bytes};
+        stream >> TX_NO_WITNESS(transaction);
         if (!stream.empty()) {
             transaction = {};
             return SetError(error, "blinded M6 legacy serialization has trailing bytes");
@@ -444,7 +439,7 @@ bool BuildNativeWithdrawalM6(const uint256& elements_genesis,
                                                   encoded_fee.end());
     m6.burn_commitment = ComputeNativeWithdrawalM6Commitment(
         elements_genesis, sidechain_slot, burn_txid, burn_vout);
-    m6.blinded_transaction.nVersion =
+    m6.blinded_transaction.version =
         Sidechain::Bitcoin::CTransaction::CURRENT_VERSION;
     m6.blinded_transaction.nLockTime = 0;
     m6.blinded_transaction.vin.clear();
@@ -483,7 +478,7 @@ bool ParseNativeWithdrawalM6(
         burn_vout == std::numeric_limits<uint32_t>::max()) {
         return SetError(error, "blinded M6 burn outpoint is unknown");
     }
-    if (blinded_transaction.nVersion !=
+    if (blinded_transaction.version !=
             Sidechain::Bitcoin::CTransaction::CURRENT_VERSION ||
         blinded_transaction.nLockTime != 0 ||
         !blinded_transaction.vin.empty() ||

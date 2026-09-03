@@ -32,10 +32,6 @@
 // sends them to the server.
 //
 
-#if defined(HAVE_CONFIG_H)
-#include <config/bitcoin-config.h>
-#endif
-
 #include <qt/sendcoinsrecipient.h>
 
 #include <QObject>
@@ -54,6 +50,8 @@ class QLocalServer;
 class QUrl;
 QT_END_NAMESPACE
 
+extern const QString ELEMENTS_IPC_PREFIX;
+
 class PaymentServer : public QObject
 {
     Q_OBJECT
@@ -66,8 +64,6 @@ public:
     // Returns true if there were URIs on the command line
     // which were successfully sent to an already-running
     // process.
-    // If a valid Elements payment request is given, the canonical Elements
-    // parameters are selected. No inherited network can be selected here.
     static bool ipcSendCommandLine();
 
     // parent should be QApplication object
@@ -101,9 +97,9 @@ protected:
     bool eventFilter(QObject *object, QEvent *event) override;
 
 private:
-    bool saveURIs;                      // true during startup
-    QLocalServer* uriServer;
-    OptionsModel *optionsModel;
+    bool saveURIs{true}; // true during startup
+    QLocalServer* uriServer{nullptr};
+    OptionsModel* optionsModel{nullptr};
 };
 
 #endif // BITCOIN_QT_PAYMENTSERVER_H

@@ -296,4 +296,4 @@ class EcxWithdrawalPositiveTest(FedPegTest):
 
 
 if __name__ == "__main__":
-    EcxWithdrawalPositiveTest().main()
+    EcxWithdrawalPositiveTest(__file__).main()

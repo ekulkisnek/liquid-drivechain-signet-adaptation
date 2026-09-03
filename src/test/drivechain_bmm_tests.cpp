@@ -24,7 +24,7 @@ namespace {
 
 struct ElementsTestingSetup : BasicTestingSetup {
     ElementsTestingSetup()
-        : BasicTestingSetup("elementsregtest")
+        : BasicTestingSetup(ChainTypeMetaFrom("elementsregtest"))
     {
     }
 };
@@ -32,8 +32,8 @@ struct ElementsTestingSetup : BasicTestingSetup {
 template <typename T>
 std::vector<unsigned char> SerializeValue(const T& value)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
-    stream << value;
+    DataStream stream;
+    stream << TX_WITH_WITNESS(value);
     return {
         UCharCast(stream.data()),
         UCharCast(stream.data()) + stream.size()};
@@ -141,7 +141,7 @@ drivechain::BmmProof EasyProof(
     const uint256& critical_hash)
 {
     Sidechain::Bitcoin::CMutableTransaction coinbase;
-    coinbase.nVersion = 2;
+    coinbase.version = 2;
     coinbase.vin.resize(1);
     coinbase.vin[0].prevout.SetNull();
     coinbase.vin[0].scriptSig = CScript() << 101;
@@ -190,10 +190,8 @@ Sidechain::Bitcoin::CMerkleBlock DecodeMerkleProof(
     const drivechain::BmmProofEntry& entry)
 {
     Sidechain::Bitcoin::CMerkleBlock merkle;
-    CDataStream stream(
-        entry.coinbase_proof,
-        SER_NETWORK,
-        PROTOCOL_VERSION);
+    DataStream stream(
+        entry.coinbase_proof);
     stream >> merkle;
     BOOST_REQUIRE(stream.empty());
     return merkle;
@@ -202,6 +200,72 @@ Sidechain::Bitcoin::CMerkleBlock DecodeMerkleProof(
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(drivechain_bmm_tests, ElementsTestingSetup)
+
+BOOST_AUTO_TEST_CASE(header_wire_and_hash_compatibility)
+{
+    // Generated with the pre-CMake e90b9afee3 build, not this serializer.
+    // Each digest commits to 128 (block hash, critical hash, wire bytes) tuples.
+    constexpr const char* expected[] = {
+        "449d03ee9b142f6200ff32dde7f829d4e9600e8f3f9acff60113e32852c4035a",
+        "98245a37992e04f34f719f27b4bc7604b4931bdcd79a3794f644b7bac66634b4",
+        "c175b966e32d866a1d478a2525dd21015e6e687d51f15ff4a14d3ab42da113dc",
+        "32d44945248839b16a9b98a1d79478a72ce05a3e343681bf7183f3c9bf770831",
+        "ecb912ee618ab49ff4ecd75496ebda052faf5e77185ff516dd34112a9879da55",
+        "6e7cd222f4ebdafad2a6ea4820508209458759bd38a3aa2928d3b3235d02b87b",
+        "6062e4ccbf91b134efd1b8699e2fe3c723fa1e75362011b210186a9d84ca4026",
+        "3375f70f47e62eb45d43d726b42fc1be1d10801d7c1ddff2fdbabd4562acdf17",
+    };
+    constexpr uint32_t masks[] = {
+        CBlockHeader::BMM_PROOF_HF_MASK,
+        CBlockHeader::EXCHANGE_STATE_HF_MASK,
+        CBlockHeader::FORCED_INBOX_HF_MASK,
+        CBlockHeader::DEPOSIT_INBOX_HF_MASK,
+        CBlockHeader::INBOX_CURSOR_HF_MASK,
+    };
+    for (unsigned mode = 0; mode < 8; ++mode) {
+        g_con_elementsmode = mode & 1;
+        g_con_blockheightinheader = mode & 2;
+        g_signed_blocks = mode & 4;
+        HashWriter aggregate;
+        for (unsigned variant = 0; variant < 128; ++variant) {
+            CBlockHeader header;
+            header.nVersion = 0x20000000 | CBlockHeader::DYNAFED_HF_MASK |
+                CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
+            for (unsigned bit = 0; bit < 5; ++bit) {
+                if (variant & (1U << bit)) header.nVersion |= masks[bit];
+            }
+            header.hashPrevBlock = uint256S("01");
+            header.hashMerkleRoot = uint256S("02");
+            if (variant & 32) header.hashWithdrawalBundle = uint256S("03");
+            header.hashBmmProof = uint256S("04");
+            header.hashExchangeStateRoot = uint256S("05");
+            header.hashForcedInboxRoot = uint256S("06");
+            header.hashDepositInboxRoot = uint256S("07");
+            header.nTime = 1784825405;
+            header.nBits = 0x1e0376cc;
+            header.nNonce = 0x12345678;
+            header.block_height = 6400;
+            header.ecxParentHeight = 995347;
+            header.forcedProcessedCursor = 0x0102030405060708ULL;
+            header.depositProcessedCursor = 0x1112131415161718ULL;
+            header.sourceBacklogOldestParentHeight = 0x2122232425262728ULL;
+            header.proof.challenge = CScript() << OP_TRUE;
+            header.proof.solution = CScript() << OP_2;
+            if (variant & 64) {
+                header.m_dynafed_params.m_current = DynaFedParamEntry(
+                    CScript() << OP_TRUE, 1000, uint256S("08"));
+            }
+            DataStream wire;
+            wire << header;
+            aggregate << header.GetHash() << header.GetBmmCriticalHash()
+                      << std::vector<unsigned char>(
+                          UCharCast(wire.data()), UCharCast(wire.data()) + wire.size());
+        }
+        BOOST_TEST_CONTEXT("serialization mode " << mode) {
+            BOOST_CHECK_EQUAL(aggregate.GetHash().GetHex(), expected[mode]);
+        }
+    }
+}
 
 BOOST_AUTO_TEST_CASE(verifies_authentic_layer_two_labs_successor)
 {
@@ -250,10 +314,8 @@ BOOST_AUTO_TEST_CASE(commits_and_roundtrips_synthetic_proof)
         ? uint256()
         : [&] {
             Sidechain::Bitcoin::CMerkleBlock merkle;
-            CDataStream stream(
-                proof.entries[0].coinbase_proof,
-                SER_NETWORK,
-                PROTOCOL_VERSION);
+            DataStream stream(
+                proof.entries[0].coinbase_proof);
             stream >> merkle;
             return merkle.header.GetHash();
         }());
@@ -272,10 +334,10 @@ BOOST_AUTO_TEST_CASE(commits_and_roundtrips_synthetic_proof)
     BOOST_CHECK_EQUAL(next_context.median_time_past, 97'600U);
     BOOST_CHECK_EQUAL(next_context.block_hash, next.block_hash);
 
-    CDataStream encoded(SER_NETWORK, PROTOCOL_VERSION);
-    encoded << block;
+    DataStream encoded;
+    encoded << TX_WITH_WITNESS(block);
     CBlock decoded;
-    encoded >> decoded;
+    encoded >> TX_WITH_WITNESS(decoded);
     BOOST_CHECK(encoded.empty());
     BOOST_CHECK_EQUAL(decoded.GetHash(), block.GetHash());
     BOOST_CHECK_EQUAL(decoded.GetBmmCriticalHash(), critical_hash);
@@ -464,14 +526,14 @@ BOOST_AUTO_TEST_CASE(two_verifiers_converge_from_serialized_evidence)
     std::string error;
     BOOST_REQUIRE_MESSAGE(drivechain::AttachBmmProof(block, proof, error), error);
 
-    CDataStream wire(SER_NETWORK, PROTOCOL_VERSION);
-    wire << block;
+    DataStream wire;
+    wire << TX_WITH_WITNESS(block);
     CBlock peer_a;
     CBlock peer_b;
-    wire >> peer_a;
-    CDataStream second_wire(SER_NETWORK, PROTOCOL_VERSION);
-    second_wire << peer_a;
-    second_wire >> peer_b;
+    wire >> TX_WITH_WITNESS(peer_a);
+    DataStream second_wire;
+    second_wire << TX_WITH_WITNESS(peer_a);
+    second_wire >> TX_WITH_WITNESS(peer_b);
 
     drivechain::BmmL1State state_a;
     drivechain::BmmL1State state_b;
@@ -500,10 +562,8 @@ BOOST_AUTO_TEST_CASE(enforces_public_checkpoint_activation)
 {
     const std::vector<unsigned char> height_two_header_bytes{ParseHex(
         "000000a043e5de39494df3a659e2ffd2610049ef5e4067032af44a0642132489cb312f94343f07c20d76afcd71dfd94dfb09a4afb9df7d197e1227e9e5cc58f2224621f09746626a02000000012200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc332604a000000fbee9cea00d8efdc49cfbec328537e0d7032194de6ebf3cf42e5c05bb89a08b100010151")};
-    CDataStream height_two_stream(
-        height_two_header_bytes,
-        SER_NETWORK,
-        PROTOCOL_VERSION);
+    DataStream height_two_stream(
+        height_two_header_bytes);
     CBlockHeader height_two;
     height_two_stream >> height_two;
     BOOST_REQUIRE(height_two_stream.empty());

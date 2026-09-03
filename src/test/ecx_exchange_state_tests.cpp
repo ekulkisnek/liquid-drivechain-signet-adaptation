@@ -15,6 +15,7 @@
 #include <hash.h>
 #include <key.h>
 #include <policy/policy.h>
+#include <policy/feerate.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -39,7 +40,7 @@ namespace {
 
 struct ElementsTestingSetup : BasicTestingSetup {
     ElementsTestingSetup()
-        : BasicTestingSetup("elementsregtest")
+        : BasicTestingSetup(ChainTypeMetaFrom("elementsregtest"))
     {
     }
 };
@@ -49,25 +50,23 @@ class MemoryCoinsView final : public CCoinsView
 public:
     std::map<COutPoint, Coin> coins;
 
-    bool GetCoin(const COutPoint& outpoint, Coin& coin) const override
+    std::optional<Coin> GetCoin(const COutPoint& outpoint) const override
     {
         const auto it = coins.find(outpoint);
-        if (it == coins.end() || it->second.IsSpent()) return false;
-        coin = it->second;
-        return true;
+        if (it == coins.end() || it->second.IsSpent()) return std::nullopt;
+        return it->second;
     }
 
-    bool BatchWrite(CCoinsMap& entries, const uint256&) override
+    bool BatchWrite(CoinsViewCacheCursor& cursor, const uint256&) override
     {
-        for (auto it = entries.begin(); it != entries.end();) {
-            if (it->second.flags & CCoinsCacheEntry::DIRTY) {
+        for (auto it = cursor.Begin(); it != cursor.End(); it = cursor.NextAndMaybeErase(*it)) {
+            if (it->second.IsDirty()) {
                 if (it->second.coin.IsSpent()) {
                     coins.erase(it->first.second);
                 } else {
                     coins[it->first.second] = it->second.coin;
                 }
             }
-            it = entries.erase(it);
         }
         return true;
     }
@@ -193,13 +192,17 @@ void PopulateTestBondV2FrozenIdentities(ecx::ExchangeConsensus& consensus)
     frozen.genesis_mark_price = 1;
 }
 
-CBlockIndex IndexFor(const CBlock& block, int height, CBlockIndex* previous = nullptr)
-{
-    CBlockIndex index{block};
-    index.nHeight = height;
-    index.pprev = previous;
-    return index;
-}
+struct TestBlockIndex : CBlockIndex {
+    uint256 hash;
+
+    TestBlockIndex(const CBlock& block, int height, CBlockIndex* previous = nullptr)
+        : CBlockIndex{block}, hash{block.GetHash()}
+    {
+        phashBlock = &hash;
+        nHeight = height;
+        pprev = previous;
+    }
+};
 
 uint256 TestSha256(const std::vector<unsigned char>& bytes)
 {
@@ -779,7 +782,7 @@ BOOST_AUTO_TEST_CASE(tapbranch_ordering_uses_serialized_hash_bytes_not_arithmeti
 BOOST_AUTO_TEST_CASE(finite_state_tree_preauthorizes_incremental_activation_leaf)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     std::fill(
         consensus.bond_v2.transition_cmr.begin(),
@@ -911,7 +914,7 @@ BOOST_AUTO_TEST_CASE(frozen_configuration_v18_exact_rust_vector_and_mutations)
 BOOST_AUTO_TEST_CASE(v18_no_history_staging_renderer_matches_rust_vector)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     consensus.chain_id.fill(1);
     consensus.bond_v2.configuration_hash = RawHash(
@@ -1253,7 +1256,7 @@ BOOST_AUTO_TEST_CASE(sp1_incremental_successor_jet_frame_routes_to_exact_verifie
 BOOST_AUTO_TEST_CASE(incremental_successor_projection_script_and_u128_snapshot_are_exact)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     const auto fill = [](uint256& value, unsigned char byte) {
         std::fill(value.begin(), value.end(), byte);
@@ -1319,7 +1322,7 @@ BOOST_AUTO_TEST_CASE(incremental_successor_projection_script_and_u128_snapshot_a
     BOOST_CHECK(rendered != TestBondV2SuccessorScript(
         consensus, snapshot.covenant_state_hash));
 
-    CDataStream serialized{SER_DISK, 0};
+    DataStream serialized;
     serialized << snapshot;
     ecx::BondV2CapitalSnapshot round_trip;
     serialized >> round_trip;
@@ -1354,7 +1357,7 @@ BOOST_AUTO_TEST_CASE(incremental_successor_projection_script_and_u128_snapshot_a
 BOOST_AUTO_TEST_CASE(incremental_successor_empty_block_preserves_u128_inbox_projection)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     ecx::BondV2CapitalSnapshot snapshot;
     snapshot.proof_profile = 1;
@@ -1388,7 +1391,7 @@ BOOST_AUTO_TEST_CASE(incremental_successor_empty_block_preserves_u128_inbox_proj
 BOOST_AUTO_TEST_CASE(incremental_successor_accepts_real_rust_crypto_source_vector)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     const auto assign_array = [](std::array<unsigned char, 32>& target,
                                  const char* raw_hex) {
@@ -1457,9 +1460,9 @@ BOOST_AUTO_TEST_CASE(incremental_successor_accepts_real_rust_crypto_source_vecto
         .Finalize(source_sha256.begin());
     BOOST_CHECK(source_sha256 ==
         RawHash(ECX_SUCCESSOR_BOND_INBOX_V23_TRANSACTION_SHA256));
-    CDataStream source_stream(source_bytes, SER_NETWORK, PROTOCOL_VERSION);
+    DataStream source_stream(source_bytes);
     CMutableTransaction source;
-    source_stream >> source;
+    source_stream >> TX_WITH_WITNESS(source);
     BOOST_REQUIRE(source_stream.empty());
     const CTransaction immutable_source{source};
     BOOST_CHECK(immutable_source.GetHash() ==
@@ -1657,7 +1660,7 @@ BOOST_AUTO_TEST_CASE(sp1_v2_public_capital_semantics_fail_closed)
 BOOST_AUTO_TEST_CASE(bond_v2_projection_is_frozen_and_activation_fails_closed)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     const std::array<unsigned char, 32> program{{
         0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4,
@@ -1778,7 +1781,7 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_is_frozen_and_activation_fails_closed)
 BOOST_AUTO_TEST_CASE(bond_v2_projection_follows_each_verified_reorg_branch)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
-        50, COutPoint{uint256S("50"), 0}, uint256S("51"))};
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
     PopulateTestBondV2FrozenIdentities(consensus);
     const std::array<unsigned char, 32> program{{
         0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4,
@@ -1793,7 +1796,7 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_follows_each_verified_reorg_branch)
 
     CBlock previous_block;
     std::fill(previous_block.hashExchangeStateRoot.begin(), previous_block.hashExchangeStateRoot.end(), 6);
-    CBlockIndex previous{IndexFor(previous_block, 50)};
+    TestBlockIndex previous{previous_block, 50};
     ecx::BondV2CapitalSnapshot previous_capital;
     previous_capital.exchange_state_root = previous.hashExchangeStateRoot;
     previous_capital.configuration_hash = consensus.bond_v2.configuration_hash;
@@ -1817,7 +1820,7 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_follows_each_verified_reorg_branch)
 
     const auto branch = [&](unsigned char script_byte) {
         CMutableTransaction mutable_tx;
-        mutable_tx.vin.emplace_back(COutPoint{uint256S("60"), 0});
+        mutable_tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256S("60")), 0});
         mutable_tx.vout.push_back(AuthorityOutput(0x60));
         std::vector<unsigned char> annex{TestSp1AnnexPayload(true)};
         uint256 next_covenant_state_hash;
@@ -1833,7 +1836,7 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_follows_each_verified_reorg_branch)
         mutable_tx.vout.push_back(AuthorityOutput(script_byte));
         const CTransaction without_witness{mutable_tx};
         std::copy(
-            without_witness.GetHash().begin(), without_witness.GetHash().end(),
+            without_witness.GetHash().ToUint256().begin(), without_witness.GetHash().ToUint256().end(),
             annex.begin() + 435 + 132);
         RecommitV2PublicValues(annex);
         std::vector<unsigned char> wire_annex{0x50};
@@ -1862,7 +1865,7 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_follows_each_verified_reorg_branch)
     const auto right{branch(0x62)};
     BOOST_CHECK(left.second.exchange_state_root != right.second.exchange_state_root);
 
-    CBlockIndex left_index{IndexFor(left.first, 51, &previous)};
+    TestBlockIndex left_index{left.first, 51, &previous};
     left_index.ecxBondV2Capital = left.second;
     CBlock carry;
     carry.hashExchangeStateRoot = left.first.hashExchangeStateRoot;
@@ -1913,7 +1916,7 @@ BOOST_AUTO_TEST_CASE(header_rules_cover_before_activation_boundary_and_descendan
 {
     const ecx::ExchangeConsensus consensus{ConfiguredConsensus(
         10,
-        COutPoint{uint256S("11"), 7},
+        COutPoint{Txid::FromUint256(uint256S("11")), 7},
         uint256S("22"))};
     std::string error;
 
@@ -1979,10 +1982,10 @@ BOOST_AUTO_TEST_CASE(consensus_rejects_spends_of_all_synthetic_state_outpoints)
     CCoinsViewCache view(&base);
     const std::vector<COutPoint> reserved{
         COutPoint{
-            uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9"),
+            Txid::FromUint256(uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9")),
             0},
         COutPoint{
-            uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1"),
+            Txid::FromUint256(uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1")),
             0},
     };
     BOOST_REQUIRE(drivechain::IsBmmStateInternalOutpoint(reserved[0]));
@@ -2015,13 +2018,13 @@ BOOST_AUTO_TEST_CASE(consensus_rejects_spends_of_all_synthetic_state_outpoints)
 
     const std::vector<COutPoint> all_reserved{
         COutPoint{
-            uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041"),
+            Txid::FromUint256(uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041")),
             0},
         COutPoint{
-            uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1"),
+            Txid::FromUint256(uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1")),
             0},
         COutPoint{
-            uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586"),
+            Txid::FromUint256(uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586")),
             0},
         reserved[0],
         reserved[1],
@@ -2065,7 +2068,7 @@ BOOST_AUTO_TEST_CASE(runtime_consensus_fingerprint_binds_every_field)
 {
     const ecx::ExchangeConsensus consensus{ConfiguredConsensus(
         10,
-        COutPoint{uint256S("11"), 7},
+        COutPoint{Txid::FromUint256(uint256S("11")), 7},
         uint256S("22"))};
     const std::string network_id{"elementsregtest"};
     const uint256 genesis_hash{uint256S("33")};
@@ -2109,7 +2112,7 @@ BOOST_AUTO_TEST_CASE(runtime_consensus_fingerprint_binds_every_field)
         BOOST_CHECK_NE(expected, compute_default(changed));
     };
     check_consensus_mutation([](auto& value) { ++value.activation_height; });
-    check_consensus_mutation([](auto& value) { value.genesis_state_outpoint.hash = uint256S("12"); });
+    check_consensus_mutation([](auto& value) { value.genesis_state_outpoint.hash = Txid::FromUint256(uint256S("12")); });
     check_consensus_mutation([](auto& value) { ++value.genesis_state_outpoint.n; });
     check_consensus_mutation([](auto& value) { value.genesis_state_root = uint256S("23"); });
     check_consensus_mutation([](auto& value) { value.chain_id[0] ^= 1; });
@@ -2136,21 +2139,23 @@ BOOST_AUTO_TEST_CASE(runtime_consensus_fingerprint_binds_every_field)
 
 BOOST_AUTO_TEST_CASE(forced_action_relay_policy_is_narrow_and_fail_closed)
 {
-    const COutPoint genesis{uint256S("11"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("11")), 0};
     const ecx::ExchangeConsensus consensus{
         ConfiguredConsensus(10, genesis, uint256S("22"))};
     const CKey key{TestTraderKey()};
     const CTransaction canonical{ForcedCancelTransaction(consensus, key)};
     std::string reason;
 
-    BOOST_REQUIRE_GT(canonical.vout[0].scriptPubKey.size(), nMaxDatacarrierBytes);
+    BOOST_REQUIRE_GT(canonical.vout[0].scriptPubKey.size(), MAX_OP_RETURN_RELAY);
     BOOST_CHECK(!IsStandardTx(
         canonical,
+        MAX_OP_RETURN_RELAY,
         true,
         CFeeRate(DUST_RELAY_TX_FEE_BITCOIN),
         reason));
     BOOST_CHECK(IsStandardTx(
         canonical,
+        MAX_OP_RETURN_RELAY,
         true,
         CFeeRate(DUST_RELAY_TX_FEE_BITCOIN),
         reason,
@@ -2163,6 +2168,7 @@ BOOST_AUTO_TEST_CASE(forced_action_relay_policy_is_narrow_and_fail_closed)
     const CTransaction corrupt{ForcedCancelTransaction(consensus, key, true)};
     BOOST_CHECK(!IsStandardTx(
         corrupt,
+        MAX_OP_RETURN_RELAY,
         true,
         CFeeRate(DUST_RELAY_TX_FEE_BITCOIN),
         reason,
@@ -2179,8 +2185,8 @@ BOOST_AUTO_TEST_CASE(forced_action_relay_policy_is_narrow_and_fail_closed)
 BOOST_AUTO_TEST_CASE(ecx_drivechain_pegout_is_standard_without_pak)
 {
     const ecx::ExchangeConsensus consensus{
-        ConfiguredConsensus(10, COutPoint{uint256S("11"), 0}, uint256S("22"))};
-    NullData pegout_data;
+        ConfiguredConsensus(10, COutPoint{Txid::FromUint256(uint256S("11")), 0}, uint256S("22"))};
+    CScript pegout_data = CScript() << OP_RETURN;
     const uint256 parent_genesis = Params().ParentGenesisBlockHash();
     pegout_data << std::vector<unsigned char>(parent_genesis.begin(), parent_genesis.end());
     pegout_data << std::vector<unsigned char>(64, 0x51);
@@ -2188,13 +2194,13 @@ BOOST_AUTO_TEST_CASE(ecx_drivechain_pegout_is_standard_without_pak)
     tx.vout.emplace_back(
         Params().GetConsensus().pegged_asset,
         25'000,
-        GetScriptForDestination(CTxDestination{pegout_data}));
+        pegout_data);
     std::string reason;
-    BOOST_REQUIRE_GT(tx.vout[0].scriptPubKey.size(), nMaxDatacarrierBytes);
+    BOOST_REQUIRE_GT(tx.vout[0].scriptPubKey.size(), MAX_OP_RETURN_RELAY);
     BOOST_CHECK(!IsStandardTx(
-        CTransaction{tx}, true, CFeeRate(DUST_RELAY_TX_FEE_BITCOIN), reason));
+        CTransaction{tx}, MAX_OP_RETURN_RELAY, true, CFeeRate(DUST_RELAY_TX_FEE_BITCOIN), reason));
     BOOST_CHECK(IsStandardTx(
-        CTransaction{tx}, true, CFeeRate(DUST_RELAY_TX_FEE_BITCOIN), reason,
+        CTransaction{tx}, MAX_OP_RETURN_RELAY, true, CFeeRate(DUST_RELAY_TX_FEE_BITCOIN), reason,
         &consensus));
 }
 
@@ -2261,12 +2267,12 @@ BOOST_AUTO_TEST_CASE(header_extension_is_append_only_and_bmm_covered)
     legacy.nBits = 6;
     legacy.nNonce = 7;
 
-    CDataStream before(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream before;
     before << legacy;
     CBlockHeader extended{legacy};
     extended.nVersion |= CBlockHeader::EXCHANGE_STATE_HF_MASK;
     extended.hashExchangeStateRoot = uint256S("05");
-    CDataStream after(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream after;
     after << extended;
 
     BOOST_REQUIRE_EQUAL(after.size(), before.size() + 32);
@@ -2278,7 +2284,7 @@ BOOST_AUTO_TEST_CASE(header_extension_is_append_only_and_bmm_covered)
     source_extended.hashForcedInboxRoot = uint256S("06");
     source_extended.hashDepositInboxRoot = uint256S("07");
     source_extended.ecxParentHeight = 8;
-    CDataStream source_bytes(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream source_bytes;
     source_bytes << source_extended;
     BOOST_REQUIRE_EQUAL(source_bytes.size(), after.size() + 68);
     BOOST_CHECK(std::equal(after.begin() + 4, after.end(), source_bytes.begin() + 4));
@@ -2288,7 +2294,7 @@ BOOST_AUTO_TEST_CASE(header_extension_is_append_only_and_bmm_covered)
     cursor_extended.forcedProcessedCursor = 9;
     cursor_extended.depositProcessedCursor = 10;
     cursor_extended.sourceBacklogOldestParentHeight = 11;
-    CDataStream cursor_bytes(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream cursor_bytes;
     cursor_bytes << cursor_extended;
     BOOST_REQUIRE_EQUAL(cursor_bytes.size(), source_bytes.size() + 24);
     BOOST_CHECK(std::equal(
@@ -2336,7 +2342,7 @@ BOOST_AUTO_TEST_CASE(activation_transition_disconnect_and_reorg_are_symmetric)
 {
     MemoryCoinsView persistent;
     CCoinsViewCache view{&persistent};
-    const COutPoint genesis{uint256S("11"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("11")), 0};
     const CTxOut genesis_output{AuthorityOutput(0x21)};
     view.AddCoin(genesis, Coin(genesis_output, 1, false), false);
     const uint256 genesis_root = ecx::ComputeStateUtxoRoot(
@@ -2359,7 +2365,7 @@ BOOST_AUTO_TEST_CASE(activation_transition_disconnect_and_reorg_are_symmetric)
     BOOST_REQUIRE_MESSAGE(
         ecx::ConnectExchangeState(activation, nullptr, view, 10, error, consensus, 100),
         error);
-    CBlockIndex activation_index{IndexFor(activation, 10)};
+    TestBlockIndex activation_index{activation, 10};
 
     CMutableTransaction transition;
     transition.vin.emplace_back(genesis);
@@ -2382,7 +2388,7 @@ BOOST_AUTO_TEST_CASE(activation_transition_disconnect_and_reorg_are_symmetric)
     BOOST_REQUIRE(view.SpendCoin(genesis));
     view.AddCoin(successor, Coin(next.vtx[0]->vout[0], 11, false), false);
 
-    CBlockIndex next_index{IndexFor(next, 11, &activation_index)};
+    TestBlockIndex next_index{next, 11, &activation_index};
     uint256 prior_root;
     BOOST_REQUIRE_MESSAGE(
         ecx::GetPriorActiveExchangeStateRoot(&next_index, prior_root, error),
@@ -2407,7 +2413,7 @@ BOOST_AUTO_TEST_CASE(activation_transition_disconnect_and_reorg_are_symmetric)
 
 BOOST_AUTO_TEST_CASE(activation_does_not_overwrite_reserved_state_coins)
 {
-    const COutPoint genesis{uint256S("11"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("11")), 0};
     const CTxOut genesis_output{AuthorityOutput(0x21)};
     const uint256 genesis_root = ecx::ComputeStateUtxoRoot(
         Params().GetConsensus().hashGenesisBlock,
@@ -2427,13 +2433,13 @@ BOOST_AUTO_TEST_CASE(activation_does_not_overwrite_reserved_state_coins)
 
     const std::vector<COutPoint> trackers{
         COutPoint{
-            uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041"),
+            Txid::FromUint256(uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041")),
             0},
         COutPoint{
-            uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1"),
+            Txid::FromUint256(uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1")),
             0},
         COutPoint{
-            uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586"),
+            Txid::FromUint256(uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586")),
             0},
     };
     for (const COutPoint& tracker : trackers) {
@@ -2456,7 +2462,7 @@ BOOST_AUTO_TEST_CASE(rejects_bad_header_authority_and_same_block_chaining)
 {
     MemoryCoinsView persistent;
     CCoinsViewCache view{&persistent};
-    const COutPoint genesis{uint256S("21"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("21")), 0};
     const CTxOut genesis_output{AuthorityOutput(0x31)};
     view.AddCoin(genesis, Coin(genesis_output, 1, false), false);
     const uint256 genesis_root = ecx::ComputeStateUtxoRoot(
@@ -2477,7 +2483,7 @@ BOOST_AUTO_TEST_CASE(rejects_bad_header_authority_and_same_block_chaining)
     std::string error;
     BOOST_REQUIRE(ecx::ConnectExchangeState(
         activation, nullptr, view, 10, error, consensus, 100));
-    CBlockIndex previous{IndexFor(activation, 10)};
+    TestBlockIndex previous{activation, 10};
 
     CMutableTransaction changed_value;
     changed_value.vin.emplace_back(genesis);
@@ -2523,7 +2529,7 @@ BOOST_AUTO_TEST_CASE(frozen_source_formats_are_verified_and_accumulated)
 
     MemoryCoinsView persistent;
     CCoinsViewCache view{&persistent};
-    const COutPoint genesis{uint256S("31"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("31")), 0};
     const CTxOut genesis_output{AuthorityOutput(0x41)};
     view.AddCoin(genesis, Coin(genesis_output, 1, false), false);
     const uint256 genesis_root = ecx::ComputeStateUtxoRoot(
@@ -2555,7 +2561,7 @@ BOOST_AUTO_TEST_CASE(frozen_source_formats_are_verified_and_accumulated)
         ecx::ConnectExchangeState(
             activation, nullptr, view, 20, error, consensus, 500),
         error);
-    CBlockIndex previous{IndexFor(activation, 20)};
+    TestBlockIndex previous{activation, 20};
     const CKey trader{TestTraderKey()};
 
     CBlock invalid_signature;
@@ -2597,7 +2603,7 @@ BOOST_AUTO_TEST_CASE(frozen_source_formats_are_verified_and_accumulated)
         ecx::ConnectExchangeState(
             source_block, &previous, view, 21, error, consensus, 501),
         error);
-    CBlockIndex source_index{IndexFor(source_block, 21, &previous)};
+    TestBlockIndex source_index{source_block, 21, &previous};
     ecx::ExchangeConsensusSnapshot snapshot;
     BOOST_REQUIRE_MESSAGE(
         ecx::GetExchangeConsensusSnapshot(
@@ -2627,7 +2633,7 @@ BOOST_AUTO_TEST_CASE(public_cursor_liveness_bounds_carry_forward_spam)
 {
     MemoryCoinsView persistent;
     CCoinsViewCache view{&persistent};
-    const COutPoint genesis{uint256S("41"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("41")), 0};
     const CTxOut genesis_output{AuthorityOutput(0x51)};
     view.AddCoin(genesis, Coin(genesis_output, 1, false), false);
     const uint256 genesis_root = ecx::ComputeStateUtxoRoot(
@@ -2650,7 +2656,7 @@ BOOST_AUTO_TEST_CASE(public_cursor_liveness_bounds_carry_forward_spam)
         ecx::ConnectExchangeState(
             activation, nullptr, view, 30, error, consensus, 700),
         error);
-    CBlockIndex activation_index{IndexFor(activation, 30)};
+    TestBlockIndex activation_index{activation, 30};
     const CKey trader{TestTraderKey()};
 
     CBlock sixty_four;
@@ -2668,7 +2674,7 @@ BOOST_AUTO_TEST_CASE(public_cursor_liveness_bounds_carry_forward_spam)
         ecx::ConnectExchangeState(
             sixty_four, &activation_index, view, 31, error, consensus, 701),
         error);
-    CBlockIndex backlog_index{IndexFor(sixty_four, 31, &activation_index)};
+    TestBlockIndex backlog_index{sixty_four, 31, &activation_index};
 
     CBlock before_deadline;
     BOOST_REQUIRE_MESSAGE(
@@ -2725,7 +2731,7 @@ BOOST_AUTO_TEST_CASE(public_cursor_liveness_bounds_carry_forward_spam)
     const COutPoint successor{consumed.vtx[0]->GetHash(), 0};
     BOOST_REQUIRE(view.SpendCoin(genesis));
     view.AddCoin(successor, Coin(consumed.vtx[0]->vout[0], 32, false), false);
-    CBlockIndex consumed_index{IndexFor(consumed, 32, &backlog_index)};
+    TestBlockIndex consumed_index{consumed, 32, &backlog_index};
 
     CBlock after_advance;
     CMutableTransaction next_forced{ForcedCancelTransaction(consensus, trader)};
@@ -2740,17 +2746,17 @@ BOOST_AUTO_TEST_CASE(public_cursor_liveness_bounds_carry_forward_spam)
 
 BOOST_AUTO_TEST_CASE(withdrawal_bundle_requires_authenticated_m6_pxst_preimage)
 {
-    const COutPoint genesis{uint256S("91"), 0};
+    const COutPoint genesis{Txid::FromUint256(uint256S("91")), 0};
     const uint256 state_root{uint256S("92")};
     const ecx::ExchangeConsensus consensus{ConfiguredConsensus(30, genesis, state_root)};
     CBlock before_block;
-    CBlockIndex before{IndexFor(before_block, 29)};
+    TestBlockIndex before{before_block, 29};
     const uint256 before_hash{uint256S("93")};
     before.phashBlock = &before_hash;
     CBlock checkpoint_block;
     checkpoint_block.nVersion = CBlockHeader::EXCHANGE_STATE_HF_MASK;
     checkpoint_block.hashExchangeStateRoot = state_root;
-    CBlockIndex checkpoint{IndexFor(checkpoint_block, 30, &before)};
+    TestBlockIndex checkpoint{checkpoint_block, 30, &before};
     const uint256 checkpoint_hash{uint256S("94")};
     checkpoint.phashBlock = &checkpoint_hash;
     const std::vector<unsigned char> m6{
@@ -2783,7 +2789,7 @@ BOOST_AUTO_TEST_CASE(withdrawal_bundle_requires_authenticated_m6_pxst_preimage)
         wrong_pxst, &checkpoint, 31, error, consensus));
     BOOST_CHECK(error.find("PXST") != std::string::npos);
 
-    CBlockIndex committed{IndexFor(block, 31, &checkpoint)};
+    TestBlockIndex committed{block, 31, &checkpoint};
     CBlock carry;
     carry.hashWithdrawalBundle = block.hashWithdrawalBundle;
     carry.vtx = {TestCoinbase()};

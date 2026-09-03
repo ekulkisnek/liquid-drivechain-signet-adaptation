@@ -4,10 +4,13 @@
 
 #include <arith_uint256.h>
 #include <blind.h>
+#include <blindpsbt.h>
 #include <coins.h>
 #include <issuance.h>
+#include <random.h>
 #include <uint256.h>
 #include <validation.h>
+#include <script/sigcache.h>
 
 #include <test/util/setup_common.h>
 
@@ -21,7 +24,7 @@
 
 // For elements serialization rules
 struct ElementsSetup : public TestingSetup {
-        ElementsSetup() : TestingSetup("custom") {}
+        ElementsSetup() : TestingSetup(ChainType::CUSTOM) {}
 };
 
 BOOST_FIXTURE_TEST_SUITE(blind_tests, ElementsSetup)
@@ -40,8 +43,8 @@ BOOST_AUTO_TEST_CASE(blinding_fits_rpc_worker_stack)
     const CAsset asset(GetRandHash());
     CMutableTransaction tx;
     tx.vin.resize(2);
-    tx.vin[0].prevout = COutPoint(ArithToUint256(1), 0);
-    tx.vin[1].prevout = COutPoint(ArithToUint256(2), 0);
+    tx.vin[0].prevout = COutPoint(Txid::FromUint256(ArithToUint256(1)), 0);
+    tx.vin[1].prevout = COutPoint(Txid::FromUint256(ArithToUint256(2)), 0);
     tx.vout.emplace_back(asset, 100, CScript() << OP_TRUE);
     tx.vout.emplace_back(asset, 22, CScript());
     tx.vout.emplace_back(asset, 0, CScript() << OP_RETURN);
@@ -82,6 +85,9 @@ BOOST_AUTO_TEST_CASE(blinding_fits_rpc_worker_stack)
 
 BOOST_AUTO_TEST_CASE(naive_blinding_test)
 {
+    BOOST_CHECK(InitRangeproofCache(DEFAULT_VALIDATION_CACHE_BYTES / 4));
+    BOOST_CHECK(InitSurjectionproofCache(DEFAULT_VALIDATION_CACHE_BYTES / 4));
+
     CKey key1;
     CKey key2;
     CKey keyDummy;
@@ -120,15 +126,15 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         // Build a transaction that spends 2 unblinded coins (11, 111), and produces a single blinded one (100) and fee (22).
         CMutableTransaction tx3;
         tx3.vin.resize(2);
-        tx3.vin[0].prevout.hash = ArithToUint256(1);
+        tx3.vin[0].prevout.hash = Txid::FromUint256(ArithToUint256(1));
 
         tx3.vin[0].prevout.n = 0;
-        tx3.vin[1].prevout.hash = ArithToUint256(2);
+        tx3.vin[1].prevout.hash = Txid::FromUint256(ArithToUint256(2));
         tx3.vin[1].prevout.n = 0;
         tx3.vout.resize(0);
-        tx3.vout.push_back(CTxOut(bitcoinID, 100, CScript() << OP_TRUE));
+        tx3.vout.emplace_back(bitcoinID, 100, CScript() << OP_TRUE);
         // Fee outputs are blank scriptpubkeys, and unblinded value/asset
-        tx3.vout.push_back(CTxOut(bitcoinID, 22, CScript()));
+        tx3.vout.emplace_back(bitcoinID, 22, CScript());
         BOOST_CHECK(VerifyAmounts(inputs, CTransaction(tx3), nullptr, false));
 
         // Malleate the output and check for correct handling of bad commitments
@@ -164,20 +170,20 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         std::vector<uint256> output_blinds;
         std::vector<uint256> output_asset_blinds;
         std::vector<CPubKey> output_pubkeys;
-        input_blinds.push_back(uint256());
-        input_blinds.push_back(uint256());
-        input_asset_blinds.push_back(uint256());
-        input_asset_blinds.push_back(uint256());
+        input_blinds.emplace_back();
+        input_blinds.emplace_back();
+        input_asset_blinds.emplace_back();
+        input_asset_blinds.emplace_back();
         input_assets.push_back(bitcoinID);
         input_assets.push_back(bitcoinID);
         input_amounts.push_back(11);
         input_amounts.push_back(111);
         output_pubkeys.push_back(pubkey1);
-        output_pubkeys.push_back(CPubKey());
+        output_pubkeys.emplace_back();
         BOOST_CHECK(BlindTransaction(input_blinds, input_asset_blinds, input_assets, input_amounts, output_blinds, output_asset_blinds, output_pubkeys, vDummy, vDummy, tx3) == 0);
 
         // Add a dummy output. Must be unspendable since it's 0-valued.
-        tx3.vout.push_back(CTxOut(bitcoinID, 0, CScript() << OP_RETURN));
+        tx3.vout.emplace_back(bitcoinID, 0, CScript() << OP_RETURN);
         output_pubkeys.push_back(pubkeyDummy);
         BOOST_CHECK(BlindTransaction(input_blinds, input_asset_blinds, input_assets, input_amounts, output_blinds, output_asset_blinds, output_pubkeys, vDummy, vDummy, tx3) == 2);
         BOOST_CHECK(!tx3.vout[0].nValue.IsExplicit());
@@ -212,13 +218,13 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         // Build a transactions that spends an unblinded (111) and blinded (100) coin, and produces only unblinded coins (impossible)
         CMutableTransaction tx4;
         tx4.vin.resize(2);
-        tx4.vin[0].prevout.hash = ArithToUint256(2);
+        tx4.vin[0].prevout.hash = Txid::FromUint256(ArithToUint256(2));
         tx4.vin[0].prevout.n = 0;
-        tx4.vin[1].prevout.hash = ArithToUint256(3);
+        tx4.vin[1].prevout.hash = Txid::FromUint256(ArithToUint256(3));
         tx4.vin[1].prevout.n = 0;
-        tx4.vout.push_back(CTxOut(bitcoinID, 30, CScript() << OP_TRUE));
-        tx4.vout.push_back(CTxOut(bitcoinID, 40, CScript() << OP_TRUE));
-        tx4.vout.push_back(CTxOut(bitcoinID, 111+100-30-40, CScript()));
+        tx4.vout.emplace_back(bitcoinID, 30, CScript() << OP_TRUE);
+        tx4.vout.emplace_back(bitcoinID, 40, CScript() << OP_TRUE);
+        tx4.vout.emplace_back(bitcoinID, 111 + 100 - 30 - 40, CScript());
         BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(tx4), nullptr, false)); // Spends a blinded coin with no blinded outputs to compensate.
 
         std::vector<uint256> input_blinds;
@@ -228,17 +234,17 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         std::vector<uint256> output_blinds;
         std::vector<uint256> output_asset_blinds;
         std::vector<CPubKey> output_pubkeys;
-        input_blinds.push_back(uint256());
+        input_blinds.emplace_back();
         input_blinds.push_back(blind3);
-        input_asset_blinds.push_back(uint256());
+        input_asset_blinds.emplace_back();
         input_asset_blinds.push_back(asset_blind);
         input_amounts.push_back(111);
         input_amounts.push_back(100);
         input_assets.push_back(unblinded_id);
         input_assets.push_back(unblinded_id);
-        output_pubkeys.push_back(CPubKey());
-        output_pubkeys.push_back(CPubKey());
-        output_pubkeys.push_back(CPubKey());
+        output_pubkeys.emplace_back();
+        output_pubkeys.emplace_back();
+        output_pubkeys.emplace_back();
         BOOST_CHECK(BlindTransaction(input_blinds, input_asset_blinds, input_assets, input_amounts, output_blinds, output_asset_blinds, output_pubkeys, vDummy, vDummy, tx4) == 0); // Blinds nothing
     }
 
@@ -250,15 +256,15 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         // Build a transactions that spends an unblinded (111) and blinded (100) coin, and produces a blinded (30), unblinded (40), and blinded (50) coin and fee (91)
         CMutableTransaction tx4;
         tx4.vin.resize(2);
-        tx4.vin[0].prevout.hash = ArithToUint256(2);
+        tx4.vin[0].prevout.hash = Txid::FromUint256(ArithToUint256(2));
         tx4.vin[0].prevout.n = 0;
-        tx4.vin[1].prevout.hash = ArithToUint256(3);
+        tx4.vin[1].prevout.hash = Txid::FromUint256(ArithToUint256(3));
         tx4.vin[1].prevout.n = 0;
-        tx4.vout.push_back(CTxOut(bitcoinID, 30, CScript() << OP_TRUE));
-        tx4.vout.push_back(CTxOut(bitcoinID, 40, CScript() << OP_TRUE));
-        tx4.vout.push_back(CTxOut(bitcoinID, 50, CScript() << OP_TRUE));
+        tx4.vout.emplace_back(bitcoinID, 30, CScript() << OP_TRUE);
+        tx4.vout.emplace_back(bitcoinID, 40, CScript() << OP_TRUE);
+        tx4.vout.emplace_back(bitcoinID, 50, CScript() << OP_TRUE);
         // Fee
-        tx4.vout.push_back(CTxOut(bitcoinID, 111+100-30-40-50, CScript()));
+        tx4.vout.emplace_back(bitcoinID, 111 + 100 - 30 - 40 - 50, CScript());
         BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(tx4), nullptr, false)); // Spends a blinded coin with no blinded outputs to compensate.
 
         std::vector<uint256> input_blinds;
@@ -269,9 +275,9 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         std::vector<uint256> output_asset_blinds;
         std::vector<CPubKey> output_pubkeys;
 
-        input_blinds.push_back(uint256());
+        input_blinds.emplace_back();
         input_blinds.push_back(blind3);
-        input_asset_blinds.push_back(uint256());
+        input_asset_blinds.emplace_back();
         input_asset_blinds.push_back(asset_blind);
         input_amounts.push_back(111);
         input_amounts.push_back(100);
@@ -279,15 +285,14 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         input_assets.push_back(unblinded_id);
 
         output_pubkeys.push_back(pubkey2);
-        output_pubkeys.push_back(CPubKey());
+        output_pubkeys.emplace_back();
         output_pubkeys.push_back(pubkey2);
-        output_pubkeys.push_back(CPubKey());
+        output_pubkeys.emplace_back();
 
         BOOST_CHECK(BlindTransaction(input_blinds, input_asset_blinds, input_assets, input_amounts, output_blinds, output_asset_blinds, output_pubkeys, vDummy, vDummy, tx4) == 2);
         BOOST_CHECK(!tx4.vout[0].nValue.IsExplicit());
         BOOST_CHECK(tx4.vout[1].nValue.IsExplicit());
         BOOST_CHECK(!tx4.vout[2].nValue.IsExplicit());
-        // This one broken
         BOOST_CHECK(VerifyAmounts(inputs, CTransaction(tx4), nullptr, false));
 
         CAmount unblinded_amount;
@@ -344,15 +349,15 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         CMutableTransaction tx5;
         tx5.vin.resize(0);
         tx5.vout.resize(0);
-        tx5.vin.push_back(CTxIn(COutPoint(ArithToUint256(3), 0)));
-        tx5.vin.push_back(CTxIn(COutPoint(ArithToUint256(5), 0)));
-        tx5.vout.push_back(CTxOut(bitcoinID, 29, CScript() << OP_TRUE));
-        tx5.vout.push_back(CTxOut(bitcoinID, 70, CScript() << OP_TRUE));
-        tx5.vout.push_back(CTxOut(otherID, 250, CScript() << OP_TRUE));
-        tx5.vout.push_back(CTxOut(otherID, 249, CScript() << OP_TRUE));
+        tx5.vin.emplace_back(COutPoint(Txid::FromUint256(ArithToUint256(3)), 0));
+        tx5.vin.emplace_back(COutPoint(Txid::FromUint256(ArithToUint256(5)), 0));
+        tx5.vout.emplace_back(bitcoinID, 29, CScript() << OP_TRUE);
+        tx5.vout.emplace_back(bitcoinID, 70, CScript() << OP_TRUE);
+        tx5.vout.emplace_back(otherID, 250, CScript() << OP_TRUE);
+        tx5.vout.emplace_back(otherID, 249, CScript() << OP_TRUE);
         // Fees
-        tx5.vout.push_back(CTxOut(bitcoinID, 1, CScript()));
-        tx5.vout.push_back(CTxOut(otherID, 1, CScript()));
+        tx5.vout.emplace_back(bitcoinID, 1, CScript());
+        tx5.vout.emplace_back(otherID, 1, CScript());
 
         // Blinds don't balance
         BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(tx5), nullptr, false));
@@ -366,9 +371,9 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         std::vector<uint256> output_asset_blinds;
         std::vector<CPubKey> output_pubkeys;
         input_blinds.push_back(blind3);
-        input_blinds.push_back(uint256()); //
+        input_blinds.emplace_back();
         input_asset_blinds.push_back(asset_blind);
-        input_asset_blinds.push_back(uint256());
+        input_asset_blinds.emplace_back();
         input_amounts.push_back(100);
         input_amounts.push_back(500);
         input_assets.push_back(bitcoinID);
@@ -391,7 +396,7 @@ BOOST_AUTO_TEST_CASE(naive_blinding_test)
         BOOST_CHECK(VerifyAmounts(inputs, CTransaction(txtemp), nullptr, false));
 
         // Transaction may not have spendable 0-value output
-        txtemp.vout.push_back(CTxOut(CAsset(), 0, CScript() << OP_TRUE));
+        txtemp.vout.emplace_back(CAsset(), 0, CScript() << OP_TRUE);
         BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(txtemp), nullptr, false));
 
         // Create imbalance by removing fees, should still be able to blind
@@ -434,7 +439,7 @@ BOOST_AUTO_TEST_CASE(spendable_zero_value_blinding_fails_without_abort)
 
     const CAsset asset(GetRandHash());
     CMutableTransaction tx;
-    tx.vin.push_back(CTxIn(COutPoint(ArithToUint256(1), 0)));
+    tx.vin.push_back(CTxIn(COutPoint(Txid::FromUint256(ArithToUint256(1)), 0)));
     // Confidential spendable outputs have a minimum range-proof value of one.
     // A zero-valued spendable output must be rejected, not abort the RPC worker.
     tx.vout.push_back(CTxOut(asset, 0, CScript() << OP_TRUE));
@@ -578,7 +583,7 @@ BOOST_AUTO_TEST_CASE(confidential_reissuance_authority_round_trip)
     const std::vector<CTxOut> inputs{current_authority};
 
     CMutableTransaction reissue;
-    reissue.vin.emplace_back(COutPoint(uint256S("0x01"), 0));
+    reissue.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("0x01")), 0));
     reissue.vin[0].assetIssuance.assetBlindingNonce = authority_abf;
     reissue.vin[0].assetIssuance.assetEntropy = entropy;
     reissue.vin[0].assetIssuance.nAmount = CConfidentialValue(mint_amount);
@@ -716,5 +721,76 @@ BOOST_AUTO_TEST_CASE(confidential_reissuance_authority_round_trip)
     mutated.vout.emplace_back(authority_generator, CConfidentialValue(1), successor_controller);
     BOOST_CHECK(!VerifyAmounts(inputs, CTransaction(mutated), nullptr, false));
 
+}
+BOOST_AUTO_TEST_CASE(rangeproof_zero_value_spendable_script)
+{
+    // A rangeproof over a spendable script uses min_value = 1
+    // (`min_value = scriptPubKey.IsUnspendable() ? 0 : 1`), and
+    // secp256k1_rangeproof_sign returns 0 when min_value > value. A zero-valued
+    // output to a spendable script therefore has no valid rangeproof, and the
+    // creation helpers must report that rather than assert on it.
+
+    const CAsset asset(GetRandHash());
+    const uint256 asset_blinder = GetRandHash();
+    const uint256 value_blinder = GetRandHash();
+    const uint256 nonce = GetRandHash();
+
+    const CScript spendable = CScript() << OP_TRUE;
+    const CScript unspendable = CScript() << OP_RETURN;
+    BOOST_CHECK(!spendable.IsUnspendable());
+    BOOST_CHECK(unspendable.IsUnspendable());
+
+    // Asset generator, shared by every case below
+    CConfidentialAsset conf_asset;
+    secp256k1_generator asset_gen;
+    CreateAssetCommitment(conf_asset, asset_gen, asset, asset_blinder);
+
+    // Commitments to 0 and to 1 under that generator
+    CConfidentialValue conf_value_zero, conf_value_one;
+    secp256k1_pedersen_commitment value_commit_zero, value_commit_one;
+    CreateValueCommitment(conf_value_zero, value_commit_zero, value_blinder, asset_gen, 0);
+    CreateValueCommitment(conf_value_one, value_commit_one, value_blinder, asset_gen, 1);
+
+    std::vector<unsigned char> rangeproof;
+
+    // Zero to a spendable script is unprovable. Before the fix, the caller at
+    // blindpsbt.cpp:562 turns this false into assert(rangeresult) -> SIGABRT.
+    BOOST_CHECK(!CreateValueRangeProof(rangeproof, value_blinder, nonce, 0, spendable,
+                                       value_commit_zero, asset_gen, asset, asset_blinder));
+
+    // Zero to an unspendable script gives min_value = 0 and must keep working:
+    // this is the fee / issuance / OP_RETURN shape.
+    BOOST_CHECK(CreateValueRangeProof(rangeproof, value_blinder, nonce, 0, unspendable,
+                                      value_commit_zero, asset_gen, asset, asset_blinder));
+
+    // The ordinary case is unaffected.
+    BOOST_CHECK(CreateValueRangeProof(rangeproof, value_blinder, nonce, 1, spendable,
+                                      value_commit_one, asset_gen, asset, asset_blinder));
+
+    // Confirm the boundary is min_value and not something incidental, mirroring
+    // the rangeproof_info check in naive_blinding_test.
+    {
+        secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+        int exp = 0;
+        int mantissa = 0;
+        uint64_t min_value = 0;
+        uint64_t max_value = 0;
+        BOOST_CHECK(secp256k1_rangeproof_info(ctx, &exp, &mantissa, &min_value, &max_value,
+                                              rangeproof.data(), rangeproof.size()) == 1);
+        BOOST_CHECK_EQUAL(min_value, 1ULL);
+        secp256k1_context_destroy(ctx);
+    }
+
+    std::vector<unsigned char*> value_blindptrs;
+    std::vector<const unsigned char*> asset_blindptrs;
+    value_blindptrs.push_back(const_cast<unsigned char*>(value_blinder.begin()));
+    asset_blindptrs.push_back(asset_blinder.begin());
+
+    BOOST_CHECK(!GenerateRangeproof(rangeproof, value_blindptrs, nonce, 0, spendable,
+                                    value_commit_zero, asset_gen, asset, asset_blindptrs));
+    BOOST_CHECK(GenerateRangeproof(rangeproof, value_blindptrs, nonce, 0, unspendable,
+                                   value_commit_zero, asset_gen, asset, asset_blindptrs));
+    BOOST_CHECK(GenerateRangeproof(rangeproof, value_blindptrs, nonce, 1, spendable,
+                                   value_commit_one, asset_gen, asset, asset_blindptrs));
 }
 BOOST_AUTO_TEST_SUITE_END()

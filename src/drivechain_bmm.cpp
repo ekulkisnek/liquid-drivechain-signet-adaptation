@@ -17,7 +17,7 @@
 #include <script/interpreter.h>
 #include <streams.h>
 #include <util/strencodings.h>
-#include <util/system.h>
+#include <common/args.h>
 
 #include <algorithm>
 #include <array>
@@ -33,7 +33,7 @@ const uint256 PUBLIC_SIDECHAIN_BLOCK_1{
 const uint256 PUBLIC_SIDECHAIN_BLOCK_2{
     uint256S("ce77dfe3b037f2e62624da0ee5e33ae3c23b8b18ddf3b87a687bb372a8406998")};
 const COutPoint BMM_STATE_OUTPOINT{
-    uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9"),
+    Txid::FromUint256(uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9")),
     0};
 const std::vector<unsigned char> BMM_STATE_MARKER{
     'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'b', 'm', 'm', '-', 'v', '1'};
@@ -186,8 +186,8 @@ template <typename T>
 bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
 {
     try {
-        CDataStream stream(bytes, SER_NETWORK, PROTOCOL_VERSION);
-        stream >> value;
+        DataStream stream{bytes};
+        stream >> TX_WITH_WITNESS(value);
         return stream.empty();
     } catch (...) {
         return false;
@@ -195,10 +195,10 @@ bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
 }
 
 template <typename T>
-std::vector<unsigned char> SerializeValue(const T& value, int version = PROTOCOL_VERSION)
+std::vector<unsigned char> SerializeValue(const T& value)
 {
-    CDataStream stream(SER_NETWORK, version);
-    stream << value;
+    DataStream stream;
+    stream << TX_WITH_WITNESS(value);
     return {
         UCharCast(stream.data()),
         UCharCast(stream.data()) + stream.size()};
@@ -336,27 +336,27 @@ uint256 BitcoinWitnessV0SignatureHash(
     const int base_type = hash_type & 0x1f;
 
     if (!(hash_type & SIGHASH_ANYONECANPAY)) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         for (const auto& input : transaction.vin) writer << input.prevout;
         hash_prevouts = writer.GetHash();
     }
     if (!(hash_type & SIGHASH_ANYONECANPAY) &&
         base_type != SIGHASH_SINGLE &&
         base_type != SIGHASH_NONE) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         for (const auto& input : transaction.vin) writer << input.nSequence;
         hash_sequence = writer.GetHash();
     }
     if (base_type != SIGHASH_SINGLE && base_type != SIGHASH_NONE) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         for (const auto& output : transaction.vout) writer << output;
         hash_outputs = writer.GetHash();
     } else if (base_type == SIGHASH_SINGLE && input_index < transaction.vout.size()) {
-        hash_outputs = (CHashWriter(SER_GETHASH, 0) << transaction.vout[input_index]).GetHash();
+        hash_outputs = (HashWriter{} << transaction.vout[input_index]).GetHash();
     }
 
-    CHashWriter writer(SER_GETHASH, 0);
-    writer << transaction.nVersion;
+    HashWriter writer;
+    writer << transaction.version;
     writer << hash_prevouts;
     writer << hash_sequence;
     writer << transaction.vin[input_index].prevout;
@@ -433,7 +433,7 @@ bool CheckSignetSolution(
     }
 
     Sidechain::Bitcoin::CMutableTransaction transaction_to_spend;
-    transaction_to_spend.nVersion = 0;
+    transaction_to_spend.version = 0;
     transaction_to_spend.nLockTime = 0;
     transaction_to_spend.vin.emplace_back(
         Sidechain::Bitcoin::COutPoint(),
@@ -442,7 +442,7 @@ bool CheckSignetSolution(
     transaction_to_spend.vout.emplace_back(0, consensus.signet_challenge);
 
     Sidechain::Bitcoin::CMutableTransaction transaction_spending;
-    transaction_spending.nVersion = 0;
+    transaction_spending.version = 0;
     transaction_spending.nLockTime = 0;
     transaction_spending.vin.emplace_back(
         Sidechain::Bitcoin::COutPoint(),
@@ -452,7 +452,7 @@ bool CheckSignetSolution(
 
     if (!signet_solution.empty()) {
         try {
-            CDataStream stream(signet_solution, SER_NETWORK, INIT_PROTO_VERSION);
+            DataStream stream{signet_solution};
             stream >> transaction_spending.vin[0].scriptSig;
             stream >> transaction_spending.vin[0].scriptWitness.stack;
             if (!stream.empty()) {
@@ -482,7 +482,7 @@ bool CheckSignetSolution(
     }
 
     std::vector<unsigned char> block_data;
-    CVectorWriter writer(SER_NETWORK, INIT_PROTO_VERSION, block_data, 0);
+    VectorWriter writer{block_data, 0};
     writer << proof.header.nVersion;
     writer << proof.header.hashPrevBlock;
     writer << modified_merkle_root;
@@ -574,7 +574,7 @@ bool ExtractSidechainParentHash(
 
 CScript EncodeBmmState(const BmmL1State& state)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream;
     stream << BMM_STATE_MARKER << state;
     return CScript()
         << std::vector<unsigned char>(
@@ -608,7 +608,7 @@ bool DecodeBmmState(const Coin& coin, BmmL1State& state, std::string& error)
         return false;
     }
     try {
-        CDataStream stream(data, SER_NETWORK, PROTOCOL_VERSION);
+        DataStream stream{data};
         std::vector<unsigned char> marker;
         stream >> marker >> state;
         if (!stream.empty() ||
@@ -699,7 +699,7 @@ uint256 RuntimeBmmConsensusFingerprint()
     payload.insert(
         payload.end(), PUBLIC_SIDECHAIN_BLOCK_2.begin(), PUBLIC_SIDECHAIN_BLOCK_2.end());
     payload.insert(
-        payload.end(), BMM_STATE_OUTPOINT.hash.begin(), BMM_STATE_OUTPOINT.hash.end());
+        payload.end(), BMM_STATE_OUTPOINT.hash.ToUint256().begin(), BMM_STATE_OUTPOINT.hash.ToUint256().end());
     FingerprintU32(payload, BMM_STATE_OUTPOINT.n);
     FingerprintBytes(payload, BMM_STATE_MARKER.data(), BMM_STATE_MARKER.size());
     payload.insert(payload.end(), SIGNET_HEADER.begin(), SIGNET_HEADER.end());
@@ -710,8 +710,8 @@ uint256 RuntimeBmmConsensusFingerprint()
 
 bool HasPersistedBmmConsensusState(const CCoinsView& view)
 {
-    Coin coin;
-    return view.GetCoin(BMM_STATE_OUTPOINT, coin) && !coin.IsSpent();
+    const auto coin = view.GetCoin(BMM_STATE_OUTPOINT);
+    return coin && !coin->IsSpent();
 }
 
 bool IsBmmStateInternalOutpoint(const COutPoint& outpoint)
@@ -897,7 +897,7 @@ bool BuildPrivateE2eBmmProof(
     if (!ValidState(previous, PRIVATE_E2E_REGTEST_CONSENSUS, error)) return false;
 
     Sidechain::Bitcoin::CMutableTransaction coinbase;
-    coinbase.nVersion = 2;
+    coinbase.version = 2;
     coinbase.vin.resize(1);
     coinbase.vin[0].prevout.SetNull();
     coinbase.vin[0].scriptSig = CScript() << static_cast<int64_t>(previous.height + 1);

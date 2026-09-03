@@ -18,7 +18,7 @@
 #include <script/script.h>
 #include <streams.h>
 #include <util/strencodings.h>
-#include <util/system.h>
+#include <common/args.h>
 extern "C" {
 #include <simplicity/elements/env.h>
 }
@@ -38,13 +38,13 @@ namespace ecx {
 namespace {
 
 const COutPoint EXCHANGE_TRACKER_OUTPOINT{
-    uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041"),
+    Txid::FromUint256(uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041")),
     0};
 const COutPoint FORCED_INBOX_TRACKER_OUTPOINT{
-    uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1"),
+    Txid::FromUint256(uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1")),
     0};
 const COutPoint DEPOSIT_INBOX_TRACKER_OUTPOINT{
-    uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586"),
+    Txid::FromUint256(uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586")),
     0};
 const std::vector<unsigned char> EXCHANGE_TRACKER_MARKER{
     'e', 'c', 'x', '-', 's', 't', 'a', 't', 'e', '-', 'v', '1'};
@@ -187,7 +187,7 @@ ExchangeConsensus LoadExchangeConsensus()
     }
 
     result.activation_height = static_cast<int>(height);
-    result.genesis_state_outpoint = COutPoint{txid, vout};
+    result.genesis_state_outpoint = COutPoint{Txid::FromUint256(txid), vout};
     result.genesis_state_root = root;
 
     const auto parse_hash32 = [](const std::string& name) {
@@ -1554,7 +1554,7 @@ void ConfigureBondV2FromArgs(ExchangeConsensus& consensus)
         }
     }
     const uint256 deployment_txid{transaction.GetHash()};
-    const uint256 genesis_txid{genesis.GetHash()};
+    const Txid genesis_txid{genesis.GetHash()};
     if (deployment_txid == genesis_txid) {
         throw std::runtime_error(
             "ECX bond V2 deployment and genesis must be separate transactions");
@@ -1601,7 +1601,7 @@ void ConfigureBondV2FromArgs(ExchangeConsensus& consensus)
     commitment.reserve(253);
     commitment.push_back(1);
     commitment.insert(commitment.end(), deployment_txid.begin(), deployment_txid.end());
-    commitment.insert(commitment.end(), issuance.prevout.hash.begin(), issuance.prevout.hash.end());
+    commitment.insert(commitment.end(), issuance.prevout.hash.ToUint256().begin(), issuance.prevout.hash.ToUint256().end());
     PushU32Be(commitment, issuance.prevout.n);
     commitment.insert(commitment.end(), bond_asset.begin(), bond_asset.end());
     commitment.insert(commitment.end(), reissuance_token.begin(), reissuance_token.end());
@@ -1678,12 +1678,12 @@ void ConfigureBondV2FromArgs(ExchangeConsensus& consensus)
     }
 
     std::vector<unsigned char> derivation;
-    CDataStream transaction_bytes(SER_NETWORK, PROTOCOL_VERSION);
-    transaction_bytes << transaction;
+    DataStream transaction_bytes;
+    transaction_bytes << TX_WITH_WITNESS(transaction);
     derivation.insert(
         derivation.end(), UCharCast(transaction_bytes.data()),
         UCharCast(transaction_bytes.data()) + transaction_bytes.size());
-    CDataStream genesis_bytes(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream genesis_bytes;
     genesis_bytes << genesis;
     derivation.insert(
         derivation.end(), UCharCast(genesis_bytes.data()),
@@ -2235,7 +2235,7 @@ bool FrozenBondV2IdentityAvailable(
 
 uint256 TxOutHash(const CTxOut& output)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream;
     stream << output;
     return Sha256({
         UCharCast(stream.data()),
@@ -2666,7 +2666,7 @@ bool ActiveAt(int height, const ExchangeConsensus& consensus)
 
 CScript EncodeTracker(const ExchangeStateTracker& tracker)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream;
     stream << EXCHANGE_TRACKER_MARKER << tracker;
     return CScript()
         << std::vector<unsigned char>(
@@ -2680,7 +2680,7 @@ CScript EncodeInboxTracker(
     const std::vector<unsigned char>& marker,
     const InboxTracker& tracker)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream;
     stream << marker << tracker;
     return CScript()
         << std::vector<unsigned char>(
@@ -2713,7 +2713,7 @@ bool DecodeInboxTracker(
         return false;
     }
     try {
-        CDataStream stream(data, SER_NETWORK, PROTOCOL_VERSION);
+        DataStream stream{data};
         std::vector<unsigned char> marker;
         stream >> marker >> tracker;
         if (!stream.empty() || marker != expected_marker || tracker.root.IsNull()) {
@@ -2782,7 +2782,7 @@ bool DecodeTracker(const Coin& coin, ExchangeStateTracker& tracker, std::string&
         return false;
     }
     try {
-        CDataStream stream(data, SER_NETWORK, PROTOCOL_VERSION);
+        DataStream stream{data};
         std::vector<unsigned char> marker;
         stream >> marker >> tracker;
         if (!stream.empty() || marker != EXCHANGE_TRACKER_MARKER ||
@@ -3568,15 +3568,15 @@ static bool IsCanonicalBondInboxSourceTransactionForProfile(
         return false;
     }
 
-    CDataStream transaction_stream(SER_NETWORK, PROTOCOL_VERSION);
-    transaction_stream << transaction;
+    DataStream transaction_stream;
+    transaction_stream << TX_WITH_WITNESS(transaction);
     if (transaction_stream.size() == 0 ||
         transaction_stream.size() >
             frozen.bond_inbox_max_unique_source_transaction_bytes_per_sidechain_block) {
         error = "ECX bond-inbox source transaction exceeds its frozen exact byte cap";
         return false;
     }
-    CDataStream witness_stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream witness_stream;
     witness_stream << transaction.witness;
     if (witness_stream.size() == 0 ||
         witness_stream.size() >
@@ -3642,7 +3642,7 @@ static bool IsCanonicalBondInboxSourceTransactionForProfile(
                 error = "ECX bond-inbox staging output is not the exact confidential frozen descriptor form";
                 return false;
             }
-            CDataStream staging_stream(SER_NETWORK, PROTOCOL_VERSION);
+            DataStream staging_stream;
             staging_stream << staging;
             if (staging_stream.size() == 0 ||
                 staging_stream.size() > frozen.bond_inbox_max_bundle_bytes) {
@@ -3744,9 +3744,9 @@ bool AppendBondInboxSourcesForBlock(
             return false;
         }
 
-        CDataStream transaction_stream(SER_NETWORK, PROTOCOL_VERSION);
-        transaction_stream << transaction;
-        CDataStream witness_stream(SER_NETWORK, PROTOCOL_VERSION);
+        DataStream transaction_stream;
+        transaction_stream << TX_WITH_WITNESS(transaction);
+        DataStream witness_stream;
         witness_stream << transaction.witness;
         if (transaction_stream.size() > UINT32_MAX || witness_stream.size() > UINT32_MAX) {
             error = "ECX bond-inbox source serialization length overflows u32";
@@ -3931,9 +3931,9 @@ bool AppendIncrementalSuccessorBondInboxSourcesForBlock(
             return false;
         }
 
-        CDataStream transaction_stream(SER_NETWORK, PROTOCOL_VERSION);
-        transaction_stream << transaction;
-        CDataStream witness_stream(SER_NETWORK, PROTOCOL_VERSION);
+        DataStream transaction_stream;
+        transaction_stream << TX_WITH_WITNESS(transaction);
+        DataStream witness_stream;
         witness_stream << transaction.witness;
         if (transaction_stream.size() > UINT32_MAX ||
             witness_stream.size() > UINT32_MAX) {
@@ -4115,7 +4115,7 @@ uint256 ComputeRuntimeConsensusFingerprint(
         payload.insert(payload.end(), data, data + size);
     };
     const auto push_outpoint = [&payload](const COutPoint& outpoint) {
-        payload.insert(payload.end(), outpoint.hash.begin(), outpoint.hash.end());
+        payload.insert(payload.end(), outpoint.hash.ToUint256().begin(), outpoint.hash.ToUint256().end());
         PushU32Be(payload, outpoint.n);
     };
 
@@ -4180,8 +4180,8 @@ uint256 ComputeRuntimeConsensusFingerprint(
     PushU32Be(payload, static_cast<uint32_t>(consensus.activation_height));
     payload.insert(
         payload.end(),
-        consensus.genesis_state_outpoint.hash.begin(),
-        consensus.genesis_state_outpoint.hash.end());
+        consensus.genesis_state_outpoint.hash.ToUint256().begin(),
+        consensus.genesis_state_outpoint.hash.ToUint256().end());
     PushU32Be(payload, consensus.genesis_state_outpoint.n);
     payload.insert(
         payload.end(),
@@ -4214,8 +4214,8 @@ uint256 ComputeRuntimeConsensusFingerprint(
             PushU64Be(payload, 0);
             return;
         }
-        CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
-        stream << *transaction;
+        DataStream stream;
+        stream << TX_WITH_WITNESS(*transaction);
         PushU64Be(payload, stream.size());
         payload.insert(
             payload.end(), UCharCast(stream.data()),
@@ -4356,10 +4356,13 @@ bool GetRuntimeConsensusFingerprint(
 
 bool HasPersistedExchangeConsensusState(const CCoinsView& view)
 {
-    Coin coin;
-    return (view.GetCoin(EXCHANGE_TRACKER_OUTPOINT, coin) && !coin.IsSpent()) ||
-        (view.GetCoin(FORCED_INBOX_TRACKER_OUTPOINT, coin) && !coin.IsSpent()) ||
-        (view.GetCoin(DEPOSIT_INBOX_TRACKER_OUTPOINT, coin) && !coin.IsSpent());
+    for (const COutPoint& outpoint : {EXCHANGE_TRACKER_OUTPOINT,
+                                    FORCED_INBOX_TRACKER_OUTPOINT,
+                                    DEPOSIT_INBOX_TRACKER_OUTPOINT}) {
+        const auto coin = view.GetCoin(outpoint);
+        if (coin && !coin->IsSpent()) return true;
+    }
+    return false;
 }
 
 const ExchangeConsensus& LayerTwoLabsExchangeConsensus()
@@ -4502,7 +4505,7 @@ uint256 ComputeStateUtxoRoot(
     const COutPoint& outpoint,
     const CTxOut& output)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream;
     stream << output;
     const std::vector<unsigned char> output_bytes{
         UCharCast(stream.data()),
@@ -4512,7 +4515,7 @@ uint256 ComputeStateUtxoRoot(
     std::vector<unsigned char> payload;
     payload.reserve(100);
     payload.insert(payload.end(), child_genesis.begin(), child_genesis.end());
-    payload.insert(payload.end(), outpoint.hash.begin(), outpoint.hash.end());
+    payload.insert(payload.end(), outpoint.hash.ToUint256().begin(), outpoint.hash.ToUint256().end());
     PushU32Le(payload, outpoint.n);
     payload.insert(payload.end(), output_hash.begin(), output_hash.end());
     return TaggedHash("ECX/header-state/v1", payload);
@@ -5487,8 +5490,8 @@ bool VerifyBondV2DeploymentAndGenesis(
     const auto& frozen{consensus.bond_v2};
     const CTransaction& deployment{*frozen.deployment_transaction};
     const CTransaction& genesis{*frozen.genesis_transaction};
-    const uint256 deployment_txid{deployment.GetHash()};
-    const uint256 genesis_txid{genesis.GetHash()};
+    const Txid deployment_txid{deployment.GetHash()};
+    const Txid genesis_txid{genesis.GetHash()};
     static constexpr CAmount FIXED_SUPPLY{2'100'000'000'000'000};
 
     if (deployment_txid == genesis_txid ||

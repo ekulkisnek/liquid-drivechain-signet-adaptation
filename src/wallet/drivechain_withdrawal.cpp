@@ -62,8 +62,8 @@ static uint256 DrivechainInputsCommitment(
 {
     std::vector<COutPoint> committed_inputs;
     committed_inputs.push_back(withdrawal_outpoint);
-    committed_inputs.emplace_back(uint256::ZERO, sidechain_block_height);
-    return SerializeHash(committed_inputs, SER_GETHASH, 0);
+    committed_inputs.emplace_back(Txid{}, sidechain_block_height);
+    return (HashWriter{} << committed_inputs).GetHash();
 }
 
 static CScript BuildDrivechainInputsCommitmentScript(const uint256& commitment)

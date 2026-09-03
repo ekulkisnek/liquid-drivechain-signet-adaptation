@@ -17,7 +17,7 @@
 #include <primitives/bitcoin/block.h>
 #include <primitives/bitcoin/merkleblock.h>
 #include <primitives/transaction.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <test/util/setup_common.h>
 #include <tinyformat.h>
 #include <util/strencodings.h>
@@ -160,7 +160,7 @@ bool Authenticate(
     const UniValue& ctip = Ctip(),
     const std::string& sidechain_network = Params().NetworkIDString(),
     const drivechain::DepositIdentity& identity = Identity(),
-    const COutPoint& outpoint = COutPoint(uint256S(DEPOSIT_TXID), 0),
+    const COutPoint& outpoint = COutPoint(Txid::FromUint256(uint256S(DEPOSIT_TXID)), 0),
     CAmount value = 2000)
 {
     return drivechain::AuthenticateDepositEvidence(
@@ -186,7 +186,7 @@ CMutableTransaction DepositTransaction(
     CAmount fee = 100)
 {
     CMutableTransaction tx;
-    tx.nVersion = 2;
+    tx.version = 2;
     CTxIn input(authenticated.outpoint, CScript(), CTxIn::SEQUENCE_FINAL);
     input.m_is_pegin = true;
     tx.vin.push_back(input);
@@ -208,8 +208,8 @@ CMutableTransaction DepositTransaction(
 template <typename T>
 std::vector<unsigned char> Serialize(const T& value)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
-    stream << value;
+    DataStream stream;
+    stream << TX_WITH_WITNESS(value);
     return {
         UCharCast(stream.data()),
         UCharCast(stream.data()) + stream.size()};
@@ -225,9 +225,8 @@ class DrivechainPegTestingSetup : public BasicTestingSetup
 public:
     DrivechainPegTestingSetup()
         : BasicTestingSetup(
-              "liquid-signet",
-              "",
-              {
+              ChainTypeMetaFrom("liquid-signet"),
+              {.extra_args = {
                   "-con_elementsmode=1",
                   "-con_has_parent_chain=1",
                   "-parentgenesisblockhash=00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
@@ -237,7 +236,7 @@ public:
                   "-parent_blech32_hrp=tb",
                   "-bech32_hrp=ert",
                   "-blech32_hrp=el",
-              })
+              }})
     {
     }
 };
@@ -245,11 +244,9 @@ public:
 CTransaction LegacyPublicDeposit()
 {
     CMutableTransaction tx;
-    CDataStream stream(
-        ParseHex("020000000101ea6bf0d0cd29414c524e1bfb175299dcb945f438200d596bbe4ba547b7aee47d0000004000ffffffff0201579008c2884b22c31d545e3887d73efd5a412d16aeb9bd8ccbeba8eaa605b71101000000000000076c001600142ab51216604aace97fd71de08cbb29078f42b8b101579008c2884b22c31d545e3887d73efd5a412d16aeb9bd8ccbeba8eaa605b7110100000000000000640000000000000000000608d00700000000000020579008c2884b22c31d545e3887d73efd5a412d16aeb9bd8ccbeba8eaa605b71120f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e9739881080000000151156472697665636861696e2d6465706f7369742d763120ea6bf0d0cd29414c524e1bfb175299dcb945f438200d596bbe4ba547b7aee47d00000000"),
-        SER_NETWORK,
-        PROTOCOL_VERSION);
-    stream >> tx;
+    DataStream stream(
+        ParseHex("020000000101ea6bf0d0cd29414c524e1bfb175299dcb945f438200d596bbe4ba547b7aee47d0000004000ffffffff0201579008c2884b22c31d545e3887d73efd5a412d16aeb9bd8ccbeba8eaa605b71101000000000000076c001600142ab51216604aace97fd71de08cbb29078f42b8b101579008c2884b22c31d545e3887d73efd5a412d16aeb9bd8ccbeba8eaa605b7110100000000000000640000000000000000000608d00700000000000020579008c2884b22c31d545e3887d73efd5a412d16aeb9bd8ccbeba8eaa605b71120f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e9739881080000000151156472697665636861696e2d6465706f7369742d763120ea6bf0d0cd29414c524e1bfb175299dcb945f438200d596bbe4ba547b7aee47d00000000"));
+    stream >> TX_WITH_WITNESS(tx);
     BOOST_REQUIRE(stream.empty());
     return CTransaction(tx);
 }
@@ -266,8 +263,8 @@ struct DeterministicFixture
             "02000000000102ba1b6b0b25cbed783a2bb5bcfcb18d54115388b1a53454417ea20ce06c2de8dd0100000000fdffffffabede444d25da6440680778541b4f5876388e10cd9da94f55a546eeab5700a010000000000ffffffff03d0c1db000000000004b401185100000000000000002d6a2b65727431713932363379396e7166326b776a6c3768726873676577656671373835397739337a356e3878388f1c00000000000016001420ee25f486b457599d671fec23be2a2ffbb8efc20247304402203cdbeac736b8c0b97fe7f9ad9b1d76fc7b60d2a7ef907942c52fd7481c509c5702201f27991af112244d8e159546587f0d2dd98f49e5a8eaed5919932a2d5f8f6dfa012103ddd93dd5a45116fb7febe151d9b4d9f7cdccc84ffb94dbe7d5665aa2bafed1dd00fe180000");
         Sidechain::Bitcoin::CMutableTransaction previous_tx;
         {
-            CDataStream stream(previous_raw, SER_NETWORK, PROTOCOL_VERSION);
-            stream >> previous_tx;
+            DataStream stream(previous_raw);
+            stream >> TX_WITH_WITNESS(previous_tx);
             BOOST_REQUIRE(stream.empty());
             BOOST_REQUIRE_EQUAL(
                 previous_tx.GetHash().GetHex(),
@@ -275,7 +272,7 @@ struct DeterministicFixture
         }
 
         Sidechain::Bitcoin::CMutableTransaction deposit_tx;
-        deposit_tx.nVersion = 2;
+        deposit_tx.version = 2;
         deposit_tx.vin.emplace_back(
             Sidechain::Bitcoin::COutPoint(previous_tx.GetHash(), 0));
         deposit_tx.vout.emplace_back(14'404'000, CtipScript());
@@ -312,7 +309,7 @@ struct DeterministicFixture
         anchor = l1_block.GetHash();
 
         drivechain::AuthenticatedDeposit authenticated;
-        authenticated.outpoint = COutPoint(deposit_tx.GetHash(), 0);
+        authenticated.outpoint = COutPoint(Txid::FromUint256(deposit_tx.GetHash()), 0);
         authenticated.value = 2'000;
         authenticated.destination_script = GetScriptForDestination(
             DecodeDestination(address));
@@ -336,12 +333,11 @@ public:
     std::set<std::pair<uint256, COutPoint>> spent;
     std::map<COutPoint, Coin> coins;
 
-    bool GetCoin(const COutPoint& outpoint, Coin& coin) const override
+    std::optional<Coin> GetCoin(const COutPoint& outpoint) const override
     {
         const auto it = coins.find(outpoint);
-        if (it == coins.end() || it->second.IsSpent()) return false;
-        coin = it->second;
-        return true;
+        if (it == coins.end() || it->second.IsSpent()) return std::nullopt;
+        return it->second;
     }
 
     bool IsPeginSpent(const std::pair<uint256, COutPoint>& outpoint) const override
@@ -349,24 +345,23 @@ public:
         return spent.count(outpoint) != 0;
     }
 
-    bool BatchWrite(CCoinsMap& map_coins, const uint256&) override
+    bool BatchWrite(CoinsViewCacheCursor& cursor, const uint256&) override
     {
-        for (auto it = map_coins.begin(); it != map_coins.end();) {
-            if ((it->second.flags & CCoinsCacheEntry::PEGIN) &&
-                (it->second.flags & CCoinsCacheEntry::DIRTY)) {
+        for (auto it = cursor.Begin(); it != cursor.End(); it = cursor.NextAndMaybeErase(*it)) {
+            if (it->second.IsPegin() &&
+                it->second.IsDirty()) {
                 if (it->second.peginSpent) {
                     spent.insert(it->first);
                 } else {
                     spent.erase(it->first);
                 }
-            } else if (it->second.flags & CCoinsCacheEntry::DIRTY) {
+            } else if (it->second.IsDirty()) {
                 if (it->second.coin.IsSpent()) {
                     coins.erase(it->first.second);
                 } else {
                     coins[it->first.second] = it->second.coin;
                 }
             }
-            it = map_coins.erase(it);
         }
         return true;
     }
@@ -400,7 +395,7 @@ BOOST_AUTO_TEST_CASE(deposit_codec_dispatch_keeps_native_and_ecx_state_separate)
         const COutPoint& deposit = tx->vin[0].prevout;
         BOOST_CHECK(IsDrivechainDepositPeginWitness(witness, deposit));
         BOOST_CHECK(IsEcxDrivechainDepositPeginWitness(witness, deposit));
-        BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(witness, COutPoint(uint256::ONE, deposit.n)));
+        BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(witness, COutPoint(Txid::FromUint256(uint256::ONE), deposit.n)));
 
         CScriptWitness altered = witness;
         altered.stack[4][0] ^= 1;
@@ -441,7 +436,7 @@ BOOST_AUTO_TEST_CASE(normalizes_l1_lifecycle_and_deduplicates)
     BOOST_REQUIRE(events.isArray());
     BOOST_CHECK_EQUAL(events.size(), 3U);
     BOOST_CHECK_EQUAL(events[0]["kind"].get_str(), "deposit");
-    BOOST_CHECK_EQUAL(events[0]["value_sats"].get_int64(), 1000);
+    BOOST_CHECK_EQUAL(events[0]["value_sats"].getInt<int64_t>(), 1000);
     BOOST_CHECK_EQUAL(events[1]["status"].get_str(), "submitted");
     BOOST_CHECK_EQUAL(events[1]["acknowledgement"].get_str(), "pending");
     BOOST_CHECK_EQUAL(events[2]["status"].get_str(), "succeeded");
@@ -534,8 +529,8 @@ BOOST_AUTO_TEST_CASE(extracts_consensus_anchored_sidechain_events)
 {
     const uint256 mainchain_txid = uint256S("01");
     CMutableTransaction deposit;
-    deposit.nVersion = 2;
-    CTxIn deposit_input(COutPoint(mainchain_txid, 0));
+    deposit.version = 2;
+    CTxIn deposit_input(COutPoint(Txid::FromUint256(mainchain_txid), 0));
     deposit_input.m_is_pegin = true;
     deposit.vin.push_back(deposit_input);
     deposit.vout.emplace_back(Params().GetConsensus().pegged_asset, 99'000, CScript() << OP_TRUE);
@@ -550,7 +545,7 @@ BOOST_AUTO_TEST_CASE(extracts_consensus_anchored_sidechain_events)
         mainchain_txid);
 
     CMutableTransaction withdrawal;
-    withdrawal.nVersion = 2;
+    withdrawal.version = 2;
     const CScript destination = CScript() << OP_TRUE;
     const CScript pegout = CScript()
         << OP_RETURN
@@ -568,9 +563,9 @@ BOOST_AUTO_TEST_CASE(extracts_consensus_anchored_sidechain_events)
     BOOST_REQUIRE_EQUAL(events.size(), 3U);
     BOOST_CHECK_EQUAL(events[0]["kind"].get_str(), "bundle_commitment");
     BOOST_CHECK_EQUAL(events[1]["kind"].get_str(), "deposit");
-    BOOST_CHECK_EQUAL(events[1]["value_sats"].get_int64(), 100'000);
+    BOOST_CHECK_EQUAL(events[1]["value_sats"].getInt<int64_t>(), 100'000);
     BOOST_CHECK_EQUAL(events[2]["kind"].get_str(), "withdrawal");
-    BOOST_CHECK_EQUAL(events[2]["value_sats"].get_int64(), 25'000);
+    BOOST_CHECK_EQUAL(events[2]["value_sats"].getInt<int64_t>(), 25'000);
 
     const UniValue repeated_bundle = drivechain::ExtractSidechainPegEvents(block, 7, block.hashWithdrawalBundle);
     BOOST_REQUIRE_EQUAL(repeated_bundle.size(), 2U);
@@ -599,7 +594,7 @@ BOOST_AUTO_TEST_CASE(authenticates_exact_deposit_and_transaction)
     drivechain::AuthenticatedDeposit authenticated;
     std::string error;
     BOOST_REQUIRE_MESSAGE(Authenticate(authenticated, error), error);
-    BOOST_CHECK(authenticated.outpoint == COutPoint(uint256S(DEPOSIT_TXID), 0));
+    BOOST_CHECK(authenticated.outpoint == COutPoint(Txid::FromUint256(uint256S(DEPOSIT_TXID)), 0));
     BOOST_CHECK_EQUAL(authenticated.value, 2000);
     BOOST_CHECK_EQUAL(authenticated.sequence_number, 8);
     BOOST_CHECK_EQUAL(authenticated.address, TestDepositAddress());
@@ -636,17 +631,17 @@ BOOST_AUTO_TEST_CASE(authenticates_nonzero_deposit_vout)
             Ctip(DEPOSIT_TXID, 14'402'000, 8, 7),
             Params().NetworkIDString(),
             Identity(),
-            COutPoint(uint256S(DEPOSIT_TXID), 7),
+            COutPoint(Txid::FromUint256(uint256S(DEPOSIT_TXID)), 7),
             2000),
         error);
-    BOOST_CHECK(authenticated.outpoint == COutPoint(uint256S(DEPOSIT_TXID), 7));
+    BOOST_CHECK(authenticated.outpoint == COutPoint(Txid::FromUint256(uint256S(DEPOSIT_TXID)), 7));
     BOOST_CHECK(authenticated.current_ctip == authenticated.outpoint);
 }
 
 BOOST_AUTO_TEST_CASE(withdrawal_bundle_is_confirmation_bound)
 {
     const CScript payout_script = CScript() << OP_TRUE;
-    const COutPoint withdrawal_outpoint(uint256S("11"), 3);
+    const COutPoint withdrawal_outpoint(Txid::FromUint256(uint256S("11")), 3);
     const uint256 genesis = uint256S("22");
     const uint256 previous = uint256S("33");
     const uint256 exchange_root = uint256S("44");
@@ -868,7 +863,7 @@ BOOST_AUTO_TEST_CASE(rejects_mismatched_txid_vout_address_and_value)
         Ctip(),
         Params().NetworkIDString(),
         Identity(),
-        COutPoint(uint256S("01"), 0),
+        COutPoint(Txid::FromUint256(uint256S("01")), 0),
         2000));
     BOOST_CHECK(error.find("absent") != std::string::npos);
 
@@ -883,7 +878,7 @@ BOOST_AUTO_TEST_CASE(rejects_mismatched_txid_vout_address_and_value)
         Ctip(),
         Params().NetworkIDString(),
         Identity(),
-        COutPoint(uint256S(DEPOSIT_TXID), 1),
+        COutPoint(Txid::FromUint256(uint256S(DEPOSIT_TXID)), 1),
         2000));
     BOOST_CHECK(error.find("absent") != std::string::npos);
 
@@ -898,7 +893,7 @@ BOOST_AUTO_TEST_CASE(rejects_mismatched_txid_vout_address_and_value)
         Ctip(),
         Params().NetworkIDString(),
         Identity(),
-        COutPoint(uint256S(DEPOSIT_TXID), 0),
+        COutPoint(Txid::FromUint256(uint256S(DEPOSIT_TXID)), 0),
         1999));
     BOOST_CHECK(error.find("value") != std::string::npos);
 
@@ -1087,7 +1082,7 @@ BOOST_AUTO_TEST_CASE(rejects_value_smuggling_and_persists_replay_state)
     CMutableTransaction extra_input = DepositTransaction(
         authenticated,
         authenticated.destination_script);
-    extra_input.vin.emplace_back(COutPoint(uint256S("01"), 0));
+    extra_input.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("01")), 0));
     extra_input.witness.vtxinwit.resize(2);
     BOOST_CHECK(!drivechain::VerifyDepositTransaction(
         CTransaction(extra_input),

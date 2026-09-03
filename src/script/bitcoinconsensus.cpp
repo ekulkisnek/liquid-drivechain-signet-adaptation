@@ -9,7 +9,10 @@
 #include <pubkey.h>
 #include <script/interpreter.h>
 #include <streams.h>
-#include <version.h>
+#include <util/translation.h>
+
+// Standalone C ABI consumers do not supply the executable's translation hook.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 
@@ -17,8 +20,7 @@ namespace {
 class TxInputStream
 {
 public:
-    TxInputStream(int nVersionIn, const unsigned char *txTo, size_t txToLen) :
-    m_version(nVersionIn),
+    TxInputStream(const unsigned char *txTo, size_t txToLen) :
     m_data(txTo),
     m_remaining(txToLen)
     {}
@@ -49,9 +51,7 @@ public:
         return *this;
     }
 
-    int GetVersion() const { return m_version; }
 private:
-    const int m_version;
     const unsigned char* m_data;
     size_t m_remaining;
 };
@@ -63,12 +63,6 @@ inline int set_error(bitcoinconsensus_error* ret, bitcoinconsensus_error serror)
     return 0;
 }
 
-struct ECCryptoClosure
-{
-    ECCVerifyHandle handle;
-};
-
-ECCryptoClosure instance_of_eccryptoclosure;
 } // namespace
 
 /** Check that all specified flags are part of the libconsensus interface. */
@@ -86,11 +80,11 @@ static int verify_script(const unsigned char *hash_genesis_block,
         return set_error(err, bitcoinconsensus_ERR_INVALID_FLAGS);
     }
     try {
-        TxInputStream stream(PROTOCOL_VERSION, txTo, txToLen);
-        CTransaction tx(deserialize, stream);
+        TxInputStream stream( txTo, txToLen);
+        CTransaction tx(deserialize, TX_WITH_WITNESS, stream);
         if (nIn >= tx.vin.size())
             return set_error(err, bitcoinconsensus_ERR_TX_INDEX);
-        if (GetSerializeSize(tx, PROTOCOL_VERSION) != txToLen)
+        if (GetSerializeSize(TX_WITH_WITNESS(tx)) != txToLen)
             return set_error(err, bitcoinconsensus_ERR_TX_SIZE_MISMATCH);
 
         // Regardless of the verification result, the tx did not error.
@@ -99,7 +93,7 @@ static int verify_script(const unsigned char *hash_genesis_block,
         auto hash_genesis_block_ = hash_genesis_block ? uint256{hash_genesis_block, 32} : uint256{};
         PrecomputedTransactionData txdata(hash_genesis_block_);
         txdata.Init(tx, {});
-        const CScriptWitness* pScriptWitness = (tx.witness.vtxinwit.size() > nIn ? &tx.witness.vtxinwit[nIn].scriptWitness : NULL);
+        const CScriptWitness* pScriptWitness = (tx.witness.vtxinwit.size() > nIn ? &tx.witness.vtxinwit[nIn].scriptWitness : nullptr);
         return VerifyScript(tx.vin[nIn].scriptSig, CScript(scriptPubKey, scriptPubKey + scriptPubKeyLen), pScriptWitness, flags, TransactionSignatureChecker(&tx, nIn, amount, txdata, MissingDataBehavior::FAIL), nullptr);
     } catch (const std::exception&) {
         return set_error(err, bitcoinconsensus_ERR_TX_DESERIALIZE); // Error deserializing
@@ -113,7 +107,7 @@ int bitcoinconsensus_verify_script_with_amount(const unsigned char *hash_genesis
                                     unsigned int nIn, unsigned int flags, bitcoinconsensus_error* err)
 {
     try {
-        TxInputStream stream(PROTOCOL_VERSION, amount, amountLen);
+        TxInputStream stream( amount, amountLen);
         CConfidentialValue am;
         stream >> am;
 

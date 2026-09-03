@@ -10,7 +10,7 @@
 #include <script/script.h>
 #include <serialize.h>
 #include <uint256.h>
-#include <fs.h>
+#include <util/fs.h>
 
 #include <cstdint>
 #include <string>
@@ -96,7 +96,7 @@ struct WithdrawalJournalEntry {
 
     WithdrawalJournalState GetState() const { return static_cast<WithdrawalJournalState>(state); }
     void SetState(WithdrawalJournalState s) { state = static_cast<uint8_t>(s); }
-    COutPoint Outpoint() const { return COutPoint(sidechain_txid, sidechain_vout); }
+    COutPoint Outpoint() const { return COutPoint(Txid::FromUint256(sidechain_txid), sidechain_vout); }
 };
 
 //! Path of the journal file inside a data directory.

@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <clientversion.h>
 #include <chainparams.h>
 #include <checkqueue.h>
@@ -23,7 +24,6 @@
 #include <validation.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
-#include <util/system.h>
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -42,13 +42,13 @@ std::vector<std::vector<unsigned char> > witness_stack = {
 
 std::vector<unsigned char> pegin_transaction = ParseHex("020000000101f321df9790633bc33c67239c4174df8142ee616ee6a2e2788fe4820fe70e9bce0100004000ffffffff0201ef4699c160d014d5ff79636d8a4cb990b9df4ebab649f144d19f5c495c585e4701000000003b9ab2e0001976a914809326f7628dc976fbe63806479a1b8dfcc8c4b988ac01ef4699c160d014d5ff79636d8a4cb990b9df4ebab649f144d19f5c495c585e47010000000000001720000000000000000002483045022100ae17064745d80650a6a5cbcbe15c8c45ba498d1c6f45a7c0f5f32d871b463fc60220799f2836471702c21f7cfe124651727b530ad41f7af4dc213c65f5030a2f6fc4012103a9d3c6c7c161a565a76113632fe13330cf2c0207ba79a76d1154cdc3cb94d940060800ca9a3b0000000020ef4699c160d014d5ff79636d8a4cb990b9df4ebab649f144d19f5c495c585e472006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f1600141eef6361cd1507a303834285d1521d6baf1b19aebe0200000001b399292c8100b8a1b66eb23896f799c1712390d560af0f70e81acd2d17a3b06e0000000049483045022100c3c749623486ea57ea93dfaf78d85590d78c7590a25768fe80f0ea4d6047419002202a0a00a90392b86c53c0fdda908c4591ba28040c16c25734c23b7df3c8b70acd01feffffff0228196bee000000001976a914470dd41542ee1a1bd75f1a838878648c8d65622488ac00ca9a3b0000000017a914cb60b1d7f76ba12b45a116c482c165a74c5d7e38876500000097000000205e3913a320cd2e3a2efa141e47419f54cb9e82320cf8dbc812fc19b9a1b2413a57f5e9fb4fa22de191454a241387f5d10cc794ee0fbf72ae2841baf3129a4eab8133025affff7f20000000000200000002f9d0be670007d38fceece999cb6144658a99c307ccc37f6d8f69129ed0f4545ff321df9790633bc33c67239c4174df8142ee616ee6a2e2788fe4820fe70e9bce010500000000");
 
-COutPoint prevout(uint256S("ce9b0ee70f82e48f78e2a2e66e61ee4281df74419c23673cc33b639097df21f3"), 1);
+COutPoint prevout(Txid::FromUint256(uint256S("ce9b0ee70f82e48f78e2a2e66e61ee4281df74419c23673cc33b639097df21f3")), 1);
 
 const std::string fedpegscript_str = "512103dff4923d778550cc13ce0d887d737553b4b58f4e8e886507fc39f5e447b2186451ae";
 
 // Needed for easier parent PoW check, and setting fedpegscript
 struct FedpegSetup : public BasicTestingSetup {
-        FedpegSetup() : BasicTestingSetup("custom", fedpegscript_str) {}
+        FedpegSetup() : BasicTestingSetup(ChainType::CUSTOM, {}, fedpegscript_str) {}
 };
 
 BOOST_FIXTURE_TEST_SUITE(pegin_witness_tests, FedpegSetup)
@@ -66,7 +66,7 @@ BOOST_AUTO_TEST_CASE(witness_valid)
     CScript fedpeg_program(GetScriptForDestination(ScriptHash(GetScriptForDestination(WitnessV0ScriptHash(fedpegscript)))));
     std::vector<std::pair<CScript, CScript>> fedpegscripts;
     // TODO test with additional scripts
-    fedpegscripts.push_back(std::make_pair(fedpeg_program, fedpegscript));
+    fedpegscripts.emplace_back(fedpeg_program, fedpegscript);
 
     bool valid = IsValidPeginWitness(witness, fedpegscripts, prevout, err, false);
     BOOST_CHECK(err == "");
@@ -88,7 +88,7 @@ BOOST_AUTO_TEST_CASE(witness_valid)
 
     // Test mismatched but valid txid
     fake_prevout = prevout;
-    fake_prevout.hash = uint256S("2f103ee04a5649eecb932b4da4ca9977f53a12bbe04d9d1eb5ccc0f4a06334");
+    fake_prevout.hash = Txid::FromUint256(uint256S("2f103ee04a5649eecb932b4da4ca9977f53a12bbe04d9d1eb5ccc0f4a06334"));
     BOOST_CHECK(!IsValidPeginWitness(witness, fedpegscripts, fake_prevout, err, false));
 
     // Ensure that all witness stack sizes are handled
@@ -105,10 +105,10 @@ BOOST_AUTO_TEST_CASE(witness_valid)
     witness.stack = witness_stack;
 
     // Check validation of peg-in transaction's inputs and balance
-    CDataStream ssTx(pegin_transaction, SER_NETWORK, PROTOCOL_VERSION);
+    DataStream ssTx(pegin_transaction);
     CTransactionRef txRef;
     try {
-        ssTx >> txRef;
+        ssTx >> TX_WITH_WITNESS(txRef);
     } catch (...) {
         BOOST_CHECK(false);
         return;
@@ -131,7 +131,7 @@ BOOST_AUTO_TEST_CASE(witness_valid)
     CCoinsViewCache coins(&coinsDummy);
     // Get the latest block index to look up fedpegscripts
     // For these tests, should be genesis-block-hardcoded consensus.fedpegscript
-    BOOST_CHECK(Consensus::CheckTxInputs(tx, state, coins, 0, fee_map, setPeginsSpent, NULL, false, true, fedpegscripts));
+    BOOST_CHECK(Consensus::CheckTxInputs(tx, state, coins, 0, fee_map, setPeginsSpent, nullptr, false, true, fedpegscripts));
     BOOST_CHECK(setPeginsSpent.size() == 1);
     setPeginsSpent.clear();
 
@@ -139,7 +139,7 @@ BOOST_AUTO_TEST_CASE(witness_valid)
     CMutableTransaction mtxn(tx);
     mtxn.witness.vtxinwit[0].m_pegin_witness.SetNull();
     CTransaction tx2(mtxn);
-    BOOST_CHECK(!Consensus::CheckTxInputs(tx2, state, coins, 0, fee_map, setPeginsSpent, NULL, false, true, fedpegscripts));
+    BOOST_CHECK(!Consensus::CheckTxInputs(tx2, state, coins, 0, fee_map, setPeginsSpent, nullptr, false, true, fedpegscripts));
     BOOST_CHECK(setPeginsSpent.empty());
 
     // Invalidate peg-in (and spending) authorization by pegin marker.
@@ -148,7 +148,7 @@ BOOST_AUTO_TEST_CASE(witness_valid)
     CMutableTransaction mtxn2(tx);
     mtxn2.vin[0].m_is_pegin = false;
     CTransaction tx3(mtxn2);
-    BOOST_CHECK(!Consensus::CheckTxInputs(tx3, state, coins, 0, fee_map, setPeginsSpent, NULL, false, true, fedpegscripts));
+    BOOST_CHECK(!Consensus::CheckTxInputs(tx3, state, coins, 0, fee_map, setPeginsSpent, nullptr, false, true, fedpegscripts));
     BOOST_CHECK(setPeginsSpent.empty());
 
 
@@ -550,8 +550,7 @@ BOOST_AUTO_TEST_CASE(persistent_parent_replay_store_restart_identity_and_corrupt
     // A malformed durable tip is never interpreted as an empty or usable
     // index. The caller can safely rebuild this derived database from genesis.
     {
-        CDBWrapper raw(path, 1 << 20, /*fMemory=*/false,
-                       /*fWipe=*/false, /*obfuscate=*/false);
+        CDBWrapper raw({.path = path, .cache_bytes = 1 << 20});
         BOOST_REQUIRE(raw.Write(uint8_t{'T'}, std::string{"malformed"}, true));
     }
     {
@@ -602,7 +601,7 @@ BOOST_AUTO_TEST_CASE(drivechain_m5_address_output_value_is_not_part_of_deposit_a
     block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
     block.vtx.push_back(deposit_ref);
 
-    const COutPoint claimed_outpoint(deposit_ref->GetHash(), 0);
+    const COutPoint claimed_outpoint(Txid::FromUint256(deposit_ref->GetHash()), 0);
     const std::map<Bitcoin::COutPoint, Bitcoin::CTxOut> previous_outputs{
         {previous_treasury, previous.vout[0]},
     };
@@ -621,7 +620,7 @@ BOOST_AUTO_TEST_CASE(drivechain_m5_address_output_value_is_not_part_of_deposit_a
         Bitcoin::MakeTransactionRef(std::move(fabricated_coinbase));
     Bitcoin::CBlock fabricated_block;
     fabricated_block.vtx.push_back(fabricated_ref);
-    const COutPoint fabricated_outpoint(fabricated_ref->GetHash(), 0);
+    const COutPoint fabricated_outpoint(Txid::FromUint256(fabricated_ref->GetHash()), 0);
     BOOST_CHECK(!MatchDrivechainDepositInBlock(
         fabricated_block, sidechain_slot, fabricated_outpoint, deposit_value,
         address, {}, &err));
@@ -1247,9 +1246,9 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_replay_sequences_usdd_root_and_native_elw
         "030201000700000000ffffffff02272300000000000004b401185101000000000000"
         "00296a27555344444d3601dd6833a6a2db112477ab453d2886af0c9154de56f5e"
         "8fc8717e3f7974186b36700000000");
-    CDataStream root_stream(root_raw, SER_NETWORK, PROTOCOL_VERSION);
+    DataStream root_stream(root_raw);
     Bitcoin::CMutableTransaction root_m6;
-    root_stream >> root_m6;
+    root_stream >> TX_WITH_WITNESS(root_m6);
     BOOST_REQUIRE(root_stream.empty());
     const Bitcoin::CTransaction root_tx(root_m6);
     BOOST_REQUIRE_EQUAL(root_tx.vin.size(), 1U);
@@ -1352,9 +1351,9 @@ BOOST_AUTO_TEST_CASE(drivechain_m6id_matches_usdd_and_enforcer_vector)
         "030201000700000000ffffffff02272300000000000004b401185101000000000000"
         "00296a27555344444d3601dd6833a6a2db112477ab453d2886af0c9154de56f5e"
         "8fc8717e3f7974186b36700000000");
-    CDataStream stream(raw, SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream(raw);
     Bitcoin::CMutableTransaction mutable_tx;
-    stream >> mutable_tx;
+    stream >> TX_WITH_WITNESS(mutable_tx);
     BOOST_REQUIRE(stream.empty());
     const Bitcoin::CTransaction transaction(mutable_tx);
     BOOST_CHECK_EQUAL(
@@ -1502,18 +1501,17 @@ BOOST_AUTO_TEST_CASE(drivechain_activation_block_deposit_is_mintable)
 BOOST_AUTO_TEST_CASE(drivechain_deposit_outputs_are_bound_to_mainchain_address)
 {
     const COutPoint deposit_outpoint(
-        uint256S("00000000000000000000000000000000000000000000000000000000000000dd"), 2);
+        Txid::FromUint256(uint256S("00000000000000000000000000000000000000000000000000000000000000dd")), 2);
     const uint256 block_hash = uint256S("00000000000000000000000000000000000000000000000000000000000000ee");
     const CAmount deposit_value = 100000;
     const CAmount fee = 1000;
-    uint160 destination_hash;
-    destination_hash.SetHex("0000000000000000000000000000000000001234");
+    const uint160 destination_hash{ParseHex("3412000000000000000000000000000000000000")};
     const CTxDestination destination = WitnessV0KeyHash(destination_hash);
     const std::string address_string = EncodeDestination(destination);
     const std::vector<unsigned char> address(address_string.begin(), address_string.end());
 
     CMutableTransaction mtx;
-    mtx.nVersion = 2;
+    mtx.version = 2;
     CTxIn pegin_input(deposit_outpoint, CScript(), CTxIn::SEQUENCE_FINAL);
     pegin_input.m_is_pegin = true;
     mtx.vin.push_back(pegin_input);
@@ -1552,7 +1550,7 @@ BOOST_AUTO_TEST_CASE(drivechain_deposit_outputs_are_bound_to_mainchain_address)
     BOOST_CHECK(!CheckDrivechainDepositOutputs(CTransaction(inflated), 0, err));
 
     CMutableTransaction extra_input = mtx;
-    extra_input.vin.push_back(CTxIn(COutPoint(uint256::ONE, 0)));
+    extra_input.vin.push_back(CTxIn(COutPoint(Txid::FromUint256(uint256::ONE), 0)));
     extra_input.witness.vtxinwit.resize(2);
     BOOST_CHECK(CheckDrivechainDepositOutputs(CTransaction(extra_input), 0, err));
     BOOST_CHECK(!IsCanonicalFeeFreeDrivechainDeposit(CTransaction(extra_input)));
@@ -1783,14 +1781,14 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)
     }
 
     Bitcoin::CMutableTransaction blinded;
-    blinded.nVersion = 2;
+    blinded.version = 2;
     blinded.vout.emplace_back(0, CScript() << OP_RETURN << fee_bytes);
     blinded.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x42));
     blinded.vout.emplace_back(payout_value, CScript() << OP_TRUE);
     const uint256 m6id = blinded.GetHash();
 
     Bitcoin::CMutableTransaction m6;
-    m6.nVersion = 2;
+    m6.version = 2;
     m6.vin.emplace_back(initial_ctip);
     m6.vout.emplace_back(new_treasury_value, treasury_script);
     m6.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x42));
@@ -1901,7 +1899,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)
         << OP_NOP5 << std::vector<unsigned char>{auxiliary_slot} << OP_TRUE;
 
     Bitcoin::CMutableTransaction auxiliary_blinded;
-    auxiliary_blinded.nVersion = 2;
+    auxiliary_blinded.version = 2;
     auxiliary_blinded.vout.emplace_back(0, CScript() << OP_RETURN << fee_bytes);
     auxiliary_blinded.vout.emplace_back(
         0, CScript() << OP_RETURN << std::vector<unsigned char>(32, 0x43));
@@ -1909,7 +1907,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)
     const uint256 auxiliary_m6id = auxiliary_blinded.GetHash();
 
     Bitcoin::CMutableTransaction auxiliary_m6;
-    auxiliary_m6.nVersion = 2;
+    auxiliary_m6.version = 2;
     auxiliary_m6.vin.emplace_back(auxiliary_initial_ctip);
     auxiliary_m6.vout.emplace_back(auxiliary_new_value, auxiliary_treasury_script);
     auxiliary_m6.vout.emplace_back(

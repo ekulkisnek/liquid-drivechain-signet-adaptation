@@ -13,6 +13,9 @@ from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 class EcxConsensusIdentityTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
+
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 4
@@ -278,4 +281,4 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
 
 
 if __name__ == "__main__":
-    EcxConsensusIdentityTest().main()
+    EcxConsensusIdentityTest(__file__).main()

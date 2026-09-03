@@ -16,7 +16,7 @@ private:
     std::vector<secp256k1_pubkey> m_online_keys;
 
 public:
-    CPAKList() {}
+    CPAKList() = default;
     /**
      * Creates a new CPAKList. Requires that the number of offline keys is the same as the number of online keys
      * and that this number is not larger than SECP256K1_WHITELIST_MAX_N_KEYS.
@@ -67,5 +67,7 @@ CPAKList GetActivePAKList(const CBlockIndex* pblockindex, const Consensus::Param
 bool IsPAKValidOutput(const CTxOut& txout, const CPAKList& paklist, const uint256& parent_gen_hash, const CAsset& peg_asset);
 
 bool IsPAKValidTx(const CTransaction& tx, const CPAKList& paklist, const uint256& parent_gen_hash, const CAsset& peg_asset);
+
+bool HasConfidentialPegoutOutput(const CTransaction& tx, const uint256& parent_gen_hash);
 
 #endif // BITCOIN_PRIMITIVES_PAK_H

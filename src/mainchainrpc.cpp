@@ -5,18 +5,18 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <common/args.h>
+#include <logging.h>
 #include <chainparamsbase.h>
 #include <consensus/merkle.h>
 #include <drivechain_parent_replay.h>
 #include <elements_drivechain_identity.h>
 #include <hash.h>
-#include <logging.h>
 #include <primitives/block.h>
 #include <primitives/bitcoin/block.h>
 #include <script/script.h>
 #include <signet.h>
 #include <streams.h>
-#include <util/system.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <rpc/request.h>
@@ -298,10 +298,8 @@ DrivechainUntrustedParentAdmission::~DrivechainUntrustedParentAdmission()
 /** Reply structure for request_done to fill in */
 struct HTTPReply
 {
-    HTTPReply(): status(0), error(-1) {}
-
-    int status;
-    int error;
+    int status{0};
+    int error{-1};
     bool body_too_large{false};
     std::string body;
 };
@@ -332,8 +330,8 @@ static void http_request_done(struct evhttp_request *req, void *ctx)
 {
     HTTPReply *reply = static_cast<HTTPReply*>(ctx);
 
-    if (req == NULL) {
-        /* If req is NULL, it means an error occurred while connecting: the
+    if (req == nullptr) {
+        /* If req is nullptr, it means an error occurred while connecting: the
          * error code will have been passed to http_error_cb.
          */
         reply->status = 0;
@@ -398,7 +396,7 @@ static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const Un
 
     HTTPReply response;
     raii_evhttp_request req = obtain_evhttp_request(http_request_done, (void*)&response);
-    if (req == NULL)
+    if (req == nullptr)
         throw std::runtime_error("create http request failed");
 #if LIBEVENT_VERSION_NUMBER >= 0x02010300
     evhttp_request_set_error_cb(req.get(), http_error_cb);
@@ -487,11 +485,11 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params)
 static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
 {
     const UniValue reply = CallMainChainRPC(method, params);
-    const UniValue& error = find_value(reply, "error");
+    const UniValue& error = reply["error"];
     if (!error.isNull()) {
         throw std::runtime_error(strprintf("%s returned error: %s", method, error.write()));
     }
-    const UniValue& result = find_value(reply, "result");
+    const UniValue& result = reply["result"];
     if (result.isNull()) {
         throw std::runtime_error(strprintf("%s returned no result", method));
     }
@@ -591,7 +589,7 @@ bool ReadRawBitcoinHeader(const uint256& hash, Bitcoin::CBlockHeader& header, st
     }
     CheckDrivechainParentDeadline();
     try {
-        CDataStream stream(ParseHex(raw.get_str()), SER_NETWORK, PROTOCOL_VERSION);
+        DataStream stream{ParseHex(raw.get_str())};
         stream >> header;
         if (!stream.empty()) return SetError(error, "raw parent header has trailing bytes");
     } catch (const std::exception& e) {
@@ -645,18 +643,18 @@ bool GetVerifiedActiveMainchainHeader(const uint256& expected_hash, const int mi
     if (!metadata.isObject()) return SetError(error, "getblockheader result is not an object");
 
     uint256 returned_hash;
-    if (!ParseCanonicalHash(find_value(metadata.get_obj(), "hash"), returned_hash) || returned_hash != expected_hash) {
+    if (!ParseCanonicalHash(metadata.get_obj()["hash"], returned_hash) || returned_hash != expected_hash) {
         return SetError(error, "getblockheader hash does not match requested parent block");
     }
-    const UniValue& height = find_value(metadata.get_obj(), "height");
-    const UniValue& confirmations = find_value(metadata.get_obj(), "confirmations");
-    const UniValue& chainwork = find_value(metadata.get_obj(), "chainwork");
+    const UniValue& height = metadata.get_obj()["height"];
+    const UniValue& confirmations = metadata.get_obj()["confirmations"];
+    const UniValue& chainwork = metadata.get_obj()["chainwork"];
     uint256 parsed_chainwork;
     if (!height.isNum() || !confirmations.isNum() || !ParseCanonicalHash(chainwork, parsed_chainwork)) {
         return SetError(error, "getblockheader is missing canonical height, confirmations, or chainwork");
     }
-    const int64_t parsed_height = height.get_int64();
-    const int64_t parsed_confirmations = confirmations.get_int64();
+    const int64_t parsed_height = height.getInt<int64_t>();
+    const int64_t parsed_confirmations = confirmations.getInt<int64_t>();
     if (parsed_height < 0 || parsed_height > std::numeric_limits<uint32_t>::max() ||
         parsed_confirmations < min_confirmations) {
         return SetError(error, strprintf("parent block has %d confirmations; %d required",
@@ -674,7 +672,7 @@ bool GetVerifiedActiveMainchainHeader(const uint256& expected_hash, const int mi
     Bitcoin::CBlockHeader raw_header;
     if (!ReadRawBitcoinHeader(expected_hash, raw_header, error)) return false;
 
-    const UniValue& previous = find_value(metadata.get_obj(), "previousblockhash");
+    const UniValue& previous = metadata.get_obj()["previousblockhash"];
     if (parsed_height == 0) {
         if (!previous.isNull() || !raw_header.hashPrevBlock.IsNull()) {
             return SetError(error, "parent genesis unexpectedly has a predecessor");
@@ -695,11 +693,11 @@ bool GetVerifiedActiveMainchainHeader(const uint256& expected_hash, const int mi
         if (!previous_metadata.isObject()) return SetError(error, "previous getblockheader result is not an object");
         uint256 returned_previous_hash;
         uint256 previous_chainwork;
-        const UniValue& previous_height = find_value(previous_metadata.get_obj(), "height");
-        if (!ParseCanonicalHash(find_value(previous_metadata.get_obj(), "hash"), returned_previous_hash) ||
+        const UniValue& previous_height = previous_metadata.get_obj()["height"];
+        if (!ParseCanonicalHash(previous_metadata.get_obj()["hash"], returned_previous_hash) ||
             returned_previous_hash != previous_hash ||
-            !ParseCanonicalHash(find_value(previous_metadata.get_obj(), "chainwork"), previous_chainwork) ||
-            !previous_height.isNum() || previous_height.get_int64() != parsed_height - 1) {
+            !ParseCanonicalHash(previous_metadata.get_obj()["chainwork"], previous_chainwork) ||
+            !previous_height.isNum() || previous_height.getInt<int64_t>() != parsed_height - 1) {
             return SetError(error, "previous parent metadata is not canonical or contiguous");
         }
         const arith_uint256 block_proof = GetParentBlockProof(raw_header.nBits);
@@ -733,8 +731,8 @@ bool ReadAuthenticatedRawMainchainBlock(const uint256& hash,
     if (!raw.isStr() || !IsHex(raw.get_str())) return SetError(error, "getblock returned non-hex raw block data");
     CheckDrivechainParentDeadline();
     try {
-        CDataStream stream(ParseHex(raw.get_str()), SER_NETWORK, PROTOCOL_VERSION);
-        stream >> block;
+        DataStream stream{ParseHex(raw.get_str())};
+        stream >> TX_WITH_WITNESS(block);
         if (!stream.empty()) return SetError(error, "raw parent block has trailing bytes");
     } catch (const std::exception& e) {
         return SetError(error, strprintf("cannot decode raw parent block: %s", e.what()));
@@ -2050,7 +2048,7 @@ bool ParseDrivechainParentHeader(const UniValue& header,
         return false;
     }
 
-    const UniValue& hash = find_value(header.get_obj(), "hash");
+    const UniValue& hash = header.get_obj()["hash"];
     if (!hash.isStr() || hash.get_str().size() != 64 || !IsHex(hash.get_str())) {
         if (error) *error = "getblockheader result has no canonical 32-byte hash";
         return false;
@@ -2064,13 +2062,13 @@ bool ParseDrivechainParentHeader(const UniValue& header,
     // Do not accept strings or a fallback `time` field.  This value becomes
     // consensus-visible, so only Bitcoin Core's numeric `mediantime` result is
     // accepted and it must fit the uint32 timestamps from which MTP is formed.
-    const UniValue& mtp = find_value(header.get_obj(), "mediantime");
+    const UniValue& mtp = header.get_obj()["mediantime"];
     if (!mtp.isNum()) {
         if (error) *error = "getblockheader result has no numeric mediantime";
         return false;
     }
     try {
-        const int64_t parsed = mtp.get_int64();
+        const int64_t parsed = mtp.getInt<int64_t>();
         if (parsed < 0 || static_cast<uint64_t>(parsed) > std::numeric_limits<uint32_t>::max()) {
             if (error) *error = "getblockheader mediantime is outside the uint32 timestamp range";
             return false;
@@ -2135,7 +2133,7 @@ bool ReadActiveMainchainHeight(uint32_t& height, std::string* error)
         return SetError(error, "parent getblockcount returned a non-numeric height");
     }
     try {
-        const int64_t parsed = result.get_int64();
+        const int64_t parsed = result.getInt<int64_t>();
         if (parsed < 0 || parsed > std::numeric_limits<uint32_t>::max()) {
             return SetError(error, "parent tip height is outside the supported uint32 range");
         }
@@ -2259,7 +2257,7 @@ uint256 DrivechainParentReplayStoreIdentity(const Consensus::Params& consensus)
 {
     assert(consensus.drivechain_slot.has_value());
     assert(consensus.drivechain_proposal_hash.has_value());
-    CHashWriter writer(SER_GETHASH, 0);
+    HashWriter writer;
     writer << std::string{"ELEMENTS_AUTHENTICATED_PARENT_REPLAY_STORE_V4"}
            << std::string{ElementsDrivechainIdentity::BIP300301_ENFORCER_REVISION}
            << std::string{ElementsDrivechainIdentity::BIP300301_LOCAL_RULE_DOMAIN}
@@ -2425,7 +2423,7 @@ bool InitializeDrivechainParentReplayCache(DrivechainParentReplayCache& cache,
     if (ElementsDrivechainBootstrap::ENABLED) {
         const uint256 expected_bootstrap_commitment = uint256S(
             ElementsDrivechainIdentity::PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT);
-        CHashWriter bootstrap_writer(SER_GETHASH, 0);
+        HashWriter bootstrap_writer;
         bootstrap_writer
             << std::string{"ELEMENTS_ALPHANET_PARENT_REPLAY_BOOTSTRAP_V1"}
             << consensus.drivechain_parent_state_height
@@ -2875,11 +2873,11 @@ DrivechainParentProbeStatus ProbeActiveDrivechainParent(
     params.push_back(parent_hash.GetHex());
     params.push_back(true);
     const UniValue reply = CallMainChainRPC("getblockheader", params);
-    const UniValue& rpc_error = find_value(reply, "error");
+    const UniValue& rpc_error = reply["error"];
     if (!rpc_error.isNull()) {
         if (rpc_error.isObject()) {
-            const UniValue& code = find_value(rpc_error.get_obj(), "code");
-            if (code.isNum() && code.get_int64() == -5) {
+            const UniValue& code = rpc_error.get_obj()["code"];
+            if (code.isNum() && code.getInt<int64_t>() == -5) {
                 if (error) *error = "committed parent hash is unknown to the authenticated parent node";
                 return DrivechainParentProbeStatus::REJECTED;
             }
@@ -2888,21 +2886,21 @@ DrivechainParentProbeStatus ProbeActiveDrivechainParent(
         return DrivechainParentProbeStatus::UNAVAILABLE;
     }
 
-    const UniValue& result = find_value(reply, "result");
+    const UniValue& result = reply["result"];
     if (!result.isObject()) {
         if (error) *error = "getblockheader returned no canonical metadata object";
         return DrivechainParentProbeStatus::UNAVAILABLE;
     }
     uint256 returned_hash;
-    const UniValue& height = find_value(result.get_obj(), "height");
-    const UniValue& confirmations = find_value(result.get_obj(), "confirmations");
-    if (!ParseCanonicalHash(find_value(result.get_obj(), "hash"), returned_hash) ||
+    const UniValue& height = result.get_obj()["height"];
+    const UniValue& confirmations = result.get_obj()["confirmations"];
+    if (!ParseCanonicalHash(result.get_obj()["hash"], returned_hash) ||
         returned_hash != parent_hash || !height.isNum() || !confirmations.isNum()) {
         if (error) *error = "getblockheader returned noncanonical parent metadata";
         return DrivechainParentProbeStatus::UNAVAILABLE;
     }
-    const int64_t parsed_height = height.get_int64();
-    const int64_t parsed_confirmations = confirmations.get_int64();
+    const int64_t parsed_height = height.getInt<int64_t>();
+    const int64_t parsed_confirmations = confirmations.getInt<int64_t>();
     if (parsed_height < 0 || parsed_height > std::numeric_limits<uint32_t>::max()) {
         if (error) *error = "committed parent height is outside the supported uint32 range";
         return DrivechainParentProbeStatus::UNAVAILABLE;
@@ -3320,7 +3318,7 @@ bool WarmDrivechainParentState(std::string* error)
         if (!height_value.isNum()) {
             return SetError(error, "parent getblockcount returned a non-numeric height");
         }
-        const int64_t height = height_value.get_int64();
+        const int64_t height = height_value.getInt<int64_t>();
         if (height < 0 || height > std::numeric_limits<uint32_t>::max()) {
             return SetError(error, "parent tip height is outside the supported uint32 range");
         }
@@ -3553,27 +3551,27 @@ bool IsConfirmedBitcoinBlock(const uint256& hash, const int nMinConfirmationDept
         UniValue params(UniValue::VARR);
         params.push_back(hash.GetHex());
         UniValue reply = CallMainChainRPC("getblockheader", params);
-        UniValue errval = find_value(reply, "error");
+        const UniValue& errval = reply.find_value("error");
         if (!errval.isNull()) {
             LogPrintf("WARNING: Got error reply from bitcoind getblockheader: %s\n", errval.write());
             return false;
         }
-        UniValue result = find_value(reply, "result");
+        const UniValue& result = reply.find_value("result");
         if (!result.isObject()) {
             LogPrintf("ERROR: bitcoind getblockheader result was malformed (not object): %s\n", result.write());
             return false;
         }
 
-        UniValue confirmations = find_value(result.get_obj(), "confirmations");
-        if (!confirmations.isNum() || confirmations.get_int64() < nMinConfirmationDepth) {
+        UniValue confirmations = result.get_obj().find_value("confirmations");
+        if (!confirmations.isNum() || confirmations.getInt<int64_t>() < nMinConfirmationDepth) {
             LogPrintf("Insufficient confirmations (got %s, need at least %d).\n", confirmations.write(), nMinConfirmationDepth);
             return false;
         }
 
         // Only perform extra test if nbTxs has been provided (non-zero).
         if (nbTxs != 0) {
-            UniValue nTx = find_value(result.get_obj(), "nTx");
-            if (!nTx.isNum() || nTx.get_int64() != nbTxs) {
+            UniValue nTx = result.get_obj().find_value("nTx");
+            if (!nTx.isNum() || nTx.getInt<int64_t>() != nbTxs) {
                 LogPrintf("ERROR: Invalid number of transactions in merkle block for %s (got %s, need exactly %d)\n",
                         hash.GetHex(), nTx.write(), nbTxs);
                 return false;

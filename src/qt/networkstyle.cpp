@@ -1,29 +1,35 @@
-// Copyright (c) 2014-2020 The Bitcoin Core developers
+// Copyright (c) 2014-2021 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#if defined(HAVE_CONFIG_H)
+#include <config/bitcoin-config.h>
+#endif
 
 #include <qt/networkstyle.h>
 
 #include <qt/guiconstants.h>
 
-#include <chainparamsbase.h>
 #include <tinyformat.h>
+#include <util/chaintype.h>
 
 #include <QApplication>
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 
 static const struct {
-    const char *networkId;
+    const ChainType networkId;
     const char *appName;
     const int iconColorHueShift;
     const int iconColorSaturationReduction;
 } network_styles[] = {
-    {"elements", QAPP_APP_NAME_ELEMENTS, 0, 0},
-    {"main", QAPP_APP_NAME_DEFAULT, 0, 0},
-    {"test", QAPP_APP_NAME_TESTNET, 70, 30},
-    {"liquidv1", QAPP_APP_NAME_LIQUID, 0, 0},
-    {"liquidtestnet", QAPP_APP_NAME_LIQUIDTESTNET, 80, 80},
-    {"signet", QAPP_APP_NAME_SIGNET, 35, 15},
-    {"regtest", QAPP_APP_NAME_REGTEST, 160, 30}
+    {ChainType::ELEMENTS, QAPP_APP_NAME_ELEMENTS, 0, 0},
+    {ChainType::MAIN, QAPP_APP_NAME_DEFAULT, 0, 0},
+    {ChainType::TESTNET, QAPP_APP_NAME_TESTNET, 70, 30},
+    {ChainType::TESTNET4, QAPP_APP_NAME_TESTNET4, 70, 30},
+    {ChainType::SIGNET, QAPP_APP_NAME_SIGNET, 35, 15},
+    {ChainType::REGTEST, QAPP_APP_NAME_REGTEST, 160, 30},
+    {ChainType::LIQUID1, QAPP_APP_NAME_LIQUID, 0, 0},
+    {ChainType::LIQUIDTESTNET, QAPP_APP_NAME_LIQUIDTESTNET, 80, 80},
 };
 
 // titleAddText needs to be const char* for tr()
@@ -80,10 +86,10 @@ NetworkStyle::NetworkStyle(const QString &_appName, const int iconColorHueShift,
     trayAndWindowIcon   = QIcon(pixmap.scaled(QSize(256,256)));
 }
 
-const NetworkStyle* NetworkStyle::instantiate(const std::string& networkId)
+const NetworkStyle* NetworkStyle::instantiate(const ChainType networkId)
 {
-    const bool canonical_name = networkId == CBaseChainParams::ELEMENTS;
-    std::string titleAddText = canonical_name || networkId == "liquidv1" ? "" : strprintf("[%s]", networkId);
+    const bool canonical_name = networkId == ChainType::ELEMENTS;
+    std::string titleAddText = canonical_name || networkId == ChainType::LIQUID1 ? "" : strprintf("[%s]", ChainTypeToString(networkId));
     for (const auto& network_style : network_styles) {
         if (networkId == network_style.networkId)
             return new NetworkStyle(
@@ -93,9 +99,9 @@ const NetworkStyle* NetworkStyle::instantiate(const std::string& networkId)
                     titleAddText.c_str());
     }
     // If it doesn't match any, use regtest since it's a custom chain
-    assert(networkId != "regtest");
+    assert(networkId != ChainType::REGTEST);
     // but keep the chain name in the title
-    NetworkStyle* instance = const_cast<NetworkStyle*>(instantiate("regtest"));
+    NetworkStyle* instance = const_cast<NetworkStyle*>(instantiate(ChainType::REGTEST));
     instance->titleAddText = titleAddText.c_str();
     return instance;
 }

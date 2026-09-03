@@ -10,6 +10,7 @@ from test_framework.util import (
     get_datadir_path,
     rpc_port,
     p2p_port,
+    tor_port,
     assert_raises_rpc_error,
     assert_equal,
     find_vout_for_address,
@@ -54,6 +55,7 @@ class FedPegTest(BitcoinTestFramework):
                             help="Run test in dynafed activated chain, without a transition")
         parser.add_argument("--post_transition", dest="post_transition", default=False, action="store_true",
                             help="Run test in dynafed activated chain, after transition and additional epoch to invalidate old fedpegscript")
+        self.add_wallet_options(parser)
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -91,7 +93,16 @@ class FedPegTest(BitcoinTestFramework):
                     "-keypool=1",
                     "-listenonion=0",
                     "-addresstype=legacy", # To make sure bitcoind gives back p2pkh no matter version
-                    "-fallbackfee=0.0002"
+                    "-fallbackfee=0.0002",
+                    "-deprecatedrpc=create_bdb", # Required to create legacy (BDB) wallets on newer bitcoind
+                    # bitcoind reads bitcoin.conf, not the elements.conf the test framework
+                    # writes with bind=127.0.0.1, so the framework's collision-avoiding auto
+                    # -bind is skipped. Without an explicit -bind, bitcoind binds P2P on
+                    # 0.0.0.0:port and 127.0.0.1:port+1 (for incoming Tor connections), and
+                    # port+1 collides with the next node's port. Bind explicitly to avoid
+                    # the port+1 default.
+                    "-bind=127.0.0.1:%s" % p2p_port(n),
+                    "-bind=127.0.0.1:%s=onion" % tor_port(n),
                 ])
             else:
                 extra_args.extend([
@@ -211,8 +222,11 @@ class FedPegTest(BitcoinTestFramework):
         WSH_OP_TRUE = self.nodes[0].decodescript("51")["segwit"]["hex"]
         # We just randomize the keys a bit to get another valid fedpegscript
         tweaked = sidechain.tweakfedpegscript("f00dbabe")
-        assert sidechain.getaddressinfo(tweaked['p2wsh'])['iswitness']
-        assert not sidechain.getaddressinfo(tweaked['p2shwsh'])['iswitness']
+        # tweakfedpegscript returns parent-chain-encoded addresses, so decode them
+        # with the parent node when the parent is bitcoin (bcrt prefix, not ert).
+        # addr_node = parent if self.options.parent_bitcoin else sidechain
+        assert parent.getaddressinfo(tweaked['p2wsh'])['iswitness']
+        assert not parent.getaddressinfo(tweaked['p2shwsh'])['iswitness']
         new_fedpegscript = tweaked["script"]
         if self.options.post_transition:
             print("Running test post-transition")
@@ -237,7 +251,7 @@ class FedPegTest(BitcoinTestFramework):
         assert_equal(sidechain.decodescript(addrs["claim_script"])["type"], "witness_v0_keyhash")
         current_fedpegscript = sidechain.getsidechaininfo()["current_fedpegscripts"][0]
         tweaked = sidechain.tweakfedpegscript(addrs["claim_script"], current_fedpegscript)
-        if sidechain.getaddressinfo(addr)['iswitness']:
+        if parent.getaddressinfo(addr)['iswitness']:
             assert_equal(tweaked['p2wsh'], addr)
         else:
             assert_equal(tweaked['p2shwsh'], addr)
@@ -382,7 +396,7 @@ class FedPegTest(BitcoinTestFramework):
         pegtxid1 = sidechain.claimpegin(raw, proof)
         # Make sure a second pegin claim does not get accepted in the mempool when
         # another mempool tx already claims that pegin.
-        assert_raises_rpc_error(-4, "txn-mempool-conflict", sidechain.claimpegin, raw, proof)
+        assert_raises_rpc_error(-4, None, sidechain.claimpegin, raw, proof)
 
         # Will invalidate the block that confirms this transaction later
         for node_group in self.node_groups:
@@ -614,6 +628,12 @@ class FedPegTest(BitcoinTestFramework):
 
         peg_out_txid = sidechain.sendtomainchain(some_btc_addr, 1)
 
+        self.log.info("sendtomainchain with null argument")
+        verbose_result = sidechain.sendtomainchain(some_btc_addr, 1, None, True)
+        assert isinstance(verbose_result, dict)
+        assert 'txid' in verbose_result
+        assert 'fee_reason' in verbose_result
+
         peg_out_details = sidechain.decoderawtransaction(sidechain.getrawtransaction(peg_out_txid))
         # peg-out, change, fee
         assert len(peg_out_details["vout"]) == 3
@@ -707,8 +727,8 @@ class FedPegTest(BitcoinTestFramework):
         for node_group in self.node_groups:
             self.sync_all(node_group)
         unspent = [u for u in sidechain.listunspent(6, 6) if u["amount"] == 15][0]
-        assert(unspent["spendable"])
-        assert("amountcommitment" in unspent)
+        assert unspent["spendable"]
+        assert "amountcommitment" in unspent
         pegin.vin.append(CTxIn(COutPoint(int(unspent["txid"], 16), unspent["vout"])))
         # insert corresponding output before fee output
         new_destination = sidechain.getaddressinfo(sidechain.getnewaddress("", "blech32"))
@@ -726,22 +746,22 @@ class FedPegTest(BitcoinTestFramework):
         pegin_signed2 = sidechain.signrawtransactionwithwallet(raw_pegin_blinded2)
         for pegin_signed in [pegin_signed1, pegin_signed2]:
             final_decoded = sidechain.decoderawtransaction(pegin_signed["hex"])
-            assert(final_decoded["vin"][0]["is_pegin"])
-            assert(not final_decoded["vin"][1]["is_pegin"])
-            assert("assetcommitment" in final_decoded["vout"][0])
-            assert("valuecommitment" in final_decoded["vout"][0])
-            assert("commitmentnonce" in final_decoded["vout"][0])
-            assert("value" not in final_decoded["vout"][0])
-            assert("asset" not in final_decoded["vout"][0])
-            assert(final_decoded["vout"][0]["commitmentnonce_fully_valid"])
-            assert("assetcommitment" in final_decoded["vout"][1])
-            assert("valuecommitment" in final_decoded["vout"][1])
-            assert("commitmentnonce" in final_decoded["vout"][1])
-            assert("value" not in final_decoded["vout"][1])
-            assert("asset" not in final_decoded["vout"][1])
-            assert(final_decoded["vout"][1]["commitmentnonce_fully_valid"])
-            assert("value" in final_decoded["vout"][2])
-            assert("asset" in final_decoded["vout"][2])
+            assert final_decoded["vin"][0]["is_pegin"]
+            assert not final_decoded["vin"][1]["is_pegin"]
+            assert "assetcommitment" in final_decoded["vout"][0]
+            assert "valuecommitment" in final_decoded["vout"][0]
+            assert "commitmentnonce" in final_decoded["vout"][0]
+            assert "value" not in final_decoded["vout"][0]
+            assert "asset" not in final_decoded["vout"][0]
+            assert final_decoded["vout"][0]["commitmentnonce_fully_valid"]
+            assert "assetcommitment" in final_decoded["vout"][1]
+            assert "valuecommitment" in final_decoded["vout"][1]
+            assert "commitmentnonce" in final_decoded["vout"][1]
+            assert "value" not in final_decoded["vout"][1]
+            assert "asset" not in final_decoded["vout"][1]
+            assert final_decoded["vout"][1]["commitmentnonce_fully_valid"]
+            assert "value" in final_decoded["vout"][2]
+            assert "asset" in final_decoded["vout"][2]
             # check that it is accepted in either mempool
             accepted = sidechain.testmempoolaccept([pegin_signed["hex"]])[0]
             if not accepted["allowed"]:
@@ -760,4 +780,4 @@ class FedPegTest(BitcoinTestFramework):
         self.stop_node(1)
 
 if __name__ == '__main__':
-    FedPegTest().main()
+    FedPegTest(__file__).main()

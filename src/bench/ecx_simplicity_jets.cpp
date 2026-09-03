@@ -46,7 +46,7 @@ void BenchmarkNullary(benchmark::Bench& bench, unsigned int jet_index)
     {                                                          \
         BenchmarkNullary(bench, index);                        \
     }                                                          \
-    BENCHMARK(Bench_##name)
+    BENCHMARK(Bench_##name, benchmark::PriorityLevel::HIGH)
 
 ECX_NULLARY_BENCHMARK(prior_active_exchange_state_root_required, 0);
 ECX_NULLARY_BENCHMARK(prior_active_forced_inbox_root_required, 1);
@@ -80,7 +80,7 @@ void BenchmarkEvalNullary(benchmark::Bench& bench, unsigned int jet_index)
     {                                                          \
         BenchmarkEvalNullary(bench, index);                    \
     }                                                          \
-    BENCHMARK(Bench_eval_##name)
+    BENCHMARK(Bench_eval_##name, benchmark::PriorityLevel::HIGH)
 
 ECX_EVAL_NULLARY_BENCHMARK(prior_active_exchange_state_root_required, 0);
 ECX_EVAL_NULLARY_BENCHMARK(prior_active_forced_inbox_root_required, 1);
@@ -114,7 +114,7 @@ void BenchmarkDecode(benchmark::Bench& bench, unsigned int jet_index)
     {                                                          \
         BenchmarkDecode(bench, index);                         \
     }                                                          \
-    BENCHMARK(Bench_decode_##name)
+    BENCHMARK(Bench_decode_##name, benchmark::PriorityLevel::HIGH)
 
 ECX_DECODE_BENCHMARK(prior_active_exchange_state_root_required, 0);
 ECX_DECODE_BENCHMARK(prior_active_forced_inbox_root_required, 1);
@@ -170,67 +170,67 @@ static void Bench_decode_eval_prior_active_exchange_state_root_required(benchmar
 {
     BenchmarkDecodeEval(bench, 0);
 }
-BENCHMARK(Bench_decode_eval_prior_active_exchange_state_root_required)
+BENCHMARK(Bench_decode_eval_prior_active_exchange_state_root_required, benchmark::PriorityLevel::HIGH)
 
 static void Bench_decode_eval_bond_v2_insurance_reserve_input_required(benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 18);
 }
-BENCHMARK(Bench_decode_eval_bond_v2_insurance_reserve_input_required)
+BENCHMARK(Bench_decode_eval_bond_v2_insurance_reserve_input_required, benchmark::PriorityLevel::HIGH)
 
 static void Bench_decode_eval_verify_sp1_groth16_sha256_valid(benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 12, false);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_sha256_valid)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_sha256_tampered(benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 12, true);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_sha256_tampered)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_v3_public_values_v4_sha256_valid(
     benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 13, false);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v3_public_values_v4_sha256_valid)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v3_public_values_v4_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_v3_public_values_v4_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 13, true);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v3_public_values_v4_sha256_tampered)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v3_public_values_v4_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_v4_public_values_v5_sha256_valid(
     benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 14, false);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v4_public_values_v5_sha256_valid)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v4_public_values_v5_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_v4_public_values_v5_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 14, true);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v4_public_values_v5_sha256_tampered)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v4_public_values_v5_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_v5_incremental_activation_sha256_valid(
     benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 22, false);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v5_incremental_activation_sha256_valid)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v5_incremental_activation_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_decode_eval_verify_sp1_groth16_v5_incremental_activation_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkDecodeEval(bench, 22, true);
 }
-BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v5_incremental_activation_sha256_tampered)
+BENCHMARK(Bench_decode_eval_verify_sp1_groth16_v5_incremental_activation_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 static void Bench_bond_v2_insurance_reserve_input_required(benchmark::Bench& bench)
 {
@@ -240,7 +240,7 @@ static void Bench_bond_v2_insurance_reserve_input_required(benchmark::Bench& ben
         ankerl::nanobench::doNotOptimizeAway(ok);
     });
 }
-BENCHMARK(Bench_bond_v2_insurance_reserve_input_required)
+BENCHMARK(Bench_bond_v2_insurance_reserve_input_required, benchmark::PriorityLevel::HIGH)
 
 static void Bench_bond_v2_collateral_vault_input_required(benchmark::Bench& bench)
 {
@@ -250,7 +250,7 @@ static void Bench_bond_v2_collateral_vault_input_required(benchmark::Bench& benc
         ankerl::nanobench::doNotOptimizeAway(ok);
     });
 }
-BENCHMARK(Bench_bond_v2_collateral_vault_input_required)
+BENCHMARK(Bench_bond_v2_collateral_vault_input_required, benchmark::PriorityLevel::HIGH)
 
 static void Bench_eval_bond_v2_insurance_reserve_input_required(benchmark::Bench& bench)
 {
@@ -260,7 +260,7 @@ static void Bench_eval_bond_v2_insurance_reserve_input_required(benchmark::Bench
         ankerl::nanobench::doNotOptimizeAway(ok);
     });
 }
-BENCHMARK(Bench_eval_bond_v2_insurance_reserve_input_required)
+BENCHMARK(Bench_eval_bond_v2_insurance_reserve_input_required, benchmark::PriorityLevel::HIGH)
 
 static void Bench_eval_bond_v2_collateral_vault_input_required(benchmark::Bench& bench)
 {
@@ -270,7 +270,7 @@ static void Bench_eval_bond_v2_collateral_vault_input_required(benchmark::Bench&
         ankerl::nanobench::doNotOptimizeAway(ok);
     });
 }
-BENCHMARK(Bench_eval_bond_v2_collateral_vault_input_required)
+BENCHMARK(Bench_eval_bond_v2_collateral_vault_input_required, benchmark::PriorityLevel::HIGH)
 
 static void Bench_CheckSigVerify(benchmark::Bench& bench)
 {
@@ -280,7 +280,7 @@ static void Bench_CheckSigVerify(benchmark::Bench& bench)
         ankerl::nanobench::doNotOptimizeAway(ok);
     });
 }
-BENCHMARK(Bench_CheckSigVerify)
+BENCHMARK(Bench_CheckSigVerify, benchmark::PriorityLevel::HIGH)
 
 static void Bench_eval_CheckSigVerify(benchmark::Bench& bench)
 {
@@ -290,7 +290,7 @@ static void Bench_eval_CheckSigVerify(benchmark::Bench& bench)
         ankerl::nanobench::doNotOptimizeAway(ok);
     });
 }
-BENCHMARK(Bench_eval_CheckSigVerify)
+BENCHMARK(Bench_eval_CheckSigVerify, benchmark::PriorityLevel::HIGH)
 
 void BenchmarkGroth16(benchmark::Bench& bench, bool tampered)
 {
@@ -309,13 +309,13 @@ static void Bench_verify_sp1_groth16_sha256_valid(benchmark::Bench& bench)
 {
     BenchmarkGroth16(bench, false);
 }
-BENCHMARK(Bench_verify_sp1_groth16_sha256_valid)
+BENCHMARK(Bench_verify_sp1_groth16_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_verify_sp1_groth16_sha256_tampered(benchmark::Bench& bench)
 {
     BenchmarkGroth16(bench, true);
 }
-BENCHMARK(Bench_verify_sp1_groth16_sha256_tampered)
+BENCHMARK(Bench_verify_sp1_groth16_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 void BenchmarkActivationV5Groth16(benchmark::Bench& bench, bool tampered)
 {
@@ -335,14 +335,14 @@ static void Bench_verify_sp1_groth16_v5_incremental_activation_sha256_valid(
 {
     BenchmarkActivationV5Groth16(bench, false);
 }
-BENCHMARK(Bench_verify_sp1_groth16_v5_incremental_activation_sha256_valid)
+BENCHMARK(Bench_verify_sp1_groth16_v5_incremental_activation_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_verify_sp1_groth16_v5_incremental_activation_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkActivationV5Groth16(bench, true);
 }
-BENCHMARK(Bench_verify_sp1_groth16_v5_incremental_activation_sha256_tampered)
+BENCHMARK(Bench_verify_sp1_groth16_v5_incremental_activation_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 void BenchmarkEvalGroth16(benchmark::Bench& bench, bool tampered)
 {
@@ -361,13 +361,13 @@ static void Bench_eval_verify_sp1_groth16_sha256_valid(benchmark::Bench& bench)
 {
     BenchmarkEvalGroth16(bench, false);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_sha256_valid)
+BENCHMARK(Bench_eval_verify_sp1_groth16_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_eval_verify_sp1_groth16_sha256_tampered(benchmark::Bench& bench)
 {
     BenchmarkEvalGroth16(bench, true);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_sha256_tampered)
+BENCHMARK(Bench_eval_verify_sp1_groth16_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 void BenchmarkEvalPublicValuesGroth16(
     benchmark::Bench& bench, unsigned int version, bool tampered)
@@ -393,28 +393,28 @@ static void Bench_eval_verify_sp1_groth16_v3_public_values_v4_sha256_valid(
 {
     BenchmarkEvalPublicValuesGroth16(bench, 4, false);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_v3_public_values_v4_sha256_valid)
+BENCHMARK(Bench_eval_verify_sp1_groth16_v3_public_values_v4_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_eval_verify_sp1_groth16_v3_public_values_v4_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkEvalPublicValuesGroth16(bench, 4, true);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_v3_public_values_v4_sha256_tampered)
+BENCHMARK(Bench_eval_verify_sp1_groth16_v3_public_values_v4_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 static void Bench_eval_verify_sp1_groth16_v4_public_values_v5_sha256_valid(
     benchmark::Bench& bench)
 {
     BenchmarkEvalPublicValuesGroth16(bench, 5, false);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_v4_public_values_v5_sha256_valid)
+BENCHMARK(Bench_eval_verify_sp1_groth16_v4_public_values_v5_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_eval_verify_sp1_groth16_v4_public_values_v5_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkEvalPublicValuesGroth16(bench, 5, true);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_v4_public_values_v5_sha256_tampered)
+BENCHMARK(Bench_eval_verify_sp1_groth16_v4_public_values_v5_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 void BenchmarkEvalActivationV5Groth16(benchmark::Bench& bench, bool tampered)
 {
@@ -435,13 +435,13 @@ static void Bench_eval_verify_sp1_groth16_v5_incremental_activation_sha256_valid
 {
     BenchmarkEvalActivationV5Groth16(bench, false);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_v5_incremental_activation_sha256_valid)
+BENCHMARK(Bench_eval_verify_sp1_groth16_v5_incremental_activation_sha256_valid, benchmark::PriorityLevel::LOW)
 
 static void Bench_eval_verify_sp1_groth16_v5_incremental_activation_sha256_tampered(
     benchmark::Bench& bench)
 {
     BenchmarkEvalActivationV5Groth16(bench, true);
 }
-BENCHMARK(Bench_eval_verify_sp1_groth16_v5_incremental_activation_sha256_tampered)
+BENCHMARK(Bench_eval_verify_sp1_groth16_v5_incremental_activation_sha256_tampered, benchmark::PriorityLevel::LOW)
 
 } // namespace

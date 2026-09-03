@@ -2,6 +2,7 @@
 # Copyright (c) 2016 The Bitcoin Core developers
 # Distributed under the MIT/X11 software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
+from time import sleep
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error, Decimal, assert_greater_than
 
@@ -20,7 +21,11 @@ class PAKTest (BitcoinTestFramework):
         self.setup_clean_chain = True
         self.extra_args = [["-enforce_pak=1", "-evbparams=dynafed:-1:::", "-initialfreecoins=210000000000000", "-anyonecanspendaremine=1", "-parent_bech32_hrp=lol", "-pubkeyprefix=112", "-scriptprefix=197", "-con_connect_genesis_outputs=1"] for i in range(self.num_nodes)]
         # First node doesn't enforce PAK, a "HF" of the other two nodes
-        self.extra_args[0] = ["-acceptnonstdtxn=1"] + self.extra_args[0][1:]   ## FIXME -acceptnonstdtxn=1 should not be needed
+        # -acceptnonstdtxn=1 is required for first node as IsStandard will block larger pegout scripts if -enforce_pak=0
+        self.extra_args[0] = ["-acceptnonstdtxn=1"] + self.extra_args[0][1:]
+
+    def add_options(self, parser):
+        self.add_wallet_options(parser)
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -69,7 +74,12 @@ class PAKTest (BitcoinTestFramework):
         new_init = self.nodes[1].initpegoutwallet(xpub, 2)
         assert_equal(self.nodes[1].getwalletpakinfo()["bip32_counter"], "2")
         assert_equal(new_init["address_lookahead"][0], init_results[1]["address_lookahead"][2])
-        assert(new_init["liquid_pak"] != init_results[1]["liquid_pak"])
+        assert new_init["liquid_pak"] != init_results[1]["liquid_pak"]
+
+        self.log.info("initpegoutwallet with null argument")
+        null_pak_init = self.nodes[2].initpegoutwallet(xpub, 5, None)
+        assert_equal(self.nodes[2].getwalletpakinfo()["bip32_counter"], "5")
+        assert null_pak_init["liquid_pak"]
 
         # Restart and connect peers to check wallet persistence
         self.stop_nodes()
@@ -187,6 +197,12 @@ class PAKTest (BitcoinTestFramework):
         wpkh_stmc = self.nodes[1].sendtomainchain("", 1)
         wpkh_txid = wpkh_stmc['txid']
 
+        self.log.info("sendtomainchain with null argument")
+        verbose_stmc = self.nodes[1].sendtomainchain("", 1, None, True)
+        assert isinstance(verbose_stmc, dict)
+        assert 'txid' in verbose_stmc
+        assert 'fee_reason' in verbose_stmc
+
         # Also check some basic return fields of sendtomainchain with pak
         assert_equal(wpkh_stmc["bitcoin_address"], wpkh_info["address_lookahead"][0])
         validata = self.nodes[1].validateaddress(wpkh_stmc["bitcoin_address"])
@@ -261,6 +277,7 @@ class PAKTest (BitcoinTestFramework):
         pegout_tx = self.nodes[0].gettransaction(nopak_pegout_txid,True,True)
         assert_equal(pegout_tx["decoded"]["vout"][[d["value"] for d in pegout_tx["decoded"]["vout"]].index(1)]["scriptPubKey"]["pegout_address"],pegout_address)
         raw_pakless_pegout = self.nodes[0].gettransaction(nopak_pegout_txid)["hex"]
+        sleep(1) # hacky fix for flaky timing where getrawmempool doesn't have nopak_pegout_txid yet
         assert nopak_pegout_txid in self.nodes[0].getrawmempool()
 
         assert_raises_rpc_error(-26, "invalid-pegout-proof", self.nodes[1].sendrawtransaction, raw_pakless_pegout)
@@ -280,4 +297,4 @@ class PAKTest (BitcoinTestFramework):
         # TODO: create rawsendtomainchain to do transaction surgery for testing
 
 if __name__ == '__main__':
-    PAKTest ().main ()
+    PAKTest(__file__).main()

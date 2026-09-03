@@ -4,14 +4,13 @@
 
 #include <node/drivechain_withdrawal_journal.h>
 
-#include <clientversion.h>
 #include <consensus/consensus.h>
 #include <hash.h>
 #include <logging.h>
 #include <random.h>
 #include <streams.h>
 #include <tinyformat.h>
-#include <util/system.h>
+#include <util/fs_helpers.h>
 
 #include <cstdio>
 
@@ -90,16 +89,16 @@ bool WriteWithdrawalJournal(const fs::path& data_dir, const WithdrawalJournalEnt
     }
 
     uint16_t randv{0};
-    GetRandBytes((unsigned char*)&randv, sizeof(randv));
-    const fs::path path_tmp = data_dir / strprintf("drivechain_withdrawal.dat.%04x", randv);
+    GetRandBytes(Span{reinterpret_cast<unsigned char*>(&randv), sizeof(randv)});
+    const fs::path path_tmp = data_dir / fs::PathFromString(strprintf("drivechain_withdrawal.dat.%04x", randv));
 
     try {
-        CHashWriter hasher(SER_DISK, CLIENT_VERSION);
+        HashWriter hasher;
         hasher << JOURNAL_MAGIC << entry;
         const uint256 checksum = hasher.GetHash();
 
         FILE* file = fsbridge::fopen(path_tmp, "wb");
-        CAutoFile fileout(file, SER_DISK, CLIENT_VERSION);
+        AutoFile fileout{file};
         if (fileout.IsNull()) {
             fileout.fclose();
             fs::remove(path_tmp);
@@ -112,7 +111,7 @@ bool WriteWithdrawalJournal(const fs::path& data_dir, const WithdrawalJournalEnt
         // The entire point of this file is that it survives a crash, so the
         // data must be on stable storage before we return and let the caller
         // spend anything.
-        if (!FileCommit(fileout.Get())) {
+        if (!fileout.Commit()) {
             fileout.fclose();
             fs::remove(path_tmp);
             LogPrintf("%s: failed to flush %s\n", __func__, fs::PathToString(path_tmp));
@@ -134,7 +133,7 @@ bool WriteWithdrawalJournal(const fs::path& data_dir, const WithdrawalJournalEnt
     // Fsync the directory too, otherwise the rename itself can be lost.
     DirectoryCommit(data_dir);
 
-    LogPrint(BCLog::VALIDATION,
+    LogDebug(BCLog::VALIDATION,
              "drivechain withdrawal journal: recorded m6id=%s state=%d txid=%s\n",
              entry.m6id.GetHex(), int{entry.state}, entry.sidechain_txid.GetHex());
     return true;
@@ -151,7 +150,7 @@ WithdrawalJournalReadResult ReadWithdrawalJournal(
 
     try {
         FILE* file = fsbridge::fopen(path, "rb");
-        CAutoFile filein(file, SER_DISK, CLIENT_VERSION);
+        AutoFile filein{file};
         if (filein.IsNull()) {
             const std::string message = strprintf("failed to open %s", fs::PathToString(path));
             if (error) *error = message;
@@ -171,7 +170,7 @@ WithdrawalJournalReadResult ReadWithdrawalJournal(
             return WithdrawalJournalReadResult::CORRUPT;
         }
 
-        CHashWriter hasher(SER_DISK, CLIENT_VERSION);
+        HashWriter hasher;
         hasher << JOURNAL_MAGIC << parsed;
         if (hasher.GetHash() != checksum) {
             const std::string message = strprintf("checksum mismatch in %s", fs::PathToString(path));

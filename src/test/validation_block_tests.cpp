@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2021 The Bitcoin Core developers
+// Copyright (c) 2018-present The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -13,8 +13,9 @@
 #include <node/miner.h>
 #include <pow.h>
 #include <random.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <streams.h>
+#include <test/util/random.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <util/time.h>
@@ -29,7 +30,7 @@ using node::BlockAssembler;
 namespace validation_block_tests {
 struct MinerTestingSetup : public TestingSetup {
     MinerTestingSetup()
-        : TestingSetup{CBaseChainParams::REGTEST, "", {"-con_elementsmode=0"}} {}
+        : TestingSetup{ChainType::REGTEST, {.extra_args = {"-con_elementsmode=0"}}} {}
 
     std::shared_ptr<CBlock> Block(const uint256& prev_hash);
     std::shared_ptr<const CBlock> GoodBlock(const uint256& prev_hash);
@@ -45,10 +46,7 @@ BOOST_AUTO_TEST_CASE(bits16_through20_remain_ordinary_on_standard_regtest)
 {
     bool ignored{false};
     BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(
-        Params(),
-        std::make_shared<CBlock>(Params().GenesisBlock()),
-        true,
-        &ignored));
+        std::make_shared<CBlock>(Params().GenesisBlock()), /*force_processing=*/true, /*min_pow_checked=*/true, &ignored));
 
     auto block{Block(Params().GenesisBlock().GetHash())};
     block->nVersion |=
@@ -76,7 +74,7 @@ BOOST_AUTO_TEST_CASE(bits16_through20_remain_ordinary_on_standard_regtest)
     without_hidden_ecx_data.sourceBacklogOldestParentHeight = 0;
     BOOST_CHECK_EQUAL(block->GetHash(), without_hidden_ecx_data.GetHash());
     BOOST_CHECK_EQUAL(
-        GetSerializeSize(block->GetBlockHeader(), PROTOCOL_VERSION),
+        GetSerializeSize(block->GetBlockHeader()),
         80U);
     while (!CheckProofOfWork(
         block->GetHash(), block->nBits, Params().GetConsensus())) {
@@ -86,7 +84,7 @@ BOOST_AUTO_TEST_CASE(bits16_through20_remain_ordinary_on_standard_regtest)
     BlockValidationState state;
     const CBlockIndex* accepted{nullptr};
     BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders(
-        {block->GetBlockHeader()}, state, Params(), &accepted));
+        std::array{block->GetBlockHeader()}, /*min_pow_checked=*/true, state, &accepted));
     BOOST_CHECK(state.IsValid());
     BOOST_REQUIRE(accepted != nullptr);
     BOOST_CHECK_EQUAL(accepted->GetBlockHash(), block->GetHash());
@@ -96,7 +94,7 @@ BOOST_AUTO_TEST_CASE(bits16_through20_remain_ordinary_on_standard_regtest)
             nullptr));
 
     CDiskBlockIndex disk_index{accepted};
-    CDataStream disk_bytes{SER_DISK, CLIENT_VERSION};
+    DataStream disk_bytes;
     disk_bytes << disk_index;
     CDiskBlockIndex decoded_disk_index;
     disk_bytes >> decoded_disk_index;
@@ -117,10 +115,7 @@ BOOST_AUTO_TEST_CASE(bit20_does_not_extend_standard_regtest_block_body)
 {
     bool ignored{false};
     BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(
-        Params(),
-        std::make_shared<CBlock>(Params().GenesisBlock()),
-        true,
-        &ignored));
+        std::make_shared<CBlock>(Params().GenesisBlock()), /*force_processing=*/true, /*min_pow_checked=*/true, &ignored));
 
     auto block{Block(Params().GenesisBlock().GetHash())};
     block->nVersion |= CBlockHeader::BMM_PROOF_HF_MASK;
@@ -130,23 +125,23 @@ BOOST_AUTO_TEST_CASE(bit20_does_not_extend_standard_regtest_block_body)
     CBlock without_bmm_payload{*finalized};
     without_bmm_payload.m_bmm_proof.clear();
     BOOST_CHECK_EQUAL(
-        GetSerializeSize(*finalized, PROTOCOL_VERSION),
-        GetSerializeSize(without_bmm_payload, PROTOCOL_VERSION));
+        GetSerializeSize(TX_WITH_WITNESS(*finalized)),
+        GetSerializeSize(TX_WITH_WITNESS(without_bmm_payload)));
     BOOST_CHECK_EQUAL(
         GetBlockWeight(*finalized),
         GetBlockWeight(without_bmm_payload));
 
-    CDataStream encoded{SER_NETWORK, PROTOCOL_VERSION};
-    encoded << *finalized;
+    DataStream encoded;
+    encoded << TX_WITH_WITNESS(*finalized);
     CBlock decoded;
-    encoded >> decoded;
+    encoded >> TX_WITH_WITNESS(decoded);
     BOOST_CHECK(encoded.empty());
     BOOST_CHECK(decoded.m_bmm_proof.empty());
     BOOST_CHECK_EQUAL(decoded.GetHash(), finalized->GetHash());
 
     bool new_block{false};
     BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(
-        Params(), std::make_shared<CBlock>(decoded), true, &new_block));
+        std::make_shared<CBlock>(decoded), /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
     BOOST_CHECK(new_block);
 }
 
@@ -154,10 +149,7 @@ BOOST_AUTO_TEST_CASE(bit30_withdrawal_extension_is_elements_only)
 {
     bool ignored{false};
     BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(
-        Params(),
-        std::make_shared<CBlock>(Params().GenesisBlock()),
-        true,
-        &ignored));
+        std::make_shared<CBlock>(Params().GenesisBlock()), /*force_processing=*/true, /*min_pow_checked=*/true, &ignored));
 
     auto block{Block(Params().GenesisBlock().GetHash())};
     block->nVersion |= CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
@@ -167,10 +159,10 @@ BOOST_AUTO_TEST_CASE(bit30_withdrawal_extension_is_elements_only)
     without_hidden_withdrawal.hashWithdrawalBundle.SetNull();
     BOOST_CHECK_EQUAL(block->GetHash(), without_hidden_withdrawal.GetHash());
     BOOST_CHECK_EQUAL(
-        GetSerializeSize(block->GetBlockHeader(), PROTOCOL_VERSION),
+        GetSerializeSize(block->GetBlockHeader()),
         80U);
 
-    CDataStream header_bytes{SER_NETWORK, PROTOCOL_VERSION};
+    DataStream header_bytes;
     header_bytes << block->GetBlockHeader();
     CBlockHeader decoded_header;
     header_bytes >> decoded_header;
@@ -179,10 +171,10 @@ BOOST_AUTO_TEST_CASE(bit30_withdrawal_extension_is_elements_only)
     BOOST_CHECK(decoded_header.hashWithdrawalBundle.IsNull());
 
     const auto finalized{FinalizeBlock(block)};
-    CDataStream block_bytes{SER_NETWORK, PROTOCOL_VERSION};
-    block_bytes << *finalized;
+    DataStream block_bytes;
+    block_bytes << TX_WITH_WITNESS(*finalized);
     CBlock decoded_block;
-    block_bytes >> decoded_block;
+    block_bytes >> TX_WITH_WITNESS(decoded_block);
     BOOST_CHECK(block_bytes.empty());
     BOOST_CHECK_EQUAL(decoded_block.nVersion, finalized->nVersion);
     BOOST_CHECK(decoded_block.hashWithdrawalBundle.IsNull());
@@ -191,7 +183,7 @@ BOOST_AUTO_TEST_CASE(bit30_withdrawal_extension_is_elements_only)
 
     bool new_block{false};
     BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(
-        Params(), std::make_shared<CBlock>(decoded_block), true, &new_block));
+        std::make_shared<CBlock>(decoded_block), /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
     BOOST_CHECK(new_block);
 
     const CBlockIndex* accepted{WITH_LOCK(
@@ -200,7 +192,7 @@ BOOST_AUTO_TEST_CASE(bit30_withdrawal_extension_is_elements_only)
             finalized->GetHash()))};
     BOOST_REQUIRE(accepted != nullptr);
     CDiskBlockIndex disk_index{accepted};
-    CDataStream disk_bytes{SER_DISK, CLIENT_VERSION};
+    DataStream disk_bytes;
     disk_bytes << disk_index;
     CDiskBlockIndex decoded_disk_index;
     disk_bytes >> decoded_disk_index;
@@ -224,10 +216,10 @@ BOOST_AUTO_TEST_CASE(bit31_dynafed_extension_is_elements_only)
     without_hidden_dynafed.m_dynafed_params.SetNull();
     BOOST_CHECK_EQUAL(block->GetHash(), without_hidden_dynafed.GetHash());
     BOOST_CHECK_EQUAL(
-        GetSerializeSize(block->GetBlockHeader(), PROTOCOL_VERSION),
+        GetSerializeSize(block->GetBlockHeader()),
         80U);
 
-    CDataStream header_bytes{SER_NETWORK, PROTOCOL_VERSION};
+    DataStream header_bytes;
     header_bytes << block->GetBlockHeader();
     CBlockHeader decoded_header;
     header_bytes >> decoded_header;
@@ -235,10 +227,10 @@ BOOST_AUTO_TEST_CASE(bit31_dynafed_extension_is_elements_only)
     BOOST_CHECK_EQUAL(decoded_header.nVersion, block->nVersion);
     BOOST_CHECK(decoded_header.m_dynafed_params.IsNull());
 
-    CDataStream block_bytes{SER_NETWORK, PROTOCOL_VERSION};
-    block_bytes << *block;
+    DataStream block_bytes;
+    block_bytes << TX_WITH_WITNESS(*block);
     CBlock decoded_block;
-    block_bytes >> decoded_block;
+    block_bytes >> TX_WITH_WITNESS(decoded_block);
     BOOST_CHECK(block_bytes.empty());
     BOOST_CHECK_EQUAL(decoded_block.nVersion, block->nVersion);
     BOOST_CHECK(decoded_block.m_dynafed_params.IsNull());
@@ -247,7 +239,7 @@ BOOST_AUTO_TEST_CASE(bit31_dynafed_extension_is_elements_only)
 
     CBlockIndex memory_index{block->GetBlockHeader()};
     CDiskBlockIndex disk_index{&memory_index};
-    CDataStream disk_bytes{SER_DISK, CLIENT_VERSION};
+    DataStream disk_bytes;
     disk_bytes << disk_index;
     CDiskBlockIndex decoded_disk_index;
     disk_bytes >> decoded_disk_index;
@@ -262,11 +254,11 @@ BOOST_AUTO_TEST_CASE(ecx_reserved_outpoints_are_ordinary_on_standard_regtest)
     CCoinsView base;
     CCoinsViewCache view{&base};
     const std::vector<COutPoint> outpoints{
-        {uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041"), 0},
-        {uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1"), 0},
-        {uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586"), 0},
-        {uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9"), 0},
-        {uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1"), 0},
+        {Txid::FromUint256(uint256S("e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041")), 0},
+        {Txid::FromUint256(uint256S("c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1")), 0},
+        {Txid::FromUint256(uint256S("0cc4c302121a9d75c8a0e520253c1740520a6d6f4d03db6947a99565175d6586")), 0},
+        {Txid::FromUint256(uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9")), 0},
+        {Txid::FromUint256(uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1")), 0},
     };
 
     for (const COutPoint& outpoint : outpoints) {
@@ -307,7 +299,7 @@ struct TestSubscriber final : public CValidationInterface {
         BOOST_CHECK_EQUAL(m_expected_tip, pindexNew->GetBlockHash());
     }
 
-    void BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex) override
+    void BlockConnected(ChainstateRole role, const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex) override
     {
         BOOST_CHECK_EQUAL(m_expected_tip, block->hashPrevBlock);
         BOOST_CHECK_EQUAL(m_expected_tip, pindex->pprev->GetBlockHash());
@@ -329,7 +321,9 @@ std::shared_ptr<CBlock> MinerTestingSetup::Block(const uint256& prev_hash)
     static int i = 0;
     static uint64_t time = Params().GenesisBlock().nTime;
 
-    auto ptemplate = BlockAssembler(m_node.chainman->ActiveChainstate(), *m_node.mempool, Params()).CreateNewBlock(CScript{} << i++ << OP_TRUE);
+    BlockAssembler::Options options;
+    options.coinbase_output_script = CScript{} << i++ << OP_TRUE;
+    auto ptemplate = BlockAssembler{m_node.chainman->ActiveChainstate(), m_node.mempool.get(), options}.CreateNewBlock();
     auto pblock = std::make_shared<CBlock>(ptemplate->block);
     pblock->hashPrevBlock = prev_hash;
     pblock->nTime = ++time;
@@ -355,7 +349,7 @@ std::shared_ptr<CBlock> MinerTestingSetup::Block(const uint256& prev_hash)
 std::shared_ptr<CBlock> MinerTestingSetup::FinalizeBlock(std::shared_ptr<CBlock> pblock)
 {
     const CBlockIndex* prev_block{WITH_LOCK(::cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(pblock->hashPrevBlock))};
-    GenerateCoinbaseCommitment(*pblock, prev_block, Params().GetConsensus());
+    m_node.chainman->GenerateCoinbaseCommitment(*pblock, prev_block);
 
     pblock->hashMerkleRoot = BlockMerkleRoot(*pblock);
 
@@ -366,7 +360,7 @@ std::shared_ptr<CBlock> MinerTestingSetup::FinalizeBlock(std::shared_ptr<CBlock>
     // submit block header, so that miner can get the block height from the
     // global state and the node has the topology of the chain
     BlockValidationState ignored;
-    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders({pblock->GetBlockHeader()}, ignored, Params()));
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders({{pblock->GetBlockHeader()}}, true, ignored));
 
     return pblock;
 }
@@ -383,7 +377,7 @@ std::shared_ptr<const CBlock> MinerTestingSetup::BadBlock(const uint256& prev_ha
     auto pblock = Block(prev_hash);
 
     CMutableTransaction coinbase_spend;
-    coinbase_spend.vin.push_back(CTxIn(COutPoint(pblock->vtx[0]->GetHash(), 0), CScript(), 0));
+    coinbase_spend.vin.emplace_back(COutPoint(pblock->vtx[0]->GetHash(), 0), CScript(), 0);
     coinbase_spend.vout.push_back(pblock->vtx[0]->vout[0]);
 
     CTransactionRef tx = MakeTransactionRef(coinbase_spend);
@@ -393,12 +387,13 @@ std::shared_ptr<const CBlock> MinerTestingSetup::BadBlock(const uint256& prev_ha
     return ret;
 }
 
+// NOLINTNEXTLINE(misc-no-recursion)
 void MinerTestingSetup::BuildChain(const uint256& root, int height, const unsigned int invalid_rate, const unsigned int branch_rate, const unsigned int max_size, std::vector<std::shared_ptr<const CBlock>>& blocks)
 {
     if (height <= 0 || blocks.size() >= max_size) return;
 
-    bool gen_invalid = InsecureRandRange(100) < invalid_rate;
-    bool gen_fork = InsecureRandRange(100) < branch_rate;
+    bool gen_invalid = m_rng.randrange(100U) < invalid_rate;
+    bool gen_fork = m_rng.randrange(100U) < branch_rate;
 
     const std::shared_ptr<const CBlock> pblock = gen_invalid ? BadBlock(root) : GoodBlock(root);
     blocks.push_back(pblock);
@@ -423,8 +418,8 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
 
     bool ignored;
     // Connect the genesis block and drain any outstanding events
-    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(Params(), std::make_shared<CBlock>(Params().GenesisBlock()), true, &ignored));
-    SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
     // subscribe to events (this subscriber will validate event ordering)
     const CBlockIndex* initial_tip = nullptr;
@@ -433,25 +428,26 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
         initial_tip = m_node.chainman->ActiveChain().Tip();
     }
     auto sub = std::make_shared<TestSubscriber>(initial_tip->GetBlockHash());
-    RegisterSharedValidationInterface(sub);
+    m_node.validation_signals->RegisterSharedValidationInterface(sub);
 
     // create a bunch of threads that repeatedly process a block generated above at random
     // this will create parallelism and randomness inside validation - the ValidationInterface
     // will subscribe to events generated during block validation and assert on ordering invariance
     std::vector<std::thread> threads;
+    threads.reserve(10);
     for (int i = 0; i < 10; i++) {
         threads.emplace_back([&]() {
             bool ignored;
             FastRandomContext insecure;
             for (int i = 0; i < 1000; i++) {
-                auto block = blocks[insecure.randrange(blocks.size() - 1)];
-                Assert(m_node.chainman)->ProcessNewBlock(Params(), block, true, &ignored);
+                const auto& block = blocks[insecure.randrange(blocks.size() - 1)];
+                Assert(m_node.chainman)->ProcessNewBlock(block, true, true, &ignored);
             }
 
             // to make sure that eventually we process the full chain - do it here
-            for (auto block : blocks) {
+            for (const auto& block : blocks) {
                 if (block->vtx.size() == 1) {
-                    bool processed = Assert(m_node.chainman)->ProcessNewBlock(Params(), block, true, &ignored);
+                    bool processed = Assert(m_node.chainman)->ProcessNewBlock(block, true, true, &ignored);
                     assert(processed);
                 }
             }
@@ -461,9 +457,9 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
     for (auto& t : threads) {
         t.join();
     }
-    SyncWithValidationInterfaceQueue();
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
 
-    UnregisterSharedValidationInterface(sub);
+    m_node.validation_signals->UnregisterSharedValidationInterface(sub);
 
     LOCK(cs_main);
     BOOST_CHECK_EQUAL(sub->m_expected_tip, m_node.chainman->ActiveChain().Tip()->GetBlockHash());
@@ -490,7 +486,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 {
     bool ignored;
     auto ProcessBlock = [&](std::shared_ptr<const CBlock> block) -> bool {
-        return Assert(m_node.chainman)->ProcessNewBlock(Params(), block, /*force_processing=*/true, /*new_block=*/&ignored);
+        return Assert(m_node.chainman)->ProcessNewBlock(block, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/&ignored);
     };
 
     // Process all mined blocks
@@ -500,7 +496,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 
     // Run the test multiple times
     for (int test_runs = 3; test_runs > 0; --test_runs) {
-        BOOST_CHECK_EQUAL(last_mined->GetHash(), m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+        BOOST_CHECK_EQUAL(last_mined->GetHash(), WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip()->GetBlockHash()));
 
         // Later on split from here
         const uint256 split_hash{last_mined->hashPrevBlock};
@@ -510,7 +506,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
         std::vector<CTransactionRef> txs;
         for (int num_txs = 22; num_txs > 0; --num_txs) {
             CMutableTransaction mtx;
-            mtx.vin.push_back(CTxIn{COutPoint{last_mined->vtx[0]->GetHash(), 1}, CScript{}});
+            mtx.vin.emplace_back(COutPoint{last_mined->vtx[0]->GetHash(), 1}, CScript{});
             mtx.witness.vtxinwit.resize(1);
             mtx.witness.vtxinwit[0].scriptWitness.stack.push_back(WITNESS_STACK_ELEM_OP_TRUE);
             mtx.vout.push_back(last_mined->vtx[0]->vout[1]);
@@ -549,8 +545,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 
         // Check that all txs are in the pool
         {
-            LOCK(m_node.mempool->cs);
-            BOOST_CHECK_EQUAL(m_node.mempool->mapTx.size(), txs.size());
+            BOOST_CHECK_EQUAL(m_node.mempool->size(), txs.size());
         }
 
         // Run a thread that simulates an RPC caller that is polling while
@@ -561,7 +556,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
             // not some intermediate amount.
             while (true) {
                 LOCK(m_node.mempool->cs);
-                if (m_node.mempool->mapTx.size() == 0) {
+                if (m_node.mempool->size() == 0) {
                     // We are done with the reorg
                     break;
                 }
@@ -570,7 +565,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
                 // be atomic. So the caller assumes that the returned mempool
                 // is consistent. That is, it has all txs that were there
                 // before the reorg.
-                assert(m_node.mempool->mapTx.size() == txs.size());
+                assert(m_node.mempool->size() == txs.size());
                 continue;
             }
             LOCK(cs_main);
@@ -583,7 +578,7 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
             ProcessBlock(b);
         }
         // Check that the reorg was eventually successful
-        BOOST_CHECK_EQUAL(last_mined->GetHash(), m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+        BOOST_CHECK_EQUAL(last_mined->GetHash(), WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip()->GetBlockHash()));
 
         // We can join the other thread, which returns when the reorg was successful
         rpc_thread.join();
@@ -592,9 +587,12 @@ BOOST_AUTO_TEST_CASE(mempool_locks_reorg)
 
 BOOST_AUTO_TEST_CASE(witness_commitment_index)
 {
+    LOCK(Assert(m_node.chainman)->GetMutex());
     CScript pubKey;
     pubKey << 1 << OP_TRUE;
-    auto ptemplate = BlockAssembler(m_node.chainman->ActiveChainstate(), *m_node.mempool, Params()).CreateNewBlock(pubKey);
+    BlockAssembler::Options options;
+    options.coinbase_output_script = pubKey;
+    auto ptemplate = BlockAssembler{m_node.chainman->ActiveChainstate(), m_node.mempool.get(), options}.CreateNewBlock();
     CBlock pblock = ptemplate->block;
 
     CTxOut witness;

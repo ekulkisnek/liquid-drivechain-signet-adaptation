@@ -5,7 +5,7 @@
 #ifndef BITCOIN_DRIVECHAIN_PARENT_REPLAY_H
 #define BITCOIN_DRIVECHAIN_PARENT_REPLAY_H
 
-#include <fs.h>
+#include <util/fs.h>
 #include <mainchainrpc.h>
 #include <uint256.h>
 

@@ -4,7 +4,8 @@
 #include <chainparamsbase.h>
 #include <mainchainrpc.h>
 #include <netbase.h>
-#include <util/system.h>
+#include <common/args.h>
+#include <util/fs_helpers.h>
 #include <util/strencodings.h>
 #include <algorithm>
 #include <fstream>
@@ -102,11 +103,9 @@ bool ValidateReadableRegularFile(const fs::path& path,
         : (S_IWGRP | S_IWOTH);
     if ((metadata.st_mode & forbidden) != 0) {
         if (error) {
-            *error = strprintf(
-                private_key
-                    ? "mTLS client key must deny all group and other access: %s"
-                    : "mTLS certificate must deny group and other write access: %s",
-                native_path);
+            *error = private_key
+                ? strprintf("mTLS client key must deny all group and other access: %s", native_path)
+                : strprintf("mTLS certificate must deny group and other write access: %s", native_path);
         }
         return false;
     }

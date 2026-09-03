@@ -11,7 +11,6 @@
 #include <streams.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
-#include <version.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -26,7 +25,7 @@ namespace {
 
 struct NativeWithdrawalSetup : public BasicTestingSetup
 {
-    NativeWithdrawalSetup() : BasicTestingSetup("custom") {}
+    NativeWithdrawalSetup() : BasicTestingSetup(ChainType::CUSTOM) {}
 };
 
 const CAsset PEGGED_ASSET{uint256S(
@@ -91,7 +90,7 @@ BOOST_AUTO_TEST_CASE(native_burn_output_round_trip)
     // cannot be recovered or spent after this transaction confirms.
     CCoinsView base;
     CCoinsViewCache coins(&base);
-    const COutPoint burn_outpoint(BURN_TXID, 7);
+    const COutPoint burn_outpoint(Txid::FromUint256(BURN_TXID), 7);
     coins.AddCoin(burn_outpoint, Coin(output, 1, false), false);
     BOOST_CHECK(!coins.HaveCoinInCache(burn_outpoint));
     BOOST_CHECK(!coins.HaveCoin(burn_outpoint));
@@ -202,7 +201,7 @@ BOOST_AUTO_TEST_CASE(native_blinded_m6_is_unique_and_legacy_serialized)
             withdrawal, m6, &error),
         error);
 
-    BOOST_CHECK_EQUAL(m6.blinded_transaction.nVersion, 2);
+    BOOST_CHECK_EQUAL(m6.blinded_transaction.version, 2);
     BOOST_CHECK(m6.blinded_transaction.vin.empty());
     BOOST_REQUIRE_EQUAL(m6.blinded_transaction.vout.size(), 3U);
     BOOST_CHECK_EQUAL(m6.blinded_transaction.vout[0].nValue, 0);
@@ -282,7 +281,7 @@ BOOST_AUTO_TEST_CASE(native_blinded_m6_rejects_mutation_and_replay_aliases)
     };
 
     Bitcoin::CMutableTransaction mutated = canonical.blinded_transaction;
-    mutated.nVersion = 1;
+    mutated.version = 1;
     BOOST_CHECK(parse_rejected(mutated));
 
     mutated = canonical.blinded_transaction;

@@ -181,9 +181,9 @@ DrivechainParentReplayStore::DrivechainParentReplayStore(
     fs::path path, const size_t cache_bytes, const bool wipe)
     : m_path(std::move(path)),
       m_cache_bytes(cache_bytes),
-      m_db(std::make_unique<CDBWrapper>(m_path, m_cache_bytes,
-                                        /*fMemory=*/false, wipe,
-                                        /*obfuscate=*/false))
+      m_db(std::make_unique<CDBWrapper>(DBParams{
+          .path = m_path, .cache_bytes = m_cache_bytes, .memory_only = false,
+          .wipe_data = wipe, .obfuscate = false}))
 {
 }
 
@@ -254,9 +254,9 @@ bool DrivechainParentReplayStore::Reset(
     // mutex and the published epoch is zero.
     m_db.reset();
     try {
-        m_db = std::make_unique<CDBWrapper>(m_path, m_cache_bytes,
-                                            /*fMemory=*/false, /*fWipe=*/true,
-                                            /*obfuscate=*/false);
+        m_db = std::make_unique<CDBWrapper>(DBParams{
+            .path = m_path, .cache_bytes = m_cache_bytes, .memory_only = false,
+            .wipe_data = true, .obfuscate = false});
         CDBBatch batch(*m_db);
         batch.Write(DB_REPLAY_IDENTITY,
                     DrivechainReplayStoreIdentity{SCHEMA_VERSION, identity});
@@ -296,7 +296,8 @@ bool DrivechainParentReplayStore::Append(
             *m_db, DB_REPLAY_TIP, stored_tip, "tip", error);
         if (tip_status != DrivechainReplayStoreReadStatus::FOUND ||
             stored_tip.height != previous.height || stored_tip.hash != previous.hash ||
-            SerializeHash(stored_tip.state) != SerializeHash(previous.state)) {
+            (HashWriter{} << stored_tip.state).GetHash() !=
+                (HashWriter{} << previous.state).GetHash()) {
             return SetStoreError(error, "persistent parent replay tip changed before append");
         }
 

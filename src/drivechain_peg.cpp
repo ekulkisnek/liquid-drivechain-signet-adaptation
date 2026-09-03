@@ -12,7 +12,7 @@
 #include <primitives/bitcoin/merkleblock.h>
 #include <rpc/util.h>
 #include <script/script.h>
-#include <script/standard.h>
+#include <script/solver.h>
 #include <streams.h>
 #include <util/strencodings.h>
 
@@ -28,7 +28,7 @@ namespace {
 
 constexpr int DRIVECHAIN_SIDECHAIN_SLOT{24};
 const COutPoint CTIP_STATE_OUTPOINT{
-    uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1"),
+    Txid::FromUint256(uint256S("2d15ce4b128995291c4e38d36b8ae411a15bf80d7acee97cf5f58d2fc4de52b1")),
     0};
 const std::vector<unsigned char> CTIP_STATE_MARKER{
     'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'c', 't', 'i', 'p', '-', 'v', '1'};
@@ -40,8 +40,8 @@ template <typename T>
 bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
 {
     try {
-        CDataStream stream(bytes, SER_NETWORK, PROTOCOL_VERSION);
-        stream >> value;
+        DataStream stream{bytes};
+        stream >> TX_WITH_WITNESS(value);
         return stream.empty();
     } catch (...) {
         return false;
@@ -204,7 +204,7 @@ bool ParseV2Deposit(
     if (!ExtractDepositDestination(deposit_tx, address, destination_script, error)) return false;
 
     parsed.previous_state = {
-        COutPoint(previous_txid, previous_vout),
+        COutPoint(Txid::FromUint256(previous_txid), previous_vout),
         previous_value,
         evidence.previous_sequence_number};
     parsed.next_state = {
@@ -239,7 +239,7 @@ const std::array<LegacyCheckpoint, 2> LEGACY_CHECKPOINTS{{
     {
         uint256S("feed724d3382997ae6500d8185353e116d557a4f299b58e8f722c1aa400ab730"),
         uint256S("000001d9988239435d51e763fd4231893dad22d7d03048266a5e21361e2db065"),
-        COutPoint(uint256S("7de4aeb747a54bbe6b590d2038f445b9dc995217fb1b4e524c4129cdd0f06bea"), 0),
+        COutPoint(Txid::FromUint256(uint256S("7de4aeb747a54bbe6b590d2038f445b9dc995217fb1b4e524c4129cdd0f06bea")), 0),
         2'000,
         14'402'000,
         8,
@@ -248,7 +248,7 @@ const std::array<LegacyCheckpoint, 2> LEGACY_CHECKPOINTS{{
     {
         uint256S("7d78b50fa26e51ca01d1a916820971e46dd6d11e8da7c06571b95d8c6dd4a382"),
         uint256S("00000268748226d792c32914d26f5608a766a13741f3762c35cb053084ac4d1c"),
-        COutPoint(uint256S("010a70b5e1fca8e8433dd2efc7c3b8f0783e98b133bbf03bcbe05cdd29a4edab"), 0),
+        COutPoint(Txid::FromUint256(uint256S("010a70b5e1fca8e8433dd2efc7c3b8f0783e98b133bbf03bcbe05cdd29a4edab")), 0),
         100'000,
         14'400'000,
         7,
@@ -311,7 +311,7 @@ bool BuildLegacyAuthenticated(
 
 CScript EncodeCtipState(const CtipState& state)
 {
-    CDataStream stream(SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream;
     stream << CTIP_STATE_MARKER << state.outpoint << state.value << state.sequence_number;
     return CScript()
         << std::vector<unsigned char>(
@@ -341,7 +341,7 @@ bool DecodeCtipState(const Coin& coin, CtipState& state, std::string& error)
         return false;
     }
     try {
-        CDataStream stream(data, SER_NETWORK, PROTOCOL_VERSION);
+        DataStream stream{data};
         std::vector<unsigned char> marker;
         stream >> marker >> state.outpoint >> state.value >> state.sequence_number;
         if (!stream.empty() || marker != CTIP_STATE_MARKER ||
@@ -396,7 +396,7 @@ std::string RequireHexField(const UniValue& value, const std::string& field, siz
 int64_t RequireInt64Field(const UniValue& value, const std::string& field)
 {
     const UniValue& result = value[field];
-    if (result.isNum()) return result.get_int64();
+    if (result.isNum()) return result.getInt<int64_t>();
     int64_t parsed{0};
     if (result.isStr() && ParseInt64(result.get_str(), &parsed)) return parsed;
     throw std::runtime_error("drivechain peg data field '" + field + "' must be an integer");
@@ -429,7 +429,7 @@ const UniValue& RequireArrayField(const UniValue& value, const std::string& lowe
 int64_t RequireInt64Field(const UniValue& value, const std::string& lower_camel, const std::string& snake_case)
 {
     const UniValue& result = FindField(value, lower_camel, snake_case);
-    if (result.isNum()) return result.get_int64();
+    if (result.isNum()) return result.getInt<int64_t>();
     int64_t parsed{0};
     if (result.isStr() && ParseInt64(result.get_str(), &parsed)) return parsed;
     throw std::runtime_error("drivechain evidence field '" + lower_camel + "' must be an integer");
@@ -587,7 +587,7 @@ AuthenticatedDeposit FindDeposit(
 
             result.sidechain_slot = expected.sidechain_slot;
             result.sequence_number = sequence;
-            result.outpoint = COutPoint(txid, vout);
+            result.outpoint = COutPoint(Txid::FromUint256(txid), vout);
             result.value = value;
             result.address = address;
             result.destination_script = GetScriptForDestination(destination);
@@ -613,11 +613,11 @@ void VerifyCtip(const UniValue& ctip_response, AuthenticatedDeposit& authenticat
         throw std::runtime_error("CTIP sequence predates the confirmed deposit");
     }
     if (sequence == authenticated.sequence_number &&
-        COutPoint(txid, vout) != authenticated.outpoint) {
+        COutPoint(Txid::FromUint256(txid), vout) != authenticated.outpoint) {
         throw std::runtime_error("CTIP outpoint does not match the deposit at the same sequence");
     }
 
-    authenticated.current_ctip = COutPoint(txid, vout);
+    authenticated.current_ctip = COutPoint(Txid::FromUint256(txid), vout);
     authenticated.current_ctip_value = value;
     authenticated.current_ctip_sequence = sequence;
 }
@@ -706,7 +706,7 @@ UniValue NormalizeL1PegEvents(const UniValue& two_way_peg_data, int sidechain_id
     for (const UniValue& block : RequireArrayField(two_way_peg_data, "blocks").getValues()) {
         if (!block.isObject()) throw std::runtime_error("GetTwoWayPegData block must be an object");
         const UniValue location = L1Location(block);
-        const int64_t height = location["height"].get_int64();
+        const int64_t height = location["height"].getInt<int64_t>();
         const UniValue& block_info = RequireObjectField(block, "blockInfo");
         const UniValue& raw_events = block_info["events"];
         if (raw_events.isNull()) continue;

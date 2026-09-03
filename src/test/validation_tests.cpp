@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <chain.h>
@@ -13,8 +14,12 @@
 #include <init.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
+#include <consensus/merkle.h>
+#include <core_io.h>
+#include <hash.h>
 #include <net.h>
 #include <net_processing.h>
+#include <node/kernel_notifications.h>
 #include <pegins.h>
 #include <policy/policy.h>
 #include <rpc/request.h>
@@ -22,11 +27,13 @@
 #include <streams.h>
 #include <uint256.h>
 #include <util/strencodings.h>
-#include <util/system.h>
 #include <usdd_sp1_resources.h>
 #include <usdd_withdrawal_accumulator.h>
+#include <util/chaintype.h>
 #include <validation.h>
 #include <wallet/drivechain_withdrawal.h>
+
+#include <string>
 
 #include <test/util/setup_common.h>
 
@@ -168,7 +175,7 @@ static void TestBlockSubsidyHalvings(int nSubsidyHalvingInterval)
 
 BOOST_AUTO_TEST_CASE(block_subsidy_test)
 {
-    const auto chainParams = CreateChainParams(*m_node.args, CBaseChainParams::MAIN);
+    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
     TestBlockSubsidyHalvings(chainParams->GetConsensus()); // As in main
     TestBlockSubsidyHalvings(150); // As in regtest
     TestBlockSubsidyHalvings(1000); // Just another interval
@@ -176,7 +183,7 @@ BOOST_AUTO_TEST_CASE(block_subsidy_test)
 
 BOOST_AUTO_TEST_CASE(subsidy_limit_test)
 {
-    const auto chainParams = CreateChainParams(*m_node.args, CBaseChainParams::MAIN);
+    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
     CAmount nSum = 0;
     for (int nHeight = 0; nHeight < 14000000; nHeight += 1000) {
         CAmount nSubsidy = GetBlockSubsidy(nHeight, chainParams->GetConsensus());
@@ -231,9 +238,8 @@ BOOST_AUTO_TEST_CASE(usdd_withdrawal_accumulator_matches_cross_language_transact
         burn_script("111122223333444455556666777788889999aaaa", 888000));
     const CTransactionRef transaction = MakeTransactionRef(std::move(mutable_transaction));
 
-    CDataStream serialized(SER_NETWORK,
-                           PROTOCOL_VERSION | SERIALIZE_TRANSACTION_NO_WITNESS);
-    serialized << *transaction;
+    DataStream serialized;
+    serialized << TX_NO_WITNESS(*transaction);
     BOOST_CHECK_EQUAL(
         HexStr(serialized),
         "0200000000000201ffeeddccbbaa99887766554433221100ffeeddccbbaa00998877665544332211010000000004a19ba000436a415553444401101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f000000000000000000000000000000000000beef00000000000bdb2801ffeeddccbbaa99887766554433221100ffeeddccbbaa009988776655443322110100000000054afb0000436a415553444401101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f111122223333444455556666777788889999aaaa00000000000d8cc000000000");
@@ -292,7 +298,7 @@ BOOST_AUTO_TEST_CASE(usdd_withdrawal_accumulator_matches_cross_language_transact
     BOOST_CHECK_EQUAL(HexStr(state.root),
                       "9a9d19c855a9cb649c60024f7de206266056755cc93b4021211870d32a630719");
 
-    CDataStream encoded(SER_DISK, CLIENT_VERSION);
+    DataStream encoded;
     encoded << state;
     BOOST_CHECK_EQUAL(encoded.size(), 73U);
     usdd::WithdrawalAccumulatorState decoded;
@@ -580,7 +586,7 @@ BOOST_AUTO_TEST_CASE(drivechain_native_deposit_block_cap)
         deposits.vout.emplace_back(CAsset(uint256::ONE), 0,
                                    CScript() << OP_TRUE);
         for (unsigned int i = 0; i < deposit_count; ++i) {
-            CTxIn input(COutPoint(uint256::ONE, i));
+            CTxIn input(COutPoint(Txid::FromUint256(uint256::ONE), i));
             input.m_is_pegin = true;
             deposits.vin.push_back(std::move(input));
         }
@@ -910,7 +916,7 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_bid_selection)
     BOOST_CHECK(ParseDrivechainBmmBid("1000", parsed, &error));
     BOOST_CHECK_EQUAL(parsed, 1000);
     BOOST_CHECK(ParseDrivechainBmmBid(
-        ToString(MAX_MONEY), parsed, &error));
+        util::ToString(MAX_MONEY), parsed, &error));
     BOOST_CHECK_EQUAL(parsed, MAX_MONEY);
     BOOST_CHECK(!ParseDrivechainBmmBid("1000garbage", parsed, &error));
     BOOST_CHECK(!ParseDrivechainBmmBid(" 1000", parsed, &error));
@@ -918,7 +924,7 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_bid_selection)
     BOOST_CHECK(!ParseDrivechainBmmBid("0", parsed, &error));
     BOOST_CHECK(!ParseDrivechainBmmBid("-1", parsed, &error));
     BOOST_CHECK(!ParseDrivechainBmmBid(
-        ToString(MAX_MONEY + 1), parsed, &error));
+        util::ToString(MAX_MONEY + 1), parsed, &error));
 }
 
 BOOST_AUTO_TEST_CASE(elements_production_identity_gate)
@@ -998,7 +1004,7 @@ BOOST_AUTO_TEST_CASE(signet_parse_tests)
 {
     ArgsManager signet_argsman;
     signet_argsman.ForceSetArg("-signetchallenge", "51"); // set challenge to OP_TRUE
-    const auto signet_params = CreateChainParams(signet_argsman, CBaseChainParams::SIGNET);
+    const auto signet_params = CreateChainParams(signet_argsman, ChainType::SIGNET);
     CBlock block;
     BOOST_CHECK(signet_params->GetConsensus().signet_challenge == std::vector<uint8_t>{OP_TRUE});
     CScript challenge{OP_TRUE};
@@ -1088,9 +1094,9 @@ BOOST_AUTO_TEST_CASE(layer_two_parent_signet_real_signature_regression)
     static constexpr const char* RAW_BLOCK_5580 =
         "00000020027d89a3fdacc10943565cfdbc1d5a32fb6f3d638e3a5dc0c9b7fd4546020000f484c8e55e26cd1eb8d279dfbfd56c44a27995cdb4c057344f6b3e0951fc2b3db5c65a6a3d77031e24a88a0001020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0302cc15ffffffff090000000000000000276a25d161736804554faf2df2135a463ad1fefdf6ecbffd27f2a2bfabba909376d9d628724dfe900000000000000000276a25d1617368093f9140f0756e966e730317341a8eb3826d0e9ba86f6e22e5a90f4ba4ad2eed390000000000000000276a25d161736862ecce70a22de077e7192456ebfd30ed617fc14eec92782936e5003307a81b27370000000000000000276a25d16173686323f3c921f22f6e4a7f9f8be1664028f2dd75ba3cc24a3794fe4c65e6222428450000000000000000276a25d16173680263c29a2764d747e4d1e94dc4de89aab1a844dcbcbcb0231715656f154a800ad50000000000000000276a25d16173680d82352000588a4ea8444ca7e585bfef39382703d2247a29389d01f9f9106c60d900000000000000000f6a0dd77d177601ffffffffffffffff00f2052a01000000160014fae83223f01759582ffe70f5f770eb8462f04da20000000000000000986a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c70ecc7daa2000247304402201e4aef7971e3279353d1c948c0af0a9e6a943a8dc8c9dcc106104c8d782bc09602206a4aadfeea8f8edf14dea5e158977ce1badf76b4faf4ab776081fab3f68738f8012103675b73e701c9dab7de809bb0000b4c1205f9a834d669a7f47c107a7d2c199f560120000000000000000000000000000000000000000000000000000000000000000000000000";
 
-    CDataStream stream(ParseHex(RAW_BLOCK_5580), SER_NETWORK, PROTOCOL_VERSION);
+    DataStream stream(ParseHex(RAW_BLOCK_5580));
     Bitcoin::CBlock block;
-    stream >> block;
+    stream >> TX_WITH_WITNESS(block);
     BOOST_CHECK(stream.empty());
     BOOST_CHECK_EQUAL(
         block.GetHash(),
@@ -1295,7 +1301,7 @@ BOOST_AUTO_TEST_CASE(elements_height_one_uses_simplicity_consensus_flags)
 
     CBlockIndex genesis_index{params->GenesisBlock()};
     genesis_index.nHeight = 0;
-    CBlockIndex first_block_index;
+    const uint256 first_block_hash{};    CBlockIndex first_block_index;    first_block_index.phashBlock = &first_block_hash;
     first_block_index.pprev = &genesis_index;
     first_block_index.nHeight = 1;
 
@@ -1320,14 +1326,14 @@ BOOST_AUTO_TEST_CASE(drivechain_mempool_parent_mtp_requires_sane_active_anchor)
 
     CBlockIndex genesis{elements->GenesisBlock()};
     genesis.nHeight = 0;
-    genesis.nChainTx = 1;
+    genesis.m_chain_tx_count = 1;
     BOOST_CHECK(!GetDrivechainMempoolParentMtp(
         &genesis, elements->GetConsensus()).has_value());
 
     CBlockIndex tip;
     tip.pprev = &genesis;
     tip.nHeight = 1;
-    tip.nChainTx = 1;
+    tip.m_chain_tx_count = 1;
     BOOST_CHECK(!GetDrivechainMempoolParentMtp(
         &tip, elements->GetConsensus()).has_value());
 
@@ -1349,10 +1355,10 @@ BOOST_AUTO_TEST_CASE(drivechain_mempool_parent_mtp_requires_sane_active_anchor)
     BOOST_CHECK(!GetDrivechainMempoolParentMtp(
         &tip, ordinary->GetConsensus()).has_value());
 
-    tip.nChainTx = 0;
+    tip.m_chain_tx_count = 0;
     BOOST_CHECK(!GetDrivechainMempoolParentMtp(
         &tip, elements->GetConsensus()).has_value());
-    tip.nChainTx = 1;
+    tip.m_chain_tx_count = 1;
     tip.m_drivechain_anchor->bmm_height++;
     BOOST_CHECK(!tip.m_drivechain_anchor->IsSane());
     BOOST_CHECK(!GetDrivechainMempoolParentMtp(
@@ -1361,6 +1367,7 @@ BOOST_AUTO_TEST_CASE(drivechain_mempool_parent_mtp_requires_sane_active_anchor)
 
 BOOST_AUTO_TEST_CASE(v11_prior_active_parent_checkpoint_codec_is_exact_and_fail_closed)
 {
+    LOCK(cs_main);
     DrivechainAnchor anchor;
     anchor.parent_block_hash = uint256S(
         "0123456789abcdef1032547698badcfeffeeddccbbaa99887766554433221100");
@@ -1390,14 +1397,14 @@ BOOST_AUTO_TEST_CASE(v11_prior_active_parent_checkpoint_codec_is_exact_and_fail_
     const auto ordinary = CreateChainParams(args, CBaseChainParams::MAIN);
     CBlockIndex genesis{elements->GenesisBlock()};
     genesis.nHeight = 0;
-    genesis.nChainTx = 1;
+    genesis.m_chain_tx_count = 1;
     BOOST_CHECK(!GetPriorActiveBmmParentCheckpoint(
         &genesis, elements->GetConsensus()).has_value());
 
     CBlockIndex authenticated_tip;
     authenticated_tip.pprev = &genesis;
     authenticated_tip.nHeight = 1;
-    authenticated_tip.nChainTx = 1;
+    authenticated_tip.m_chain_tx_count = 1;
     authenticated_tip.m_drivechain_anchor = anchor;
     const auto authenticated = GetPriorActiveBmmParentCheckpoint(
         &authenticated_tip, elements->GetConsensus());
@@ -1407,10 +1414,10 @@ BOOST_AUTO_TEST_CASE(v11_prior_active_parent_checkpoint_codec_is_exact_and_fail_
     BOOST_CHECK(!GetPriorActiveBmmParentCheckpoint(
         &authenticated_tip, ordinary->GetConsensus()).has_value());
 
-    authenticated_tip.nChainTx = 0;
+    authenticated_tip.m_chain_tx_count = 0;
     BOOST_CHECK(!GetPriorActiveBmmParentCheckpoint(
         &authenticated_tip, elements->GetConsensus()).has_value());
-    authenticated_tip.nChainTx = 1;
+    authenticated_tip.m_chain_tx_count = 1;
     authenticated_tip.nStatus |= BLOCK_FAILED_VALID;
     BOOST_CHECK(!GetPriorActiveBmmParentCheckpoint(
         &authenticated_tip, elements->GetConsensus()).has_value());
@@ -1491,7 +1498,7 @@ BOOST_AUTO_TEST_CASE(drivechain_slot_is_not_enabled_on_other_builtin_networks)
 
         CBlockIndex genesis_index{params->GenesisBlock()};
         genesis_index.nHeight = 0;
-        CBlockIndex first_block_index;
+        const uint256 first_block_hash{};        CBlockIndex first_block_index;        first_block_index.phashBlock = &first_block_hash;
         first_block_index.pprev = &genesis_index;
         first_block_index.nHeight = 1;
         const unsigned int flags = GetBlockScriptFlagsForTesting(
@@ -1622,9 +1629,8 @@ BOOST_AUTO_TEST_CASE(drivechain_replacement_anchor_survives_block_index_reload)
     index.nTx = 1;
     index.m_drivechain_anchor = old_anchor;
 
-    CBlockTreeDB block_tree_db(/*nCacheSize=*/1 << 20,
-                               /*fMemory=*/true,
-                               /*fWipe=*/true);
+    kernel::BlockTreeDB block_tree_db({.path = {}, .cache_bytes = 1 << 20,
+                                      .memory_only = true, .wipe_data = true});
     const std::vector<std::pair<int, const CBlockFileInfo*>> no_files;
     const std::vector<const CBlockIndex*> blocks{&index};
     BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files, 0, blocks));
@@ -1645,7 +1651,7 @@ BOOST_AUTO_TEST_CASE(drivechain_replacement_anchor_survives_block_index_reload)
         return it->second.get();
     };
     BOOST_REQUIRE(block_tree_db.LoadBlockIndexGuts(
-        Params().GetConsensus(), insert, /*trimBelowHeight=*/0));
+        Params().GetConsensus(), insert, *m_node.shutdown_signal, /*trimBelowHeight=*/0));
     BOOST_REQUIRE_EQUAL(loaded.count(block_hash), 1U);
     BOOST_REQUIRE(loaded.at(block_hash)->m_drivechain_anchor.has_value());
     BOOST_CHECK(*loaded.at(block_hash)->m_drivechain_anchor == replacement);
@@ -1679,7 +1685,7 @@ BOOST_AUTO_TEST_CASE(drivechain_best_header_requires_admitted_full_block)
     BOOST_CHECK(!IsDrivechainHeaderAuthenticated(&index, drivechain));
 
     index.nTx = 1;
-    index.nChainTx = 2;
+    index.m_chain_tx_count = 2;
     BOOST_CHECK(IsDrivechainHeaderAuthenticated(&index, drivechain));
 
     // Pruning removes local block bytes, not the fact that this full block was
@@ -1706,11 +1712,33 @@ BOOST_AUTO_TEST_CASE(drivechain_unknown_sibling_headers_are_not_indexed)
         }
     } drivechain_params;
 
+    // Header admission now reads the manager's immutable chain parameters.
+    const ChainstateManager::Options chainman_opts{
+        .chainparams = drivechain_params,
+        .datadir = m_path_root / "header-admission",
+        .check_block_index = 1,
+        .notifications = *m_node.notifications,
+        .worker_threads_num = 0,
+        .script_execution_cache_bytes = 0,
+        .signature_cache_bytes = 0,
+    };
+    const node::BlockManager::Options blockman_opts{
+        .chainparams = drivechain_params,
+        .blocks_dir = chainman_opts.datadir / "blocks",
+        .notifications = chainman_opts.notifications,
+        .block_tree_db_params = DBParams{
+            .path = chainman_opts.datadir / "blocks" / "index",
+            .cache_bytes = 1 << 20,
+            .memory_only = true,
+        },
+    };
+    fs::create_directories(blockman_opts.blocks_dir);
+    ChainstateManager chainman{*m_node.shutdown_signal, chainman_opts, blockman_opts};
     size_t original_index_size;
     {
         LOCK(cs_main);
-        original_index_size =
-            m_node.chainman->m_blockman.m_block_index.size();
+        chainman.InitializeChainstate(nullptr);
+        original_index_size = chainman.m_blockman.m_block_index.size();
     }
 
     // Each call models another connection/reconnection offering a distinct
@@ -1723,15 +1751,35 @@ BOOST_AUTO_TEST_CASE(drivechain_unknown_sibling_headers_are_not_indexed)
         sibling.nTime = 1'700'000'000;
         sibling.nNonce = nonce;
         BlockValidationState state;
-        BOOST_CHECK(!m_node.chainman->ProcessNewBlockHeaders(
-            {sibling}, state, drivechain_params));
+        BOOST_CHECK(!chainman.ProcessNewBlockHeaders(
+            std::span{&sibling, 1}, /*min_pow_checked=*/true, state));
         BOOST_CHECK(state.IsError());
     }
 
     LOCK(cs_main);
     BOOST_CHECK_EQUAL(
-        m_node.chainman->m_blockman.m_block_index.size(),
+        chainman.m_blockman.m_block_index.size(),
         original_index_size);
+
+    // Reindex can populate the index before the active chain has a tip.
+    BOOST_REQUIRE(chainman.ActiveChain().Tip() == nullptr);
+    chainman.RecalculateBestHeader();
+    BOOST_CHECK(chainman.m_best_header == nullptr);
+    CBlockIndex* genesis = chainman.m_blockman.InsertBlockIndex(
+        drivechain_params.GetConsensus().hashGenesisBlock);
+    BOOST_REQUIRE(genesis != nullptr);
+    genesis->nTx = 1;
+    genesis->m_chain_tx_count = 1;
+    genesis->nChainWork = 1;
+    chainman.RecalculateBestHeader();
+    BOOST_CHECK(chainman.m_best_header == genesis);
+
+    CBlockIndex* unauthenticated = chainman.m_blockman.InsertBlockIndex(uint256S("04"));
+    BOOST_REQUIRE(unauthenticated != nullptr);
+    unauthenticated->nHeight = 1;
+    unauthenticated->nChainWork = 2;
+    chainman.RecalculateBestHeader();
+    BOOST_CHECK(chainman.m_best_header == genesis);
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_withdrawal_capability_is_fail_closed)
@@ -1754,24 +1802,261 @@ BOOST_AUTO_TEST_CASE(drivechain_withdrawal_capability_is_fail_closed)
 //! Test retrieval of valid assumeutxo values.
 BOOST_AUTO_TEST_CASE(test_assumeutxo)
 {
-    const auto params = CreateChainParams(*m_node.args, CBaseChainParams::REGTEST);
+    const auto params = CreateChainParams(*m_node.args, ChainType::REGTEST);
 
     // These heights don't have assumeutxo configurations associated, per the contents
-    // of chainparams.cpp.
+    // of kernel/chainparams.cpp.
     std::vector<int> bad_heights{0, 100, 111, 115, 209, 211};
 
     for (auto empty : bad_heights) {
-        const auto out = ExpectedAssumeutxo(empty, *params);
+        const auto out = params->AssumeutxoForHeight(empty);
         BOOST_CHECK(!out);
     }
 
-    const auto out110 = *ExpectedAssumeutxo(110, *params);
-    BOOST_CHECK_EQUAL(out110.hash_serialized.ToString(), "09a3e443dbf48f3b95207c9ce529062d9764395232c482aa7d3a0bf274d282d9");
-    BOOST_CHECK_EQUAL(out110.nChainTx, 110U);
+    const auto out110 = *params->AssumeutxoForHeight(110);
+    BOOST_CHECK_EQUAL(out110.hash_serialized.ToString(), "6657b736d4fe4db0cbc796789e812d5dba7f5c143764b1b6905612f1830609d1");
+    BOOST_CHECK_EQUAL(out110.m_chain_tx_count, 111U);
 
-    const auto out210 = *ExpectedAssumeutxo(200, *params);
-    BOOST_CHECK_EQUAL(out210.hash_serialized.ToString(), "51c8d11d8b5c1de51543c579736e786aa2736206d1e11e627568029ce092cf62");
-    BOOST_CHECK_EQUAL(out210.nChainTx, 200U);
+    const auto out110_2 = *params->AssumeutxoForBlockhash(uint256{"696e92821f65549c7ee134edceeeeaaa4105647a3c4fd9f298c0aec0ab50425c"});
+    BOOST_CHECK_EQUAL(out110_2.hash_serialized.ToString(), "6657b736d4fe4db0cbc796789e812d5dba7f5c143764b1b6905612f1830609d1");
+    BOOST_CHECK_EQUAL(out110_2.m_chain_tx_count, 111U);
+}
+
+BOOST_AUTO_TEST_CASE(block_malleation)
+{
+    // Test utilities that calls `IsBlockMutated` and then clears the validity
+    // cache flags on `CBlock`.
+    auto is_mutated = [](CBlock& block, bool check_witness_root) {
+        bool mutated{IsBlockMutated(block, check_witness_root)};
+        block.fChecked = false;
+        block.m_checked_witness_commitment = false;
+        block.m_checked_merkle_root = false;
+        return mutated;
+    };
+    auto is_not_mutated = [&is_mutated](CBlock& block, bool check_witness_root) {
+        return !is_mutated(block, check_witness_root);
+    };
+
+    // Test utilities to create coinbase transactions and insert witness
+    // commitments.
+    //
+    // Note: this will not include the witness stack by default to avoid
+    // triggering the "no witnesses allowed for blocks that don't commit to
+    // witnesses" rule when testing other malleation vectors.
+    auto create_coinbase_tx = [](bool include_witness = false) {
+        CMutableTransaction coinbase;
+        coinbase.vin.resize(1);
+        coinbase.witness.vtxinwit.resize(1);
+        if (include_witness) {
+            coinbase.witness.vtxinwit[0].scriptWitness.stack.resize(1);
+            coinbase.witness.vtxinwit[0].scriptWitness.stack[0] = std::vector<unsigned char>(32, 0x00);
+        }
+
+        coinbase.vout.resize(1);
+        coinbase.vout[0].scriptPubKey.resize(MINIMUM_WITNESS_COMMITMENT);
+        coinbase.vout[0].scriptPubKey[0] = OP_RETURN;
+        coinbase.vout[0].scriptPubKey[1] = 0x24;
+        coinbase.vout[0].scriptPubKey[2] = 0xaa;
+        coinbase.vout[0].scriptPubKey[3] = 0x21;
+        coinbase.vout[0].scriptPubKey[4] = 0xa9;
+        coinbase.vout[0].scriptPubKey[5] = 0xed;
+
+        auto tx = MakeTransactionRef(coinbase);
+        assert(tx->IsCoinBase());
+        return tx;
+    };
+    auto insert_witness_commitment = [](CBlock& block, uint256 commitment) {
+        assert(!block.vtx.empty() && block.vtx[0]->IsCoinBase() && !block.vtx[0]->vout.empty());
+
+        CMutableTransaction mtx{*block.vtx[0]};
+        CHash256().Write(commitment).Write(std::vector<unsigned char>(32, 0x00)).Finalize(commitment);
+        memcpy(&mtx.vout[0].scriptPubKey[6], commitment.begin(), 32);
+        block.vtx[0] = MakeTransactionRef(mtx);
+    };
+
+    {
+        CBlock block;
+
+        // Empty block is expected to have merkle root of 0x0.
+        BOOST_CHECK(block.vtx.empty());
+        block.hashMerkleRoot = uint256{1};
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/false));
+        block.hashMerkleRoot = uint256{};
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/false));
+
+        // Block with a single coinbase tx is mutated if the merkle root is not
+        // equal to the coinbase tx's hash.
+        block.vtx.push_back(create_coinbase_tx());
+        BOOST_CHECK(block.vtx[0]->GetHash() != block.hashMerkleRoot);
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/false));
+        block.hashMerkleRoot = block.vtx[0]->GetHash();
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/false));
+
+        // Block with two transactions is mutated if the merkle root does not
+        // match the double sha256 of the concatenation of the two transaction
+        // hashes.
+        block.vtx.push_back(MakeTransactionRef(CMutableTransaction{}));
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/false));
+        HashWriter hasher;
+        hasher.write(block.vtx[0]->GetHash());
+        hasher.write(block.vtx[1]->GetHash());
+        block.hashMerkleRoot = hasher.GetHash();
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/false));
+
+        // Block with two transactions is mutated if any node is duplicate.
+        {
+            block.vtx[1] = block.vtx[0];
+            HashWriter hasher;
+            hasher.write(block.vtx[0]->GetHash());
+            hasher.write(block.vtx[1]->GetHash());
+            block.hashMerkleRoot = hasher.GetHash();
+            BOOST_CHECK(is_mutated(block, /*check_witness_root=*/false));
+        }
+
+        // Blocks with 64-byte coinbase transactions are not considered mutated
+        block.vtx.clear();
+        {
+            CMutableTransaction mtx;
+            mtx.vin.resize(1);
+            mtx.vout.resize(1);
+            mtx.vout[0].scriptPubKey.resize(4);
+            block.vtx.push_back(MakeTransactionRef(mtx));
+            block.hashMerkleRoot = block.vtx.back()->GetHash();
+            assert(block.vtx.back()->IsCoinBase());
+            assert(GetSerializeSize(TX_NO_WITNESS(block.vtx.back())) == 64);
+        }
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/false));
+    }
+
+    {
+        // Test merkle root malleation
+
+        // Pseudo code to mine transactions tx{1,2,3}:
+        //
+        // ```
+        // loop {
+        //   tx1 = random_tx()
+        //   tx2 = random_tx()
+        //   tx3 = deserialize_tx(txid(tx1) || txid(tx2));
+        //   if serialized_size_without_witness(tx3) == 64 {
+        //     print(hex(tx3))
+        //     break
+        //   }
+        // }
+        // ```
+        //
+        // The `random_tx` function used to mine the txs below simply created
+        // empty transactions with a random version field.
+        CMutableTransaction tx1;
+        BOOST_CHECK(DecodeHexTx(tx1, "ff204bd0000000000000", /*try_no_witness=*/true, /*try_witness=*/false));
+        CMutableTransaction tx2;
+        BOOST_CHECK(DecodeHexTx(tx2, "8ae53c92000000000000", /*try_no_witness=*/true, /*try_witness=*/false));
+        CMutableTransaction tx3;
+        BOOST_CHECK(DecodeHexTx(tx3, "cdaf22d00002c6a7f848f8ae4d30054e61dcf3303d6fe01d282163341f06feecc10032b3160fcab87bdfe3ecfb769206ef2d991b92f8a268e423a6ef4d485f06", /*try_no_witness=*/true, /*try_witness=*/false));
+        {
+            // Verify that double_sha256(txid1||txid2) == txid3
+            HashWriter hasher;
+            hasher.write(tx1.GetHash());
+            hasher.write(tx2.GetHash());
+            assert(hasher.GetHash() == tx3.GetHash());
+            // Verify that tx3 is 64 bytes in size (without witness).
+            assert(GetSerializeSize(TX_NO_WITNESS(tx3)) == 64);
+        }
+
+        CBlock block;
+        block.vtx.push_back(MakeTransactionRef(tx1));
+        block.vtx.push_back(MakeTransactionRef(tx2));
+        uint256 merkle_root = block.hashMerkleRoot = BlockMerkleRoot(block);
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/false));
+
+        // Mutate the block by replacing the two transactions with one 64-byte
+        // transaction that serializes into the concatenation of the txids of
+        // the transactions in the unmutated block.
+        block.vtx.clear();
+        block.vtx.push_back(MakeTransactionRef(tx3));
+        BOOST_CHECK(!block.vtx.back()->IsCoinBase());
+        BOOST_CHECK(BlockMerkleRoot(block) == merkle_root);
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/false));
+    }
+
+    {
+        CBlock block;
+        block.vtx.push_back(create_coinbase_tx(/*include_witness=*/true));
+        {
+            CMutableTransaction mtx;
+            mtx.vin.resize(1);
+            mtx.witness.vtxinwit.resize(1);
+            mtx.witness.vtxinwit[0].scriptWitness.stack.resize(1);
+            mtx.witness.vtxinwit[0].scriptWitness.stack[0] = {0};
+            block.vtx.push_back(MakeTransactionRef(mtx));
+        }
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        // Block with witnesses is considered mutated if the witness commitment
+        // is not validated.
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/false));
+        // Block with invalid witness commitment is considered mutated.
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/true));
+
+        // Block with valid commitment is not mutated
+        {
+            auto commitment{BlockWitnessMerkleRoot(block)};
+            insert_witness_commitment(block, commitment);
+            block.hashMerkleRoot = BlockMerkleRoot(block);
+        }
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/true));
+
+        // Malleating witnesses should be caught by `IsBlockMutated`.
+        {
+            CMutableTransaction mtx{*block.vtx[1]};
+            assert(!mtx.witness.vtxinwit[0].scriptWitness.stack[0].empty());
+            ++mtx.witness.vtxinwit[0].scriptWitness.stack[0][0];
+            block.vtx[1] = MakeTransactionRef(mtx);
+        }
+        // Without also updating the witness commitment, the merkle root should
+        // not change when changing one of the witnesses.
+        BOOST_CHECK(block.hashMerkleRoot == BlockMerkleRoot(block));
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/true));
+        {
+            auto commitment{BlockWitnessMerkleRoot(block)};
+            insert_witness_commitment(block, commitment);
+            block.hashMerkleRoot = BlockMerkleRoot(block);
+        }
+        BOOST_CHECK(is_not_mutated(block, /*check_witness_root=*/true));
+
+        // Test malleating the coinbase witness reserved value
+        {
+            CMutableTransaction mtx{*block.vtx[0]};
+            mtx.witness.vtxinwit.resize(1);
+            mtx.witness.vtxinwit[0].scriptWitness.stack.resize(0);
+            block.vtx[0] = MakeTransactionRef(mtx);
+            block.hashMerkleRoot = BlockMerkleRoot(block);
+        }
+        BOOST_CHECK(is_mutated(block, /*check_witness_root=*/true));
+    }
+}
+
+// ELEMENTS: the offline (chainstate-less) SIGHASH_RANGEPROOF gating used by
+// elements-tx must treat liquidv1 as known-active even though dynafed there is
+// height-activated rather than ALWAYS_ACTIVE.
+BOOST_AUTO_TEST_CASE(sighash_rangeproof_by_params_test)
+{
+    // liquidv1: dynafed is height-activated (nStartTime = 1000000), NOT the
+    // ALWAYS_ACTIVE sentinel, but must be treated as active by params.
+    const auto liquidv1 = CreateChainParams(*m_node.args, ChainType::LIQUID1);
+    BOOST_CHECK(liquidv1->GetConsensus().vDeployments[Consensus::DEPLOYMENT_DYNA_FED].nStartTime
+                != Consensus::BIP9Deployment::ALWAYS_ACTIVE);
+    BOOST_CHECK(liquidv1->SighashRangeproofActiveByParams());
+
+    // liquidv1test: overrides dynafed to ALWAYS_ACTIVE, so it is active by params
+    // via the ALWAYS_ACTIVE branch (independent of the liquidv1 chain-type check).
+    const auto liquidv1test = CreateChainParams(*m_node.args, ChainType::LIQUID1TEST);
+    BOOST_CHECK_EQUAL(liquidv1test->GetConsensus().vDeployments[Consensus::DEPLOYMENT_DYNA_FED].nStartTime,
+                      Consensus::BIP9Deployment::ALWAYS_ACTIVE);
+    BOOST_CHECK(liquidv1test->SighashRangeproofActiveByParams());
+
+    // regtest: dynafed never active by default; must be inactive by params.
+    const auto regtest = CreateChainParams(*m_node.args, ChainType::REGTEST);
+    BOOST_CHECK(!regtest->SighashRangeproofActiveByParams());
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_withdrawal_bundle_wire_format)
@@ -1780,7 +2065,7 @@ BOOST_AUTO_TEST_CASE(drivechain_withdrawal_bundle_wire_format)
     const CAmount mainchain_fee{1'000};
     const CScript payout_script = CScript() << OP_0 <<
         std::vector<unsigned char>(20, 0x11);
-    const COutPoint withdrawal_outpoint(uint256::ONE, 7);
+    const COutPoint withdrawal_outpoint(Txid::FromUint256(uint256::ONE), 7);
 
     const wallet::DrivechainWithdrawalBundle bundle =
         wallet::BuildDrivechainWithdrawalBundle(
@@ -1800,9 +2085,8 @@ BOOST_AUTO_TEST_CASE(drivechain_withdrawal_bundle_wire_format)
     // The enforcer uses rust-bitcoin's explicit inputless-transaction decoder.
     // Core's generic decoder rejects this deliberately non-broadcastable
     // blinded form, so decode its vector of outputs independently here.
-    CDataStream payload(
-        std::vector<unsigned char>(bundle.bytes.begin() + 7, bundle.bytes.end()),
-        SER_NETWORK, 0);
+    DataStream payload(
+        std::vector<unsigned char>(bundle.bytes.begin() + 7, bundle.bytes.end()));
     std::vector<Bitcoin::CTxOut> outputs;
     uint32_t lock_time{0};
     payload >> outputs >> lock_time;
@@ -2173,10 +2457,9 @@ BOOST_AUTO_TEST_CASE(drivechain_reward_script_rejects_unsafe_destinations)
     const CPubKey pubkey(ParseHex("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"));
     WitnessV0KeyHash confidential(pubkey);
     confidential.blinding_pubkey = pubkey;
-    WitnessUnknown future{};
-    future.version = 2;
-    future.length = 32;
-    future.program[0] = 1;
+    std::vector<unsigned char> future_program(32, 0);
+    future_program[0] = 1;
+    const WitnessUnknown future{2, future_program};
     const CScript anyone_can_spend = CScript() << OP_TRUE;
     const std::vector<std::string> rejected{
         "", "not-an-address", "51", "null",
@@ -2236,13 +2519,14 @@ BOOST_AUTO_TEST_CASE(drivechain_withdrawal_capability_requires_replay_or_explici
 BOOST_AUTO_TEST_SUITE_END()
 
 struct ElementsTestingSetup : public TestingSetup {
-    ElementsTestingSetup() : TestingSetup{CBaseChainParams::ELEMENTS} {}
+    ElementsTestingSetup() : TestingSetup{ChainType::ELEMENTS} {}
 };
 
 BOOST_FIXTURE_TEST_SUITE(elements_startup_validation_tests, ElementsTestingSetup)
 
 BOOST_AUTO_TEST_CASE(activates_genesis_from_empty_chain)
 {
+    LOCK(cs_main);
     const CBlockIndex* tip = m_node.chainman->ActiveChain().Tip();
     BOOST_REQUIRE(tip != nullptr);
     BOOST_CHECK_EQUAL(tip->nHeight, 0);
@@ -2281,10 +2565,10 @@ BOOST_AUTO_TEST_CASE(native_alpha_rejects_ecx_deposit_codecs_without_parent_rpc)
     Sidechain::Bitcoin::CMutableTransaction parent;
     parent.vin.emplace_back(Sidechain::Bitcoin::COutPoint(uint256::ONE, 0));
     parent.vout.emplace_back(2'000, CScript() << OP_TRUE);
-    const COutPoint outpoint(parent.GetHash(), 0);
+    const COutPoint outpoint(Txid::FromUint256(parent.GetHash()), 0);
     DrivechainDepositEvidence evidence;
-    CVectorWriter writer(SER_NETWORK, PROTOCOL_VERSION, evidence.deposit_tx, 0);
-    writer << parent;
+    VectorWriter writer(evidence.deposit_tx, 0);
+    writer << TX_WITH_WITNESS(parent);
     const auto legacy = CreateDrivechainDepositPeginWitness(
         2'000, Params().GetConsensus().pegged_asset,
         Params().ParentGenesisBlockHash(), CScript() << OP_TRUE, outpoint.hash);

@@ -90,6 +90,10 @@ and resubmit the same claim rather than create another burn.
 
 ## Local validation
 
+The commands and counts below describe the pre-upstream-merge security revision.
+For current CMake instructions and post-merge results, see the
+[upstream integration record](upstream-merge-20260902.md).
+
 Validated on macOS arm64 in an isolated out-of-tree build with the pinned native
 USDD SP1 verifier linked, tests enabled, and two build workers. No daemon was
 started and no transaction was created or broadcast.

@@ -4,27 +4,28 @@
 
 #include <signet.h>
 
-#include <array>
-#include <cstdint>
-#include <vector>
-
+#include <common/system.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <hash.h>
+#include <logging.h>
 #include <primitives/block.h>
 #include <primitives/bitcoin/block.h>
 #include <primitives/bitcoin/transaction.h>
 #include <primitives/transaction.h>
 #include <pubkey.h>
-#include <span.h>
 #include <script/interpreter.h>
-#include <script/standard.h>
+#include <span.h>
 #include <streams.h>
-#include <util/strencodings.h>
-#include <util/system.h>
 #include <uint256.h>
+#include <util/strencodings.h>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <vector>
 
 static constexpr uint8_t SIGNET_HEADER[4] = {0xec, 0xc7, 0xda, 0xa2};
 
@@ -43,7 +44,7 @@ static bool FetchAndClearCommitmentSection(const Span<const uint8_t> header, CSc
     std::vector<uint8_t> pushdata;
     while (witness_commitment.GetOp(pc, opcode, pushdata)) {
         if (pushdata.size() > 0) {
-            if (!found_header && pushdata.size() > (size_t)header.size() && Span{pushdata}.first(header.size()) == header) {
+            if (!found_header && pushdata.size() > header.size() && std::ranges::equal(Span{pushdata}.first(header.size()), header)) {
                 // pushdata only counts if it has the header _and_ some data
                 result.insert(result.end(), pushdata.begin() + header.size(), pushdata.end());
                 pushdata.erase(pushdata.begin() + header.size(), pushdata.end());
@@ -73,13 +74,13 @@ static uint256 ComputeModifiedMerkleRoot(const CMutableTransaction& cb, const CB
 std::optional<SignetTxs> SignetTxs::Create(const CBlock& block, const CScript& challenge)
 {
     CMutableTransaction tx_to_spend;
-    tx_to_spend.nVersion = 0;
+    tx_to_spend.version = 0;
     tx_to_spend.nLockTime = 0;
     tx_to_spend.vin.emplace_back(COutPoint(), CScript(OP_0), 0);
     tx_to_spend.vout.emplace_back(CAsset(), 0, challenge);
 
     CMutableTransaction tx_spending;
-    tx_spending.nVersion = 0;
+    tx_spending.version = 0;
     tx_spending.nLockTime = 0;
     tx_spending.vin.emplace_back(COutPoint(), CScript(), 0);
     tx_spending.witness.vtxinwit.resize(1);
@@ -104,7 +105,7 @@ std::optional<SignetTxs> SignetTxs::Create(const CBlock& block, const CScript& c
         // no signet solution -- allow this to support OP_TRUE as trivial block challenge
     } else {
         try {
-            SpanReader v{SER_NETWORK, INIT_PROTO_VERSION, signet_solution};
+            SpanReader v{signet_solution};
             v >> tx_spending.vin[0].scriptSig;
             v >> tx_spending.witness.vtxinwit[0].scriptWitness.stack;
             if (!v.empty()) return std::nullopt; // extraneous data encountered
@@ -115,7 +116,7 @@ std::optional<SignetTxs> SignetTxs::Create(const CBlock& block, const CScript& c
     uint256 signet_merkle = ComputeModifiedMerkleRoot(modified_cb, block);
 
     std::vector<uint8_t> block_data;
-    CVectorWriter writer(SER_NETWORK, INIT_PROTO_VERSION, block_data, 0);
+    VectorWriter writer{block_data, 0};
     writer << block.nVersion;
     writer << block.hashPrevBlock;
     writer << signet_merkle;
@@ -138,7 +139,7 @@ bool CheckSignetBlockSolution(const CBlock& block, const Consensus::Params& cons
     const std::optional<SignetTxs> signet_txs = SignetTxs::Create(block, challenge);
 
     if (!signet_txs) {
-        LogPrint(BCLog::VALIDATION, "CheckSignetBlockSolution: Errors in block (block solution parse failure)\n");
+        LogDebug(BCLog::VALIDATION, "CheckSignetBlockSolution: Errors in block (block solution parse failure)\n");
         return false;
     }
 
@@ -150,7 +151,7 @@ bool CheckSignetBlockSolution(const CBlock& block, const Consensus::Params& cons
     TransactionSignatureChecker sigcheck(&signet_txs->m_to_sign, /* nInIn= */ 0, /* amountIn= */ signet_txs->m_to_spend.vout[0].nValue, txdata, MissingDataBehavior::ASSERT_FAIL);
 
     if (!VerifyScript(scriptSig, signet_txs->m_to_spend.vout[0].scriptPubKey, &witness, BLOCK_SCRIPT_VERIFY_FLAGS, sigcheck)) {
-        LogPrint(BCLog::VALIDATION, "CheckSignetBlockSolution: Errors in block (block solution invalid)\n");
+        LogDebug(BCLog::VALIDATION, "CheckSignetBlockSolution: Errors in block (block solution invalid)\n");
         return false;
     }
     return true;
@@ -193,27 +194,27 @@ uint256 BitcoinWitnessV0SignatureHash(const CScript& script_code,
     const int base_type = hash_type & 0x1f;
 
     if (!(hash_type & SIGHASH_ANYONECANPAY)) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         for (const auto& input : transaction.vin) writer << input.prevout;
         hash_prevouts = writer.GetHash();
     }
     if (!(hash_type & SIGHASH_ANYONECANPAY) && base_type != SIGHASH_SINGLE && base_type != SIGHASH_NONE) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         for (const auto& input : transaction.vin) writer << input.nSequence;
         hash_sequence = writer.GetHash();
     }
     if (base_type != SIGHASH_SINGLE && base_type != SIGHASH_NONE) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         for (const auto& output : transaction.vout) writer << output;
         hash_outputs = writer.GetHash();
     } else if (base_type == SIGHASH_SINGLE && input_index < transaction.vout.size()) {
-        CHashWriter writer(SER_GETHASH, 0);
+        HashWriter writer;
         writer << transaction.vout[input_index];
         hash_outputs = writer.GetHash();
     }
 
-    CHashWriter writer(SER_GETHASH, 0);
-    writer << transaction.nVersion;
+    HashWriter writer;
+    writer << transaction.version;
     writer << hash_prevouts;
     writer << hash_sequence;
     writer << transaction.vin[input_index].prevout;
@@ -284,20 +285,20 @@ bool CheckBitcoinSignetBlockSolution(const Bitcoin::CBlock& block,
     FetchAndClearCommitmentSection(SIGNET_HEADER, witness_commitment, signet_solution);
 
     Bitcoin::CMutableTransaction transaction_to_spend;
-    transaction_to_spend.nVersion = 0;
+    transaction_to_spend.version = 0;
     transaction_to_spend.nLockTime = 0;
     transaction_to_spend.vin.emplace_back(Bitcoin::COutPoint(), CScript(OP_0), 0);
     transaction_to_spend.vout.emplace_back(0, challenge);
 
     Bitcoin::CMutableTransaction transaction_to_sign;
-    transaction_to_sign.nVersion = 0;
+    transaction_to_sign.version = 0;
     transaction_to_sign.nLockTime = 0;
     transaction_to_sign.vin.emplace_back(Bitcoin::COutPoint(), CScript(), 0);
     transaction_to_sign.vout.emplace_back(0, CScript(OP_RETURN));
 
     if (!signet_solution.empty()) {
         try {
-            SpanReader reader{SER_NETWORK, INIT_PROTO_VERSION, signet_solution};
+            SpanReader reader{signet_solution};
             reader >> transaction_to_sign.vin[0].scriptSig;
             reader >> transaction_to_sign.vin[0].scriptWitness.stack;
             if (!reader.empty()) return SetSignetError(error, "parent signet solution has trailing bytes");
@@ -308,7 +309,7 @@ bool CheckBitcoinSignetBlockSolution(const Bitcoin::CBlock& block,
 
     const uint256 modified_merkle_root = ComputeBitcoinModifiedMerkleRoot(modified_coinbase, block);
     std::vector<uint8_t> block_data;
-    CVectorWriter writer(SER_NETWORK, INIT_PROTO_VERSION, block_data, 0);
+    VectorWriter writer(block_data, 0);
     writer << block.nVersion;
     writer << block.hashPrevBlock;
     writer << modified_merkle_root;

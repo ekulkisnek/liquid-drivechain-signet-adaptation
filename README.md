@@ -46,6 +46,14 @@ historical reference only. Quarantined entry points fail immediately. They are
 not instructions to launch this native network. Historical release recipes
 likewise do not build the current verifier-enabled node.
 
+## Building this revision
+
+The upstream integration uses CMake 3.22 or newer and a C++20 compiler, not
+Autotools. Configure a fresh out-of-tree build and provide the pinned verifier
+archives explicitly. See [build instructions, compatibility checks and known
+validation limits](doc/upstream-merge-20260902.md). Upstream `master` is a
+development branch; being current with it is not release certification.
+
 ## Inherited Elements features
 
 The following upstream references describe the platform this fork derives from,
@@ -86,6 +94,27 @@ Additional RPC commands and parameters:
 Fork CI and release validation are described in the
 [remediation and release gates](doc/security-report-remediation.md). Inherited
 upstream workflows are not evidence of a validated current cross-platform release.
+
+Testing and code review is the bottleneck for development; we get more pull
+requests than we can review and test on short notice. Please be patient and help out by testing
+other people's pull requests, and remember this is a security-critical project where any mistake might cost people
+lots of money.
+
+### Automated Testing
+
+Developers are strongly encouraged to write [unit tests](src/test/README.md) for new code, and to
+submit new unit tests for old code. Unit tests can be compiled and run
+(assuming they weren't disabled during the generation of the build system) with: `ctest`. Further details on running
+and extending unit tests can be found in [/src/test/README.md](/src/test/README.md).
+
+There are also [regression and integration tests](/test), written
+in Python.
+These tests can be run (if the [test dependencies](/test) are installed) with:
+`python3 test/functional/test_runner.py --configfile=build/test/config.ini`
+(assuming `build` is your build directory). Private functional-test binaries
+are separate from the installed, native-only programs. Some inherited tests
+need additional dependencies; consult the validation limits linked above.
+
 
 License
 -------
