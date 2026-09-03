@@ -30,6 +30,7 @@
 #include <usdd_sp1_resources.h>
 #include <usdd_withdrawal_accumulator.h>
 #include <util/chaintype.h>
+#include <util/signalinterrupt.h>
 #include <validation.h>
 #include <wallet/drivechain_withdrawal.h>
 
@@ -40,6 +41,7 @@
 #include <limits>
 #include <cstring>
 #include <fstream>
+#include <thread>
 
 #ifndef WIN32
 #include <sys/stat.h>
@@ -1506,6 +1508,154 @@ BOOST_AUTO_TEST_CASE(drivechain_slot_is_not_enabled_on_other_builtin_networks)
         BOOST_CHECK_MESSAGE(!(flags & SCRIPT_VERIFY_USDD_SP1_ANNEX), network);
         BOOST_CHECK_MESSAGE(!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY), network);
     }
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_anchor_snapshot_exact_identity_and_generation)
+{
+    DrivechainAnchor anchor;
+    anchor.parent_block_hash = uint256S("01");
+    anchor.bmm_block_hash = uint256S("02");
+    anchor.parent_chainwork = uint256S("10");
+    anchor.bmm_chainwork = uint256S("20");
+    anchor.parent_height = 100;
+    anchor.bmm_height = 101;
+    anchor.parent_median_time_past = 1'700'000'000;
+    BOOST_REQUIRE(anchor.IsSane());
+    const uint256 tip = uint256S("ff");
+    DrivechainAnchorSnapshot snapshot{24, tip, 7};
+    BOOST_REQUIRE(snapshot.Add(anchor, DrivechainAnchorStatus::ACTIVE));
+    BOOST_CHECK(snapshot.Matches(24, tip, 7));
+    BOOST_CHECK(snapshot.Contains(anchor, 24, 7));
+    BOOST_CHECK(!snapshot.Contains(anchor, 23, 7));
+    BOOST_CHECK(!snapshot.Contains(anchor, 24, 0));
+    BOOST_CHECK(!snapshot.Contains(anchor, 24, 8));
+    BOOST_CHECK(!snapshot.Matches(23, tip, 7));
+    BOOST_CHECK(!snapshot.Matches(24, tip, 0));
+    BOOST_CHECK(!snapshot.Matches(24, tip, 8));
+    // A parent reorg OR ordinary extension must invalidate the old tip,
+    // including before the background replay generation has noticed it.
+    BOOST_CHECK(!snapshot.Matches(24, uint256S("fe"), 7));
+    BOOST_CHECK(!snapshot.Matches(24, uint256{}, 7));
+
+    // Every serialized field participates, including context fields that
+    // leave the P/Q pair unchanged. Test each substitution independently.
+    const std::array<std::function<void(DrivechainAnchor&)>, 8> mutations{{
+        [](DrivechainAnchor& a) { ++a.version; },
+        [](DrivechainAnchor& a) { a.parent_block_hash = uint256S("03"); },
+        [](DrivechainAnchor& a) { a.bmm_block_hash = uint256S("04"); },
+        [](DrivechainAnchor& a) { a.parent_chainwork = uint256S("11"); },
+        [](DrivechainAnchor& a) { a.bmm_chainwork = uint256S("21"); },
+        [](DrivechainAnchor& a) { ++a.parent_height; },
+        [](DrivechainAnchor& a) { ++a.bmm_height; },
+        [](DrivechainAnchor& a) { ++a.parent_median_time_past; },
+    }};
+    for (size_t i = 0; i < mutations.size(); ++i) {
+        BOOST_TEST_CONTEXT("serialized anchor field " << i) {
+            DrivechainAnchor changed = anchor;
+            mutations[i](changed);
+            BOOST_CHECK(changed != anchor);
+            BOOST_CHECK(!snapshot.Contains(changed, 24, 7));
+        }
+    }
+    // Height substitutions must also miss when their pair remains sane.
+    auto other_height = anchor;
+    ++other_height.parent_height;
+    ++other_height.bmm_height;
+    BOOST_REQUIRE(other_height.IsSane());
+    BOOST_CHECK(!snapshot.Contains(other_height, 24, 7));
+
+    for (const int invalid_slot : {-1, 256}) {
+        DrivechainAnchorSnapshot invalid{invalid_slot, tip, 7};
+        BOOST_CHECK(!invalid.Add(anchor, DrivechainAnchorStatus::ACTIVE));
+        BOOST_CHECK(!invalid.Matches(invalid_slot, tip, 7));
+    }
+    DrivechainAnchorSnapshot no_epoch{24, tip, 0};
+    BOOST_CHECK(!no_epoch.Add(anchor, DrivechainAnchorStatus::ACTIVE));
+    BOOST_CHECK(!no_epoch.EpochMatches(24, 0));
+    DrivechainAnchorSnapshot no_tip{24, uint256{}, 7};
+    BOOST_CHECK(!no_tip.Add(anchor, DrivechainAnchorStatus::ACTIVE));
+    BOOST_CHECK(!no_tip.Matches(24, uint256{}, 7));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_anchor_snapshot_bulk_positive_only)
+{
+    DrivechainAnchor anchor;
+    anchor.parent_block_hash = uint256S("01");
+    anchor.bmm_block_hash = uint256S("02");
+    anchor.parent_chainwork = uint256S("10");
+    anchor.bmm_chainwork = uint256S("20");
+    anchor.parent_median_time_past = 1'700'000'000;
+    DrivechainAnchorSnapshot snapshot{24, uint256S("ff"), 7};
+    std::vector<DrivechainAnchor> anchors;
+    // More than the 62-anchor startup regression: positive lookups are
+    // in-memory and do not open/reset one parent budget per ancestor.
+    DrivechainParentValidationBudget budget{/*enable=*/true};
+    for (uint32_t height = 100; height < 228; ++height) {
+        anchor.parent_height = height;
+        anchor.bmm_height = height + 1;
+        BOOST_REQUIRE(anchor.IsSane());
+        BOOST_REQUIRE(snapshot.Add(anchor, DrivechainAnchorStatus::ACTIVE));
+        anchors.push_back(anchor);
+    }
+    BOOST_CHECK_EQUAL(snapshot.Size(), 128U);
+    for (const auto& active : anchors) {
+        BOOST_CHECK(snapshot.Contains(active, 24, 7));
+        BOOST_CHECK(snapshot.Add(active, DrivechainAnchorStatus::ACTIVE));
+    }
+    BOOST_CHECK_EQUAL(snapshot.Size(), 128U);
+
+    ++anchor.parent_height;
+    ++anchor.bmm_height;
+    BOOST_REQUIRE(anchor.IsSane());
+    BOOST_CHECK(!snapshot.Add(anchor, DrivechainAnchorStatus::ORPHANED));
+    BOOST_CHECK(!snapshot.Add(anchor, DrivechainAnchorStatus::UNAVAILABLE));
+    BOOST_CHECK(!snapshot.Contains(anchor, 24, 7));
+    anchor.bmm_block_hash.SetNull();
+    BOOST_REQUIRE(!anchor.IsSane());
+    BOOST_CHECK(!snapshot.Add(anchor, DrivechainAnchorStatus::ACTIVE));
+    BOOST_CHECK(!snapshot.Contains(anchor, 24, 7));
+    BOOST_CHECK_EQUAL(snapshot.Size(), 128U);
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_anchor_snapshot_failed_warm_clears_output)
+{
+    util::SignalInterrupt interrupt;
+    std::string error;
+    std::shared_ptr<const DrivechainAnchorSnapshot> result =
+        std::make_shared<DrivechainAnchorSnapshot>(24, uint256S("ff"), 7);
+    {
+        DrivechainParentValidationBudget budget{/*enable=*/true};
+        BOOST_CHECK(!WarmDrivechainAnchorSnapshot({}, 24, interrupt, result, &error));
+        BOOST_CHECK(!result);
+        BOOST_CHECK(error.find("inside a parent validation budget") != std::string::npos);
+    }
+    // These failures happen before RPC; no synthetic authentication or
+    // network-dependent fixture is allowed to turn a partial result valid.
+    result = std::make_shared<DrivechainAnchorSnapshot>(24, uint256S("ff"), 7);
+    BOOST_CHECK(!WarmDrivechainAnchorSnapshot({}, -1, interrupt, result, &error));
+    BOOST_CHECK(!result);
+    BOOST_CHECK(!error.empty());
+    result = std::make_shared<DrivechainAnchorSnapshot>(24, uint256S("ff"), 7);
+    BOOST_REQUIRE(interrupt());
+    BOOST_CHECK(!WarmDrivechainAnchorSnapshot({}, 24, interrupt, result, &error));
+    BOOST_CHECK(!result);
+    BOOST_CHECK(error.find("interrupted") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_anchor_snapshot_does_not_outlive_locked_budget)
+{
+    DrivechainAnchorSnapshot snapshot{24, uint256S("ff"), 7};
+    std::string error;
+    DrivechainParentValidationBudget budget{/*enable=*/true};
+    std::this_thread::sleep_for(std::chrono::milliseconds{2100});
+    // Deadline rejection precedes the generation lookup, so this test needs
+    // neither a fabricated replay epoch nor an available parent RPC server.
+    BOOST_CHECK(!CheckDrivechainAnchorSnapshotEpoch(snapshot, 24, &error));
+    BOOST_CHECK(error.find("work budget exhausted") != std::string::npos);
+    // Nested budgets must not reset the two-second aggregate limit.
+    DrivechainParentValidationBudget nested{/*enable=*/true};
+    BOOST_CHECK(!CheckDrivechainAnchorSnapshotEpoch(snapshot, 24, &error));
+    BOOST_CHECK(error.find("work budget exhausted") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_anchor_sequence_is_strict)
