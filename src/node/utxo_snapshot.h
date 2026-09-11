@@ -12,6 +12,8 @@
 #include <serialize.h>
 #include <sync.h>
 #include <uint256.h>
+#include <txdb.h>
+#include <usdd_withdrawal_accumulator.h>
 #include <util/chaintype.h>
 #include <util/check.h>
 #include <util/fs.h>
@@ -24,8 +26,27 @@
 static constexpr std::array<uint8_t, 5> SNAPSHOT_MAGIC_BYTES = {'u', 't', 'x', 'o', 0xff};
 
 class Chainstate;
+class ChainstateManager;
 
 namespace node {
+/** Consistent native sources, not a frozen proof checkpoint or wire encoding.
+ * The active coins database must outlive both cursors (no chainstate teardown
+ * or cache resize while consuming). Metadata is copied, not a live tip pointer.
+ * Output witnesses still require authenticated source-block retrieval.
+ */
+struct ChildCheckpointSources {
+    uint256 genesis;
+    uint256 block_hash;
+    int height;
+    usdd::WithdrawalAccumulatorState withdrawals;
+    std::unique_ptr<CCoinsViewCursor> coins;
+    std::unique_ptr<CSpentPeginCursor> spent_claims;
+};
+
+//! Flush and capture all sources at one active tip. Caller holds cs_main.
+ChildCheckpointSources PrepareChildCheckpointSources(ChainstateManager& chainman)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
 //! Metadata describing a serialized version of a UTXO set from which an
 //! assumeutxo Chainstate can be constructed.
 //! All metadata fields come from an untrusted file, so must be validated

@@ -62,6 +62,12 @@ struct DrivechainBmmBlockContext : public DrivechainParentBlockContext {
     uint32_t bmm_height{0};
 };
 
+/** Authenticate a historical execution anchor on the same stable active chain
+ * as the bidding parent. Does not replace or authenticate a BIP301 P->Q edge. */
+bool GetDrivechainExecutionAnchor(int slot, const uint256& hash,
+    uint32_t minimum_height, const DrivechainParentBlockContext& bid_parent,
+    DrivechainParentBlockContext& anchor, std::string* error = nullptr);
+
 enum class DrivechainAnchorStatus {
     ACTIVE,
     ORPHANED,
@@ -504,6 +510,14 @@ bool GetDrivechainParentBlockContext(const CBlock& block,
                                      DrivechainParentBlockContext& context,
                                      std::string* error = nullptr);
 
+/** Authenticate a stable active parent tip for native mempool admission.
+ * This is not an inclusion proof; candidate validation must authenticate its
+ * own committed P again. On failure the result is cleared.
+ */
+bool GetDrivechainMempoolParentContext(int sidechain_slot,
+                                      DrivechainParentBlockContext& context,
+                                      std::string* error = nullptr);
+
 /** Compatibility overload while validation migrates to the parent-only type. */
 bool GetDrivechainParentBlockContext(const CBlock& block,
                                      int sidechain_slot,
@@ -638,6 +652,9 @@ bool ComputeDrivechainM6Id(const Sidechain::Bitcoin::CTransaction& transaction,
  * Authenticate the containing parent block and require one exact BIP300 M5
  * deposit.  Callers in consensus validation must preserve UNAVAILABLE as a
  * retryable validation stall rather than converting it to block invalidity.
+ * child_height must come from the validated child block index (active tip + 1
+ * for admission), never from the witness. Unknown context retains the
+ * historical confirmation depth.
  */
 DrivechainDepositStatus GetConfirmedDrivechainDepositStatus(
     const uint256& mainchain_block_hash,
@@ -645,7 +662,8 @@ DrivechainDepositStatus GetConfirmedDrivechainDepositStatus(
     const COutPoint& outpoint,
     CAmount value,
     const std::vector<unsigned char>& address,
-    std::string* error = nullptr);
+    std::string* error = nullptr,
+    int child_height = -1);
 
 /** Compatibility wrapper for non-consensus callers. */
 bool IsConfirmedDrivechainDeposit(const uint256& mainchain_block_hash,
@@ -653,6 +671,12 @@ bool IsConfirmedDrivechainDeposit(const uint256& mainchain_block_hash,
                                   const COutPoint& outpoint,
                                   CAmount value,
                                   const std::vector<unsigned char>& address,
-                                  std::string* error = nullptr);
+                                  std::string* error = nullptr,
+                                  int child_height = -1);
+
+/** Inclusive confirmations through an authenticated parent anchor; never accepts a future deposit. */
+bool HasRequiredDrivechainDepositDepth(uint32_t deposit_height,
+                                      uint32_t confirmed_through_height,
+                                      uint32_t required_depth);
 
 #endif // BITCOIN_MAINCHAINRPC_H

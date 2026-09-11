@@ -2,12 +2,22 @@
 // Distributed under the MIT software license.
 
 #include <ecx_exchange_state.h>
+#include <blind.h>
+#include <confidential_validation.h>
+#include <issuance.h>
+#include <core_io.h>
+#include <rpc/util.h>
+#include <univalue.h>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 
 #include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
 #include <consensus/tx_verify.h>
+#include <consensus/tx_check.h>
 #include <consensus/validation.h>
 #include <crypto/sha256.h>
 #include <drivechain_bmm.h>
@@ -23,12 +33,14 @@ extern "C" {
 #include <simplicity/elements/env.h>
 }
 #include <streams.h>
+#include <undo.h>
 #include <test/ecx_simplicity_test_shim.h>
 #include <test/util/setup_common.h>
 #include <test/data/ecx_v17_configuration.hex.h>
 #include <test/data/ecx_v18_configuration.hex.h>
 #include <test/data/ecx_successor_bond_inbox_source_v23.hex.h>
 #include <util/strencodings.h>
+#include <common/args.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -37,6 +49,19 @@ extern "C" {
 #include <set>
 
 namespace {
+
+#ifdef ECX_PRODUCTION_ACTIVATION_PROFILE_FROZEN
+// Run each case in a separate process: LayerTwoLabsExchangeConsensus caches
+// its first successful load. Never exercise this against live chain data.
+struct FrozenAlphaProfileSetup : BasicTestingSetup {
+    FrozenAlphaProfileSetup() : BasicTestingSetup(ChainTypeMetaFrom("elements"))
+    {
+        // BasicTestingSetup clears the fee asset; production initialization
+        // resolves it to the immutable Alpha pegged asset before loading ECX.
+        ::policyAsset = Params().GetConsensus().pegged_asset;
+    }
+};
+#endif
 
 struct ElementsTestingSetup : BasicTestingSetup {
     ElementsTestingSetup()
@@ -142,6 +167,7 @@ void PopulateTestBondV2FrozenIdentities(ecx::ExchangeConsensus& consensus)
     fill(frozen.state_authority_asset_id, 34);
     fill(frozen.inventory_asset_blinding_factor, 35);
     fill(frozen.inventory_value_blinding_factor, 36);
+    fill(frozen.issuance_value_blinding_factor, 93);
     fill(frozen.redemption_queue_script_sha256, 37);
     fill(frozen.insurance_reserve_script_sha256, 38);
     fill(frozen.insurance_reserve_covenant_cmr, 39);
@@ -764,6 +790,493 @@ CMutableTransaction ConfidentialDepositTransaction(
 
 BOOST_FIXTURE_TEST_SUITE(ecx_exchange_state_tests, ElementsTestingSetup)
 
+BOOST_AUTO_TEST_CASE(checkpoint_genesis_initialization_is_stable_and_ancestor_bound)
+{
+    ecx::ExchangeConsensus consensus{};
+    auto& frozen{consensus.bond_v2};
+    const uint256 hash{uint256S("1234")};
+    CBlockIndex anchor;
+    anchor.nHeight = 5;
+    anchor.phashBlock = &hash;
+    DrivechainAnchor parent;
+    parent.parent_block_hash = uint256S("11");
+    parent.bmm_block_hash = uint256S("12");
+    parent.parent_chainwork = uint256S("01");
+    parent.bmm_chainwork = uint256S("02");
+    parent.parent_height = 10;
+    parent.bmm_height = 11;
+    parent.parent_median_time_past = 100;
+    anchor.m_drivechain_anchor = parent;
+    CBlockIndex intermediate;
+    intermediate.nHeight = 6;
+    intermediate.pprev = &anchor;
+    CBlockIndex previous;
+    previous.nHeight = 7;
+    previous.pprev = &intermediate;
+    frozen.genesis_initialization_version = 2;
+    frozen.genesis_initialization_height = 5;
+    frozen.genesis_initialization_block_hash = hash;
+    frozen.genesis_initialization_parent_mtp = 100;
+    uint64_t height{0}, mtp{0};
+    std::string error;
+    const auto resolve = [&](uint32_t creation, uint64_t current) {
+        return ecx::ResolveBondV2GenesisInitialization(
+            &previous, creation, current, height, mtp, error, consensus);
+    };
+    BOOST_REQUIRE(resolve(6, 110));
+    BOOST_CHECK_EQUAL(height, 5);
+    BOOST_CHECK_EQUAL(mtp, 100);
+    BOOST_REQUIRE(resolve(7, 120));
+    BOOST_CHECK_EQUAL(height, 5);
+    BOOST_CHECK_EQUAL(mtp, 100);
+    // Equality is allowed: initialization uses the authenticated parent clock,
+    // not elapsed wall time or a newly invented timestamp at signing.
+    BOOST_REQUIRE(resolve(6, 100));
+    BOOST_CHECK_EQUAL(height, 5);
+    BOOST_CHECK_EQUAL(mtp, 100);
+    const auto reject = [&](uint32_t creation, uint64_t current) {
+        height = 999;
+        mtp = 999;
+        BOOST_CHECK(!resolve(creation, current));
+        BOOST_CHECK_EQUAL(height, 0);
+        BOOST_CHECK_EQUAL(mtp, 0);
+        BOOST_CHECK(!error.empty());
+    };
+    reject(0, 100);
+    reject(6, 0);
+    const auto saved_parent = anchor.m_drivechain_anchor;
+    anchor.m_drivechain_anchor->parent_block_hash.SetNull();
+    reject(6, 100);
+    anchor.m_drivechain_anchor = saved_parent;
+    // A same-height replacement after reorg is not the frozen ancestor.
+    const uint256 replacement_hash{uint256S("5678")};
+    anchor.phashBlock = &replacement_hash;
+    reject(6, 100);
+    anchor.phashBlock = &hash;
+    BOOST_REQUIRE(resolve(6, 100));
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(!resolve(5, 120));
+    BOOST_CHECK(!resolve(8, 120));
+    BOOST_CHECK(!resolve(6, 99));
+    frozen.genesis_initialization_block_hash = uint256S("99");
+    BOOST_CHECK(!resolve(6, 120));
+    frozen.genesis_initialization_block_hash = hash;
+    anchor.m_drivechain_anchor->parent_median_time_past = 101;
+    BOOST_CHECK(!resolve(6, 120));
+    anchor.m_drivechain_anchor.reset();
+    BOOST_CHECK(!resolve(6, 120));
+    frozen.genesis_initialization_version = 1;
+    BOOST_CHECK(!resolve(6, 120));
+    BOOST_CHECK_EQUAL(height, 0);
+    BOOST_CHECK_EQUAL(mtp, 0);
+}
+
+BOOST_AUTO_TEST_CASE(genesis_funding_matches_current_rust_band_encoding)
+{
+    ecx::ExchangeConsensus consensus{};
+    consensus.bond_v2.genesis_mark_price = 3'000'000'000;
+    uint256 state, bond, funding, covenant;
+    BOOST_REQUIRE(ecx::ComputeBondV2EmptyGenesisRoots(
+        consensus, 39, 1'700'000'000, state, bond, funding, covenant));
+    BOOST_CHECK_EQUAL(funding, RawHash(
+        "ae301bba06a2b3ccf1d4fd7c05a2f36fc476e4dd064c0bb30e1fdd857c7550c2"));
+    BOOST_CHECK(!ecx::ComputeBondV2EmptyGenesisRoots(
+        consensus, 0, 1'700'000'000, state, bond, funding, covenant));
+    BOOST_CHECK(state.IsNull() && bond.IsNull() && funding.IsNull() && covenant.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(genesis_full_roots_and_script_match_rust_materializer)
+{
+    // Synthetic frozen_configuration_fixture + check_creation_independence
+    // in ecx-bond-action-client. This is serialization, not live authentication.
+    ecx::ExchangeConsensus consensus{};
+    consensus.chain_id.fill(0xcc);
+    consensus.forced_action_domain.fill(0x11);
+    consensus.deposit_inbox_domain.fill(0x12);
+    const auto repeated = [](unsigned char byte) {
+        uint256 result;
+        std::fill(result.begin(), result.end(), byte);
+        return result;
+    };
+    auto& b = consensus.bond_v2;
+    b.genesis_mark_price = 3'000'000'000;
+    b.bond_asset_id = repeated(0x77);
+    b.bond_deployment_commitment = repeated(0x88);
+    b.inventory_covenant_script_sha256 = repeated(0x70);
+    b.matcher_genesis_receipt_hash = repeated(0x10);
+    b.bond_inbox_domain = repeated(0x46);
+    b.order_receipts_genesis_root = repeated(4);
+    b.genesis_availability_root = repeated(3);
+    b.public_state_domain_sha256 = repeated(5);
+    b.state_node_domain_sha256 = repeated(6);
+    b.transition_cmr = repeated(8);
+    b.incremental_activation_cmr = repeated(9);
+    b.configuration_hash = RawHash("3df93f4bcb331b1ecf1784bcff2a7ac6e9835f4f1ca03f9c30f92e6ac7a67528");
+    const auto key = ParseHex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+    std::copy(key.begin(), key.end(), b.keyless_internal_key.begin());
+    uint256 state, bond, funding, covenant;
+    BOOST_REQUIRE(ecx::ComputeBondV2EmptyGenesisRoots(
+        consensus, 39, 1'700'000'000, state, bond, funding, covenant));
+    BOOST_CHECK_EQUAL(state, RawHash("2a3138979463a11b1a1f32eddf87f178def27eb245cd6e395543e40391ef61c7"));
+    BOOST_CHECK_EQUAL(bond, RawHash("42d03521b322730cb12768b4e9092962969aa07f262da8306f2cd5561862881e"));
+    BOOST_CHECK_EQUAL(funding, RawHash("ae301bba06a2b3ccf1d4fd7c05a2f36fc476e4dd064c0bb30e1fdd857c7550c2"));
+    BOOST_CHECK_EQUAL(covenant, RawHash("f4c6825dab61df693292077a9d84b93e586f4693cbafbbe5bd7b2a7f7d88208f"));
+    CScript script;
+    BOOST_REQUIRE(ecx::ComputeBondV2FiniteStateScript(consensus, covenant, script));
+    BOOST_CHECK_EQUAL(HexStr(script), "5120156fa2e4f41f964e2331da133c3517d68dd70f6e85c66e5764f769b17909733a");
+}
+
+BOOST_AUTO_TEST_CASE(external_prepared_genesis_roots)
+{
+    const char* path = std::getenv("ECX_TEST_RUNTIME_CANDIDATE");
+    if (!path) { BOOST_TEST_MESSAGE("External genesis comparison not requested"); return; }
+    const auto read = [](const char* file) {
+        BOOST_REQUIRE(file != nullptr);
+        std::ifstream input(file);
+        BOOST_REQUIRE(input.good());
+        const std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        UniValue value;
+        BOOST_REQUIRE(value.read(bytes));
+        return value;
+    };
+    const auto candidate = read(path);
+    const auto configuration = read(std::getenv("ECX_TEST_GENESIS_CONFIGURATION"));
+    const auto genesis = read(std::getenv("ECX_TEST_GENESIS_MATERIALIZATION"));
+    BOOST_REQUIRE_EQUAL(candidate["schema"].get_str(), "ECX_ALPHA_OFFLINE_RUNTIME_CANDIDATE_V1");
+    BOOST_REQUIRE_EQUAL(genesis["schema"].get_str(), "ECX_BOND_V2_FINITE_GENESIS_MATERIALIZATION_V2");
+    const auto& args = candidate["candidate_arguments"];
+    const auto hash = [&](const char* key) { return RawHash(args[key].get_str()); };
+    const auto array_hash = [&](const char* key) {
+        const auto& a = configuration[key];
+        BOOST_REQUIRE(a.isArray());
+        BOOST_REQUIRE_EQUAL(a.size(), 32U);
+        uint256 result;
+        for (size_t i = 0; i < 32; ++i) {
+            const auto byte = a[i].getInt<unsigned int>();
+            BOOST_REQUIRE_LE(byte, 255U);
+            result.begin()[i] = byte;
+        }
+        return result;
+    };
+    ecx::ExchangeConsensus consensus{};
+    const auto copy_arg = [&](const char* key, auto& destination) {
+        const auto value = hash(key);
+        std::copy(value.begin(), value.end(), destination.begin());
+    };
+    copy_arg("-ecxchainid", consensus.chain_id);
+    copy_arg("-ecxforcedactiondomain", consensus.forced_action_domain);
+    copy_arg("-ecxdepositinboxdomain", consensus.deposit_inbox_domain);
+    auto& b = consensus.bond_v2;
+    b.genesis_mark_price = std::stoull(args["-ecxbondv2genesismarkprice"].get_str());
+    b.bond_asset_id = array_hash("bond_asset_id");
+    b.bond_deployment_commitment = array_hash("bond_deployment_commitment");
+    b.inventory_covenant_script_sha256 = array_hash("bond_inventory_script_sha256");
+    b.bond_inbox_domain = array_hash("bond_inbox_domain");
+    b.matcher_genesis_receipt_hash = hash("-ecxbondv2matcherreceipt");
+    b.order_receipts_genesis_root = hash("-ecxbondv2orderreceiptsroot");
+    b.genesis_availability_root = hash("-ecxbondv2availabilityroot");
+    b.public_state_domain_sha256 = hash("-ecxbondv2publicstatedomain");
+    b.state_node_domain_sha256 = hash("-ecxbondv2statenodedomain");
+    b.transition_cmr = hash("-ecxbondv2transitioncmr");
+    b.incremental_activation_cmr = hash("-ecxbondv2incrementalactivationcmr");
+    b.configuration_hash = hash("-ecxbondv2configurationhash");
+    copy_arg("-ecxbondv2keylessinternalkey", b.keyless_internal_key);
+    uint256 encoded_hash;
+    std::string error;
+    BOOST_REQUIRE(ecx::ValidateBondV2FrozenConfigurationV18(
+        ParseHex(args["-ecxbondv2configurationbytes"].get_str()), encoded_hash, error));
+    BOOST_CHECK_EQUAL(encoded_hash, b.configuration_hash);
+    BOOST_CHECK_EQUAL(b.configuration_hash, RawHash(genesis["configuration_hash_hex"].get_str()));
+    const auto height = std::stoull(args["-ecxbondv2initializationheight"].get_str());
+    const auto mtp = std::stoull(args["-ecxbondv2initializationmtp"].get_str());
+    BOOST_CHECK_EQUAL(height, genesis["initialization"]["height"].getInt<uint64_t>());
+    BOOST_CHECK_EQUAL(mtp, genesis["initialization"]["parent_mtp"].getInt<uint64_t>());
+    uint256 state, bond, funding, covenant;
+    BOOST_REQUIRE(ecx::ComputeBondV2EmptyGenesisRoots(consensus, height, mtp, state, bond, funding, covenant));
+    BOOST_CHECK_EQUAL(state, RawHash(genesis["private_state_root_hex"].get_str()));
+    BOOST_CHECK_EQUAL(bond, RawHash(genesis["bond_state_root_hex"].get_str()));
+    BOOST_CHECK_EQUAL(funding, RawHash(genesis["funding_state_root_hex"].get_str()));
+    BOOST_CHECK_EQUAL(covenant, RawHash(genesis["covenant_state_hash_hex"].get_str()));
+    CScript script;
+    BOOST_REQUIRE(ecx::ComputeBondV2FiniteStateScript(consensus, covenant, script));
+    BOOST_CHECK_EQUAL(HexStr(script), genesis["state_script_hex"].get_str());
+    // Exercise the actual fixed-covenant joins enforced by the loader, not
+    // only the finite state script. This does not bypass its release gate.
+    const XOnlyPubKey internal{Span<const unsigned char>(b.keyless_internal_key.data(), 32)};
+    for (const auto& binding : std::array<std::pair<uint256, uint256>, 4>{{
+        {hash("-ecxbondv2inventorycmr"), array_hash("bond_inventory_script_sha256")},
+        {hash("-ecxbondv2queuecmr"), array_hash("bond_redemption_queue_script_sha256")},
+        {array_hash("collateral_vault_covenant_cmr"), hash("-ecxcollateralvaultscripthash")},
+        {array_hash("insurance_reserve_covenant_cmr"), array_hash("insurance_reserve_script_sha256")},
+    }}) {
+        std::vector<unsigned char> leaf_payload{TAPROOT_LEAF_TAPSIMPLICITY, 32};
+        leaf_payload.insert(leaf_payload.end(), binding.first.begin(), binding.first.end());
+        const auto leaf = TestTaggedHash("TapLeaf/elements", leaf_payload);
+        const auto tweaked = internal.CreateTapTweak(&leaf);
+        BOOST_REQUIRE(tweaked.has_value());
+        CScript covenant_script;
+        covenant_script << OP_1 << std::vector<unsigned char>(tweaked->first.begin(), tweaked->first.end());
+        uint256 digest;
+        CSHA256().Write(covenant_script.data(), covenant_script.size()).Finalize(digest.begin());
+        BOOST_CHECK_EQUAL(digest, binding.second);
+    }
+    // Input joins and native derivation only: not ancestry, signatures, or release qualification.
+}
+
+BOOST_AUTO_TEST_CASE(external_preserved_bond_deployment_openings)
+{
+    // Explicit opt-in: never replace the repository fixtures or require a
+    // developer's private runtime configuration for ordinary test execution.
+    const char* path = std::getenv("ECX_TEST_BOND_PROFILE");
+    if (!path) { BOOST_TEST_MESSAGE("External deployment check not requested"); return; }
+    std::ifstream input(path);
+    BOOST_REQUIRE(input.good());
+    const std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    UniValue profile;
+    BOOST_REQUIRE(profile.read(bytes));
+    const auto& args = profile["arguments"];
+    auto number = [&](const char* key) -> uint32_t {
+        const auto& value = args[key];
+        return value.isStr() ? std::stoul(value.get_str()) : value.getInt<uint32_t>();
+    };
+    auto raw = [&](const char* key) {
+        const auto decoded = ParseHex(args[key].get_str());
+        BOOST_REQUIRE_EQUAL(decoded.size(), 32U);
+        uint256 value;
+        std::copy(decoded.begin(), decoded.end(), value.begin());
+        return value;
+    };
+    CMutableTransaction mutable_tx;
+    BOOST_REQUIRE(DecodeHexTx(mutable_tx, args["-ecxbondv2deploymenttx"].get_str(), true, true));
+    const CTransaction tx(mutable_tx);
+    const auto issuance_index = number("-ecxbondv2issuanceinput");
+    const auto issuance_blinder = raw("-ecxbondv2issuancevalueblinder");
+    const auto inventory_abf = raw("-ecxbondv2inventoryassetblinder");
+    const auto inventory_vbf = raw("-ecxbondv2inventoryvalueblinder");
+    BOOST_REQUIRE(issuance_blinder != inventory_abf && issuance_blinder != inventory_vbf);
+    BOOST_REQUIRE(ecx::VerifyBondIssuance(tx, issuance_index, issuance_blinder));
+    uint256 entropy;
+    const auto& issuance = tx.vin.at(issuance_index);
+    GenerateAssetEntropy(entropy, issuance.prevout, issuance.assetIssuance.assetEntropy);
+    CAsset asset, token;
+    CalculateAsset(asset, entropy);
+    CalculateReissuanceToken(token, entropy, true);
+    const auto& inventory = tx.vout.at(number("-ecxbondv2inventoryoutput"));
+    BOOST_REQUIRE(VerifyConfidentialPair(inventory.nValue, inventory.nAsset,
+        2'100'000'000'000'000, asset, inventory_vbf, inventory_abf));
+    const auto& burn = tx.vout.at(number("-ecxbondv2burnoutput"));
+    BOOST_REQUIRE(burn.nAsset.IsExplicit() && burn.nAsset.GetAsset() == token);
+    BOOST_REQUIRE(burn.nValue.IsExplicit() && burn.nValue.GetAmount() == 1);
+    BOOST_REQUIRE(burn.nNonce.IsNull() && burn.scriptPubKey.IsUnspendable());
+    BOOST_TEST_MESSAGE("Verified preserved deployment issuance/inventory/token: " << tx.GetHash().ToString());
+    // This deliberately does not claim signatures, input conservation, source
+    // UTXO authentication, genesis linkage or full deployment qualification.
+}
+
+BOOST_AUTO_TEST_CASE(external_public_deployment_relation)
+{
+    const char* path = std::getenv("ECX_TEST_PUBLIC_DEPLOYMENT");
+    if (!path) { BOOST_TEST_MESSAGE("External public deployment not requested"); return; }
+    std::ifstream input(path);
+    BOOST_REQUIRE(input.good());
+    const std::string bytes{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    UniValue candidate;
+    BOOST_REQUIRE(candidate.read(bytes));
+    BOOST_REQUIRE_EQUAL(candidate["schema"].get_str(), "ALPHA_PUBLIC_DEPLOYMENT_MIGRATION_CANDIDATE_V1");
+    CMutableTransaction mutable_tx;
+    BOOST_REQUIRE(DecodeHexTx(mutable_tx, candidate["transactionHex"].get_str(), true, true));
+    const CTransaction tx(mutable_tx);
+    BOOST_REQUIRE_EQUAL(tx.vin.size(), 2);
+    BOOST_REQUIRE_EQUAL(tx.vout.size(), 5);
+    TxValidationState legacy_totals, per_asset_totals;
+    BOOST_CHECK(!CheckTransaction(tx, legacy_totals, false));
+    BOOST_CHECK_EQUAL(legacy_totals.GetRejectReason(), "bad-txns-txouttotal-toolarge");
+    BOOST_CHECK(CheckTransaction(tx, per_asset_totals, true));
+    BOOST_CHECK(Consensus::HasOnlyExplicitCreations(tx));
+    BOOST_REQUIRE(ecx::VerifyPublicBondDeployment(tx, 0, 0, 1));
+    uint256 entropy;
+    GenerateAssetEntropy(entropy, tx.vin[0].prevout, tx.vin[0].assetIssuance.assetEntropy);
+    CAsset asset, token;
+    CalculateAsset(asset, entropy);
+    CalculateReissuanceToken(token, entropy, false);
+    BOOST_CHECK_EQUAL(tx.GetHash().ToString(), candidate["candidateTxid"].get_str());
+    BOOST_CHECK_EQUAL(asset.GetHex(), candidate["bondAsset"].get_str());
+    BOOST_CHECK_EQUAL(token.GetHex(), candidate["tokenAsset"].get_str());
+    const auto script_hash = [](const CScript& script) {
+        uint256 result;
+        CSHA256().Write(script.data(), script.size()).Finalize(result.begin());
+        return result;
+    };
+    const auto commitment = ecx::BondDeploymentCommitment(3,
+        {tx.GetHash().ToUint256(), tx.vin[0].prevout.hash.ToUint256(), tx.vin[0].prevout.n,
+         asset.id, token.id, 0, 1, script_hash(tx.vout[0].scriptPubKey), script_hash(tx.vout[1].scriptPubKey)});
+    // Independently derived by the Rust public relation from these candidate bytes.
+    BOOST_CHECK_EQUAL(HexStr(Span{commitment.begin(), commitment.end()}),
+        "0dbfe1a4dc3fc5089ca31c6f346e49cbd86567393e2a4d9357f1f89b46c260ac");
+    if (const char* funding_path = std::getenv("ECX_TEST_PUBLIC_DEPLOYMENT_FUNDING")) {
+        std::ifstream funding_file(funding_path);
+        BOOST_REQUIRE(funding_file.good());
+        const std::string funding_bytes{std::istreambuf_iterator<char>(funding_file), std::istreambuf_iterator<char>()};
+        UniValue funding;
+        BOOST_REQUIRE(funding.read(funding_bytes));
+        std::vector<CTxOut> prevouts;
+        for (const auto& in : tx.vin) {
+            bool found = false;
+            for (const auto& entry : funding["inputs"].getValues()) {
+                if (entry["txid"].get_str() != in.prevout.hash.ToString() || entry["vout"].getInt<uint32_t>() != in.prevout.n) continue;
+                BOOST_REQUIRE(!found);
+                const auto& output = entry["output"];
+                const auto script_bytes = ParseHex(output["scriptPubKey"]["hex"].get_str());
+                CTxOut out;
+                out.nAsset = CConfidentialAsset(CAsset(uint256S(output["asset"].get_str())));
+                out.nValue = CConfidentialValue(AmountFromValue(output["value"]));
+                out.scriptPubKey = CScript(script_bytes.begin(), script_bytes.end());
+                prevouts.push_back(out);
+                found = true;
+            }
+            BOOST_REQUIRE(found);
+        }
+        // Unsigned serialization lacks input witnesses: issuance verification
+        // rejects before checking conservation. No consensus relaxation needed.
+        BOOST_CHECK(!VerifyAmounts(prevouts, tx, nullptr, false));
+        mutable_tx.witness.vtxinwit.resize(mutable_tx.vin.size());
+        BOOST_CHECK(VerifyAmounts(prevouts, CTransaction(mutable_tx), nullptr, false));
+        BOOST_CHECK_EQUAL(CTransaction(mutable_tx).GetHash(), tx.GetHash());
+        mutable_tx.vout[0].nValue = CConfidentialValue(mutable_tx.vout[0].nValue.GetAmount() - 1);
+        BOOST_CHECK(!VerifyAmounts(prevouts, CTransaction(mutable_tx), nullptr, false));
+    }
+    // This does not validate input signatures/UTXOs or a production configuration join.
+}
+
+BOOST_AUTO_TEST_CASE(confidential_bond_issuance_checks_opening_and_rangeproof)
+{
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.witness.vtxinwit.resize(1);
+    auto& issuance = tx.vin[0].assetIssuance;
+    issuance.nInflationKeys = CConfidentialValue(1);
+    uint256 entropy;
+    GenerateAssetEntropy(entropy, tx.vin[0].prevout, issuance.assetEntropy);
+    CAsset asset;
+    CalculateAsset(asset, entropy);
+    const uint256 blinder = uint256S("01");
+    const uint256 nonce = uint256S("02");
+    secp256k1_generator generator;
+    BOOST_REQUIRE(secp256k1_generator_generate(secp256k1_blind_context, &generator, asset.begin()));
+    secp256k1_pedersen_commitment commitment;
+    CreateValueCommitment(issuance.nAmount, commitment, blinder.begin(), generator, 2'100'000'000'000'000);
+    auto& proof = tx.witness.vtxinwit[0].vchIssuanceAmountRangeproof;
+    proof.resize(5134);
+    size_t size = proof.size();
+    BOOST_REQUIRE(secp256k1_rangeproof_sign(secp256k1_blind_context, proof.data(), &size,
+        0, &commitment, blinder.begin(), nonce.begin(), 0, 52,
+        2'100'000'000'000'000, nullptr, 0, nullptr, 0, &generator));
+    proof.resize(size);
+    BOOST_CHECK(ecx::VerifyBondIssuance(CTransaction(tx), 0, blinder));
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 1, blinder));
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, uint256{}));
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, nonce));
+    const auto original = tx;
+    proof[0] ^= 1;
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, blinder));
+    tx = original;
+    tx.witness.vtxinwit[0].vchIssuanceAmountRangeproof.clear();
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, blinder));
+    tx = original;
+    tx.witness.vtxinwit[0].vchInflationKeysRangeproof = {1};
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, blinder));
+    tx = original;
+    tx.vin[0].assetIssuance.nAmount = CConfidentialValue(2'100'000'000'000'000);
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, blinder));
+    tx = original;
+    tx.vin[0].assetIssuance.assetBlindingNonce = nonce;
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, blinder));
+}
+
+BOOST_AUTO_TEST_CASE(bond_deployment_commitment_encoding_vector)
+{
+    const auto sequence = [](unsigned char start) {
+        uint256 value;
+        for (size_t i = 0; i < 32; ++i) value.begin()[i] = start + i;
+        return value;
+    };
+    const ecx::BondDeploymentCommitmentFields fields{
+        sequence(0), sequence(32), 0x01020304, sequence(64), sequence(96),
+        0x05060708, 0x090a0b0c, sequence(128), sequence(160)};
+    const auto bytes = ecx::EncodeBondDeploymentCommitment(3, fields);
+    BOOST_REQUIRE_EQUAL(bytes.size(), 213);
+    BOOST_CHECK_EQUAL(HexStr(bytes),
+        "03000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f01020304"
+        "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+        "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+        "000775f05a07400005060708090a0b0c"
+        "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf");
+    // Independent hashlib/struct vector: compare digest bytes, not uint256 display order.
+    const auto public_hash = ecx::BondDeploymentCommitment(3, fields);
+    BOOST_CHECK_EQUAL(HexStr(Span{public_hash.begin(), public_hash.end()}),
+        "d6f052787853cd42b3d7838d424ea45f59d14b3bce3373c33fb3f871f919b1bf");
+    auto legacy = bytes;
+    legacy[0] = 1;
+    BOOST_CHECK(ecx::EncodeBondDeploymentCommitment(2, fields) == legacy);
+    const auto legacy_hash = ecx::BondDeploymentCommitment(2, fields);
+    BOOST_CHECK_EQUAL(HexStr(Span{legacy_hash.begin(), legacy_hash.end()}),
+        "2fbd5df12cd975d4afd10470e9f06a76e6cfb7c41fbd79d9391f677864caa7e8");
+    BOOST_CHECK_THROW(ecx::EncodeBondDeploymentCommitment(1, fields), std::invalid_argument);
+    BOOST_CHECK_THROW(ecx::BondDeploymentCommitment(4, fields), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(public_bond_deployment_exact_relation)
+{
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vin[0].prevout = COutPoint{Txid::FromUint256(uint256S("1234")), 7};
+    auto& issuance = tx.vin[0].assetIssuance;
+    issuance.assetEntropy = uint256S("5678");
+    issuance.nAmount = CConfidentialValue(2'100'000'000'000'000);
+    issuance.nInflationKeys = CConfidentialValue(1);
+    uint256 entropy;
+    GenerateAssetEntropy(entropy, tx.vin[0].prevout, issuance.assetEntropy);
+    CAsset asset, token, confidential_token;
+    CalculateAsset(asset, entropy);
+    CalculateReissuanceToken(token, entropy, false);
+    CalculateReissuanceToken(confidential_token, entropy, true);
+    BOOST_REQUIRE(token != confidential_token);
+    tx.vout.resize(2);
+    tx.vout[0].nAsset = CConfidentialAsset(asset);
+    tx.vout[0].nValue = issuance.nAmount;
+    tx.vout[0].scriptPubKey = CScript{} << OP_TRUE;
+    tx.vout[1].nAsset = CConfidentialAsset(token);
+    tx.vout[1].nValue = CConfidentialValue(1);
+    tx.vout[1].scriptPubKey = CScript{} << OP_RETURN;
+    BOOST_REQUIRE(ecx::VerifyPublicBondDeployment(CTransaction(tx), 0, 0, 1));
+    const auto reject = [&](auto mutate) {
+        auto changed = tx;
+        mutate(changed);
+        BOOST_CHECK(!ecx::VerifyPublicBondDeployment(CTransaction(changed), 0, 0, 1));
+    };
+    reject([&](auto& value) { value.vout[1].nAsset = CConfidentialAsset(confidential_token); });
+    reject([](auto& value) { value.vin[0].m_is_pegin = true; });
+    reject([](auto& value) { value.vin.push_back(value.vin[0]); });
+    reject([](auto& value) { value.vin[0].assetIssuance.nAmount = CConfidentialValue(1); });
+    reject([](auto& value) { value.vin[0].assetIssuance.assetBlindingNonce = uint256S("01"); });
+    reject([](auto& value) { value.vout[0].nValue = CConfidentialValue(1); });
+    reject([](auto& value) { value.vout[0].scriptPubKey = CScript{} << OP_RETURN; });
+    reject([](auto& value) { value.vout[1].scriptPubKey = CScript{} << OP_TRUE; });
+    reject([](auto& value) { value.vout.push_back(value.vout[0]); });
+    reject([](auto& value) { value.vout.push_back(value.vout[1]); });
+    reject([](auto& value) { value.vout[0].nNonce.vchCommitment.assign(33, 2); });
+    reject([](auto& value) { value.witness.vtxinwit.resize(1); value.witness.vtxinwit[0].vchIssuanceAmountRangeproof = {1}; });
+    reject([](auto& value) { value.witness.vtxinwit.resize(1); value.witness.vtxinwit[0].vchInflationKeysRangeproof = {1}; });
+    reject([](auto& value) { value.witness.vtxoutwit.resize(2); value.witness.vtxoutwit[0].vchRangeproof = {1}; });
+    reject([](auto& value) { value.witness.vtxoutwit.resize(2); value.witness.vtxoutwit[0].vchSurjectionproof = {1}; });
+    BOOST_CHECK(!ecx::VerifyPublicBondDeployment(CTransaction(tx), 1, 0, 1));
+    BOOST_CHECK(!ecx::VerifyPublicBondDeployment(CTransaction(tx), 0, 0, 0));
+    BOOST_CHECK(!ecx::VerifyPublicBondDeployment(CTransaction(tx), 0, 0, 2));
+    BOOST_CHECK(!ecx::VerifyBondIssuance(CTransaction(tx), 0, uint256{}));
+}
+
 BOOST_AUTO_TEST_CASE(tapbranch_ordering_uses_serialized_hash_bytes_not_arithmetic_value)
 {
     uint256 serialized_first;
@@ -803,13 +1316,58 @@ BOOST_AUTO_TEST_CASE(finite_state_tree_preauthorizes_incremental_activation_leaf
     BOOST_CHECK_NE(HexStr(production), HexStr(changed_script));
 }
 
+BOOST_AUTO_TEST_CASE(incremental_activation_binds_consumed_finite_coin)
+{
+    ecx::ExchangeConsensus consensus{ConfiguredConsensus(
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
+    PopulateTestBondV2FrozenIdentities(consensus);
+    ecx::BondV2CapitalSnapshot prior;
+    prior.proof_profile = 0;
+    prior.covenant_state_hash = uint256S("1234");
+    CTxOut output{AuthorityOutput(1)};
+    BOOST_REQUIRE(ecx::ComputeBondV2FiniteStateScript(
+        consensus, prior.covenant_state_hash, output.scriptPubKey));
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256S("1235")), 0});
+    const Coin coin{output, 49, false};
+    prior.exchange_state_root = ecx::ComputeStateUtxoRoot(
+        Params().GetConsensus().hashGenesisBlock, tx.vin[0].prevout, output);
+    std::string error;
+    auto check = [&](const CMutableTransaction& candidate, const Coin& spent,
+                     const ecx::BondV2CapitalSnapshot& snapshot) {
+        return ecx::CheckBondV2ActivationPredecessorCoin(CTransaction{candidate},
+            spent, prior.exchange_state_root, snapshot, error, consensus);
+    };
+    BOOST_CHECK(check(tx, coin, prior));
+    auto changed_tx{tx};
+    changed_tx.vin[0].prevout.n = 1;
+    BOOST_CHECK(!check(changed_tx, coin, prior));
+    changed_tx = tx;
+    changed_tx.vin[0].m_is_pegin = true;
+    BOOST_CHECK(!check(changed_tx, coin, prior));
+    BOOST_CHECK(!check(tx, Coin{}, prior));
+    auto changed_output{output};
+    changed_output.scriptPubKey = CScript{} << OP_TRUE;
+    BOOST_CHECK(!check(tx, Coin{changed_output, 49, false}, prior));
+    auto changed_prior{prior};
+    changed_prior.covenant_state_hash = uint256S("4321");
+    BOOST_CHECK(!check(tx, coin, changed_prior));
+    BOOST_CHECK(error.find("covenant-state bound") != std::string::npos);
+    changed_prior = prior;
+    changed_prior.exchange_state_root.SetNull();
+    BOOST_CHECK(!check(tx, coin, changed_prior));
+    changed_prior = prior;
+    changed_prior.proof_profile = 1;
+    BOOST_CHECK(!check(tx, coin, changed_prior));
+}
+
 BOOST_AUTO_TEST_CASE(frozen_configuration_v18_exact_rust_vector_and_mutations)
 {
     static constexpr size_t COLLATERAL_COVENANT_CMR_OFFSET{1232};
     static constexpr size_t ECX_ASSET_OFFSET{50};
     static constexpr size_t USDD_ASSET_OFFSET{82};
     static constexpr size_t STATE_AUTHORITY_ASSET_OFFSET{146};
-    static constexpr size_t TRUTHCOIN_ANCHOR_AUTHORITY_OFFSET{722};
+    static constexpr size_t TRUTHCOIN_ANCHOR_AUTHORITY_OFFSET{754};
     static constexpr size_t AVAILABILITY_SCHEME_OFFSET{293};
     static constexpr size_t MATCHER_FORCED_INCLUSION_BLOCKS_OFFSET{1128};
     static constexpr size_t STAGING_TEMPLATE_OFFSET{1392};
@@ -909,6 +1467,114 @@ BOOST_AUTO_TEST_CASE(frozen_configuration_v18_exact_rust_vector_and_mutations)
     // V17 is retained only as a historical fixture and is never accepted by
     // the live V18 decoder, even if its former tagged digest is known.
     rejects(ParseHex(ECX_V17_CONFIGURATION_HEX));
+}
+
+BOOST_AUTO_TEST_CASE(frozen_configuration_v18_native_ecx_fee_asset_alias)
+{
+    // Byte offsets in the exact, historical V18 Rust vector. This test does
+    // not make the fixture a live deployment or qualify a new proof binary.
+    static constexpr size_t ECX_ASSET_OFFSET{50};
+    static constexpr size_t POLICY_ASSET_OFFSET{114};
+    static constexpr std::array<size_t, 10> OTHER_BASE_IDENTITIES{{
+        2, 82, 146, 179, 211, 754, 1096, 1132, 1164, 1196,
+    }};
+    const std::vector<unsigned char> original{ParseHex(ECX_V18_CONFIGURATION_HEX)};
+    BOOST_REQUIRE_EQUAL(original.size(), 1977U);
+
+    std::vector<unsigned char> native_fees{original};
+    std::copy_n(
+        native_fees.begin() + ECX_ASSET_OFFSET, 32,
+        native_fees.begin() + POLICY_ASSET_OFFSET);
+    uint256 configuration_hash;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(ecx::ValidateBondV2FrozenConfigurationV18(
+        native_fees, configuration_hash, error), error);
+    BOOST_CHECK_EQUAL(configuration_hash, TestTaggedHash(
+        "ECX/frozen-configuration/v18-no-history-keyless-staging-renderer-v2",
+        native_fees));
+    BOOST_CHECK_NE(configuration_hash, TestTaggedHash(
+        "ECX/frozen-configuration/v18-no-history-keyless-staging-renderer-v2",
+        original));
+
+    // Native ECX may pay fees. USDD, authority assets, and every unrelated
+    // domain/identity must still be rejected as aliases of the policy asset.
+    for (const size_t offset : OTHER_BASE_IDENTITIES) {
+        BOOST_TEST_CONTEXT("policy asset aliases identity at byte " << offset) {
+            std::vector<unsigned char> collision{original};
+            std::copy_n(
+                collision.begin() + offset, 32,
+                collision.begin() + POLICY_ASSET_OFFSET);
+            BOOST_CHECK(!ecx::ValidateBondV2FrozenConfigurationV18(
+                collision, configuration_hash, error));
+            BOOST_CHECK(configuration_hash.IsNull());
+            BOOST_CHECK(!error.empty());
+        }
+    }
+    std::vector<unsigned char> zero_policy{native_fees};
+    std::fill_n(zero_policy.begin() + POLICY_ASSET_OFFSET, 32, 0);
+    BOOST_CHECK(!ecx::ValidateBondV2FrozenConfigurationV18(
+        zero_policy, configuration_hash, error));
+    BOOST_CHECK(configuration_hash.IsNull());
+
+    // The one allowed alias must not mask another duplicate base identity.
+    std::vector<unsigned char> ecx_equals_usdd{native_fees};
+    std::copy_n(ecx_equals_usdd.begin() + ECX_ASSET_OFFSET, 32,
+        ecx_equals_usdd.begin() + 82);
+    BOOST_CHECK(!ecx::ValidateBondV2FrozenConfigurationV18(
+        ecx_equals_usdd, configuration_hash, error));
+    BOOST_CHECK(configuration_hash.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(frozen_configuration_v18_version_six_absent_oracle_conversions)
+{
+    std::vector<unsigned char> bytes{ParseHex(ECX_V18_CONFIGURATION_HEX)};
+    BOOST_REQUIRE_EQUAL(bytes.size(), 1977U);
+    bytes[0] = 6;
+    std::copy_n(bytes.begin() + 50, 32, bytes.begin() + 114);
+    for (const size_t offset : {1031U, 1039U}) {
+        for (size_t i = 0; i < 8; ++i) {
+            bytes[offset + i] = (UINT64_C(100000000) >> (8 * (7 - i))) & 0xff;
+        }
+    }
+    std::fill(bytes.begin() + 1753, bytes.begin() + 1945, 0);
+    uint256 digest;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(ecx::ValidateBondV2FrozenConfigurationV18(bytes, digest, error), error);
+    const auto rejects = [&](std::vector<unsigned char> invalid) {
+        BOOST_CHECK(!ecx::ValidateBondV2FrozenConfigurationV18(invalid, digest, error));
+        BOOST_CHECK(digest.IsNull());
+        BOOST_CHECK(!error.empty());
+    };
+    for (const size_t offset : {1753U, 1785U, 1817U, 1849U, 1881U, 1913U,
+                               114U, 1031U, 1039U}) {
+        auto invalid = bytes;
+        invalid[offset] ^= 1;
+        rejects(std::move(invalid));
+    }
+    for (const unsigned char version : {5, 7}) {
+        auto invalid = bytes;
+        invalid[0] = version;
+        rejects(std::move(invalid));
+    }
+    // Exercise the runtime gate independently of the structural decoder.
+    // This deliberately incomplete consensus is not a valid activation.
+    ecx::ExchangeConsensus consensus{};
+    auto& frozen = consensus.bond_v2;
+    frozen.activation_enabled = true;
+    frozen.identities_frozen = true;
+    frozen.canonical_configuration_bytes = bytes;
+    frozen.configuration_hash = TestTaggedHash(
+        "ECX/frozen-configuration/v18-no-history-keyless-staging-renderer-v2", bytes);
+    ecx::BondV2CapitalSnapshot snapshot;
+    BOOST_CHECK(!ecx::DecodeBondV2CapitalProjection({}, uint256{}, snapshot, error, consensus));
+    BOOST_CHECK_EQUAL(error, "missing frozen ECX bond V2 transition program");
+    frozen.usdd_usd_conversion_program_id = uint256S("01");
+    BOOST_CHECK(!ecx::DecodeBondV2CapitalProjection({}, uint256{}, snapshot, error, consensus));
+    BOOST_CHECK_EQUAL(error, "direct-price configuration requires absent oracle conversion identities");
+    frozen.usdd_usd_conversion_program_id.SetNull();
+    frozen.configuration_hash.begin()[0] ^= 1;
+    BOOST_CHECK(!ecx::DecodeBondV2CapitalProjection({}, uint256{}, snapshot, error, consensus));
+    BOOST_CHECK_EQUAL(error, "direct-price configuration hash mismatch");
 }
 
 BOOST_AUTO_TEST_CASE(v18_no_history_staging_renderer_matches_rust_vector)
@@ -1778,6 +2444,108 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_is_frozen_and_activation_fails_closed)
     BOOST_CHECK(error.find("physical deployment/genesis linkage") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(incremental_activation_projection_requires_exact_undo)
+{
+    // Synthetic post-script projection coverage, not Groth16 verification.
+    ecx::ExchangeConsensus consensus{ConfiguredConsensus(
+        50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"))};
+    PopulateTestBondV2FrozenIdentities(consensus);
+    const auto fill_identity = [](uint256& value, unsigned char byte) {
+        std::fill(value.begin(), value.end(), byte);
+    };
+    fill_identity(consensus.bond_v2.transition_program_id, 1);
+    fill_identity(consensus.bond_v2.configuration_hash, 2);
+    fill_identity(consensus.bond_v2.bond_asset_id, 11);
+    fill_identity(consensus.bond_v2.bond_deployment_commitment, 12);
+    fill_identity(consensus.bond_v2.transition_journal_domain_sha256, 16);
+    fill_identity(consensus.bond_v2.transition_cmr, 17);
+    fill_identity(consensus.bond_v2.identity_derivation_record_sha256, 18);
+    auto annex{TestIncrementalActivationAnnexPayload()};
+    std::copy(consensus.bond_v2.incremental_activation_program_id.begin(),
+        consensus.bond_v2.incremental_activation_program_id.end(), annex.begin() + 11);
+    const auto bind_hash = [&](size_t offset, const uint256& hash) {
+        std::copy(hash.begin(), hash.end(), annex.begin() + 435 + offset);
+    };
+    bind_hash(4, consensus.bond_v2.incremental_activation_configuration_hash);
+    bind_hash(36, consensus.bond_v2.configuration_hash);
+    bind_hash(100, consensus.bond_v2.incremental_successor_configuration_hash);
+    const uint256 private_root{uint256S("1234")};
+    const uint256 covenant_root{uint256S("5678")};
+    const uint256 successor_root{uint256S("9876")};
+    const uint256 parent_hash{uint256S("abcd")};
+    BOOST_REQUIRE(private_root != covenant_root);
+    bind_hash(68, private_root);
+    bind_hash(132, successor_root);
+    bind_hash(196, parent_hash);
+    std::copy(consensus.chain_id.begin(), consensus.chain_id.end(), annex.begin() + 435 + 228);
+    const auto bind_u64 = [&](size_t offset, uint64_t value) {
+        std::vector<unsigned char> encoded;
+        TestPushU64Be(encoded, value);
+        std::copy(encoded.begin(), encoded.end(), annex.begin() + 435 + offset);
+    };
+    bind_u64(324, 51);
+    bind_u64(332, 9);
+    CTxOut predecessor{AuthorityOutput(1)};
+    BOOST_REQUIRE(ecx::ComputeBondV2FiniteStateScript(consensus, covenant_root,
+        predecessor.scriptPubKey));
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256S("1235")), 0});
+    tx.vout.push_back(AuthorityOutput(1));
+    BOOST_REQUIRE(ecx::ComputeBondV2IncrementalSuccessorScript(consensus,
+        successor_root, tx.vout[0].scriptPubKey));
+    bind_hash(164, CTransaction{tx}.GetHash().ToUint256());
+    const std::vector<unsigned char> values(annex.begin() + 435, annex.end());
+    const uint256 digest{TestSha256(values)};
+    std::copy(digest.begin(), digest.end(), annex.begin() + 43);
+    std::vector<unsigned char> wire{0x50};
+    wire.insert(wire.end(), annex.begin(), annex.end());
+    tx.witness.vtxinwit.resize(1);
+    tx.witness.vtxinwit[0].scriptWitness.stack = {{0}, wire};
+    CMutableTransaction coinbase;
+    coinbase.vin.resize(1);
+    CBlock block;
+    block.vtx = {MakeTransactionRef(coinbase), MakeTransactionRef(tx)};
+    block.hashExchangeStateRoot = ecx::ComputeStateUtxoRoot(
+        Params().GetConsensus().hashGenesisBlock,
+        COutPoint{block.vtx[1]->GetHash(), 0}, tx.vout[0]);
+    CBlock prior_block;
+    prior_block.hashExchangeStateRoot = ecx::ComputeStateUtxoRoot(
+        Params().GetConsensus().hashGenesisBlock, tx.vin[0].prevout, predecessor);
+    TestBlockIndex previous{prior_block, 50};
+    ecx::BondV2CapitalSnapshot prior;
+    prior.exchange_state_root = prior_block.hashExchangeStateRoot;
+    prior.covenant_state_hash = covenant_root;
+    previous.ecxBondV2Capital = prior;
+    CBlockUndo undo;
+    undo.vtxundo.resize(1);
+    undo.vtxundo[0].vprevout.emplace_back(predecessor, 49, false);
+    MemoryCoinsView base;
+    CCoinsViewCache view{&base};
+    ecx::BondV2CapitalSnapshot result;
+    std::string error;
+    const auto project = [&](const CBlockUndo* supplied) {
+        return ecx::DeriveBondV2CapitalProjectionAfterScripts(block, &previous,
+            view, 51, parent_hash, 8, 9, result, error, consensus, supplied);
+    };
+    BOOST_REQUIRE_MESSAGE(project(&undo), error);
+    BOOST_CHECK_EQUAL(result.proof_profile, 1);
+    BOOST_CHECK_EQUAL(result.covenant_state_hash, successor_root);
+    BOOST_CHECK(!project(nullptr));
+    BOOST_CHECK(error.find("undo context") != std::string::npos);
+    CBlockUndo missing;
+    BOOST_CHECK(!project(&missing));
+    auto malformed{undo};
+    malformed.vtxundo[0].vprevout.clear();
+    BOOST_CHECK(!project(&malformed));
+    malformed = undo;
+    malformed.vtxundo[0].vprevout[0].Clear();
+    BOOST_CHECK(!project(&malformed));
+    malformed = undo;
+    malformed.vtxundo[0].vprevout[0].out.scriptPubKey = CScript{} << OP_TRUE;
+    BOOST_CHECK(!project(&malformed));
+    BOOST_REQUIRE_MESSAGE(project(&undo), error);
+}
+
 BOOST_AUTO_TEST_CASE(bond_v2_projection_follows_each_verified_reorg_branch)
 {
     ecx::ExchangeConsensus consensus{ConfiguredConsensus(
@@ -2112,6 +2880,7 @@ BOOST_AUTO_TEST_CASE(runtime_consensus_fingerprint_binds_every_field)
         BOOST_CHECK_NE(expected, compute_default(changed));
     };
     check_consensus_mutation([](auto& value) { ++value.activation_height; });
+    check_consensus_mutation([](auto& value) { ++value.bond_v2.deployment_version; });
     check_consensus_mutation([](auto& value) { value.genesis_state_outpoint.hash = Txid::FromUint256(uint256S("12")); });
     check_consensus_mutation([](auto& value) { ++value.genesis_state_outpoint.n; });
     check_consensus_mutation([](auto& value) { value.genesis_state_root = uint256S("23"); });
@@ -2370,6 +3139,12 @@ BOOST_AUTO_TEST_CASE(activation_transition_disconnect_and_reorg_are_symmetric)
     CMutableTransaction transition;
     transition.vin.emplace_back(genesis);
     transition.vout.push_back(AuthorityOutput(0x22));
+    // Empty inboxes alone do not exempt an ordinary transition from its marker.
+    CBlock unmarked;
+    unmarked.vtx.push_back(MakeTransactionRef(transition));
+    BOOST_CHECK(!ecx::PrepareExchangeStateHeader(
+        unmarked, &activation_index, view, 11, error, consensus, 101));
+    BOOST_CHECK_EQUAL(error, "ECX state transition is missing its processed-cursor marker");
     transition.vout.push_back(CursorMarker(0, 0));
     CBlock next;
     next.vtx.push_back(MakeTransactionRef(transition));
@@ -2802,3 +3577,90 @@ BOOST_AUTO_TEST_CASE(withdrawal_bundle_requires_authenticated_m6_pxst_preimage)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+#ifdef ECX_PRODUCTION_ACTIVATION_PROFILE_FROZEN
+BOOST_FIXTURE_TEST_SUITE(ecx_frozen_alpha_profile_tests, FrozenAlphaProfileSetup)
+
+BOOST_AUTO_TEST_CASE(load_actual_frozen_profile)
+{
+    BOOST_REQUIRE_EQUAL(Params().NetworkIDString(), "elements");
+    BOOST_REQUIRE_EQUAL(Params().GetConsensus().hashGenesisBlock.GetHex(),
+        "672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd");
+    const auto& consensus = ecx::LayerTwoLabsExchangeConsensus();
+    BOOST_CHECK_EQUAL(consensus.activation_height,
+        gArgs.GetIntArg("-ecxactivationheight", -1));
+    BOOST_CHECK(consensus.bond_v2.activation_enabled);
+    BOOST_CHECK(consensus.bond_v2.identities_frozen);
+    BOOST_REQUIRE(consensus.bond_v2.deployment_transaction);
+    BOOST_REQUIRE(consensus.bond_v2.genesis_transaction);
+    BOOST_CHECK_EQUAL(consensus.genesis_state_outpoint.hash.GetHex(),
+        consensus.bond_v2.genesis_transaction->GetHash().GetHex());
+}
+
+BOOST_AUTO_TEST_CASE(reject_conflicting_operator_override)
+{
+    gArgs.ForceSetArg("-ecxactivationheight", "1");
+    BOOST_CHECK_EXCEPTION(ecx::LayerTwoLabsExchangeConsensus(), std::runtime_error,
+        [](const std::runtime_error& error) {
+            return std::string(error.what()).find(
+                "operator override conflicts with the source-frozen") != std::string::npos;
+        });
+}
+
+BOOST_AUTO_TEST_CASE(activation_annex_policy_requires_exact_frozen_bindings)
+{
+    const auto& consensus = ecx::LayerTwoLabsExchangeConsensus();
+    const auto& frozen = consensus.bond_v2;
+    CMutableTransaction tx;
+    tx.vin.emplace_back(consensus.genesis_state_outpoint);
+    tx.vout.emplace_back(Params().GetConsensus().pegged_asset, 10'000,
+        CScript() << OP_1 << std::vector<unsigned char>(32,1));
+    tx.witness.vtxinwit.resize(1);
+    auto& stack = tx.witness.vtxinwit[0].scriptWitness.stack;
+    stack.resize(5);
+    stack[2].assign(frozen.incremental_activation_cmr.begin(),frozen.incremental_activation_cmr.end());
+    stack[3].resize(33); stack[3][0]=0xbe;
+    auto& a=stack[4]; a.resize(800);
+    const unsigned char prefix[]{0x50,'E','C','X','S','P','1',0,5,2,1,0};
+    std::copy(std::begin(prefix),std::end(prefix),a.begin());
+    std::copy(frozen.incremental_activation_program_id.begin(),frozen.incremental_activation_program_id.end(),a.begin()+12);
+    a[78]=1; a[79]=100; a[439]=1;
+    for (unsigned i=0;i<10;++i) a[436+4+32*i+31]=i+1;
+    for (unsigned offset : {324,332,340,348,356}) a[436+offset+7]=1;
+    const auto put=[&](size_t offset,const auto& hash) {
+        std::copy(hash.begin(),hash.end(),a.begin()+436+offset);
+    };
+    put(4,frozen.incremental_activation_configuration_hash);
+    put(36,frozen.configuration_hash);
+    put(100,frozen.incremental_successor_configuration_hash);
+    put(228,consensus.chain_id);
+    const auto txid=CTransaction{tx}.GetHash();
+    std::transform(txid.begin(),txid.end(),a.begin()+600,
+        [](std::byte b){return std::to_integer<unsigned char>(b);});
+    CSHA256().Write(a.data()+436,364).Finalize(a.data()+44);
+    const auto standard=[&](const CMutableTransaction& candidate,const ecx::ExchangeConsensus* config) {
+        std::string reason;
+        return IsStandardTx(CTransaction{candidate},MAX_OP_RETURN_RELAY,true,
+            CFeeRate(DUST_RELAY_TX_FEE_BITCOIN),reason,config);
+    };
+    // Zero proof and empty program are only transport-policy fixtures. Full
+    // consensus script execution MUST reject them; this is not proof evidence.
+    BOOST_REQUIRE(standard(tx,&consensus));
+    BOOST_CHECK(!standard(tx,nullptr));
+    for (unsigned offset : {12,440,472,536,600,664}) {
+        auto bad=tx;
+        auto& annex=bad.witness.vtxinwit[0].scriptWitness.stack[4];
+        annex[offset]^=1;
+        CSHA256().Write(annex.data()+436,364).Finalize(annex.data()+44);
+        BOOST_CHECK(!standard(bad,&consensus));
+    }
+    auto bad=tx; bad.vout[0].nValue.SetToAmount(9'999);
+    BOOST_CHECK(!standard(bad,&consensus));
+    bad=tx; bad.witness.vtxinwit[0].scriptWitness.stack[2][0]^=1;
+    BOOST_CHECK(!standard(bad,&consensus));
+    bad=tx; bad.witness.vtxinwit[0].scriptWitness.stack[4][1]='U';
+    BOOST_CHECK(!standard(bad,&consensus));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif

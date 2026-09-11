@@ -1404,12 +1404,13 @@ static RPCHelpMan getsimplicityinfo()
 #ifndef ECX_SIMPLICITY_CATALOGUE_SHA256_HEX
 #error "a frozen Simplicity catalogue build must define ECX_SIMPLICITY_CATALOGUE_SHA256_HEX"
 #endif
-#ifndef ECX_PREDICTION_MARKET_PROGRAM_CMR_HEX
-#error "a frozen Simplicity catalogue build must define ECX_PREDICTION_MARKET_PROGRAM_CMR_HEX"
-#endif
             frozen = true;
             catalogue = ECX_SIMPLICITY_CATALOGUE_SHA256_HEX;
+#ifdef ECX_PREDICTION_MARKET_PROGRAM_CMR_HEX
+            // A catalogue-enabled Elements node need not host a prediction
+            // market. Never substitute an activation covenant CMR here.
             program_cmr = ECX_PREDICTION_MARKET_PROGRAM_CMR_HEX;
+#endif
 #endif
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
             private_catalogue = true;

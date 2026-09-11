@@ -774,6 +774,12 @@ public:
     {
         m_chain_type = ChainTypeMetaFrom(ChainType::ELEMENTS);
 
+        // Post-genesis Alpha upgrade: preserve blocks through the reviewed
+        // height-83 checkpoint; require public creations and per-asset totals
+        // starting with the prospective deployment block. This does not alter
+        // the historical proposal or genesis serialization.
+        consensus.explicit_only_height = 84;
+
         // The sidechain itself uses an OP_TRUE signed-block challenge. Its
         // security boundary is the mandatory, independently verified BIP301
         // commitment on the parent chain, not a second native PoW race.

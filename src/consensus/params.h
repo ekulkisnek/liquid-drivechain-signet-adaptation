@@ -173,6 +173,11 @@ struct Params {
     bool has_parent_chain;
     uint256 parentChainPowLimit;
     uint32_t pegin_min_depth;
+    /** Negative disables explicit-only creation; activation must be release-pinned. */
+    int explicit_only_height{-1};
+    bool ExplicitOnlyActive(int height) const {
+        return explicit_only_height >= 0 && height >= explicit_only_height;
+    }
     CScript parent_chain_signblockscript;
     /** BIP325 challenge when the parent is Signet, empty for non-Signet parents. */
     std::vector<uint8_t> parent_signet_challenge;

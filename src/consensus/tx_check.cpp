@@ -7,8 +7,26 @@
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
 #include <consensus/validation.h>
+#include <map>
+
+static bool CheckTransactionImpl(const CTransaction&, TxValidationState&, bool, bool);
 
 bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
+{
+    return CheckTransaction(tx, state, false);
+}
+
+bool CheckTransaction(const CTransaction& tx, TxValidationState& state, bool explicit_asset_totals)
+{
+    return CheckTransactionImpl(tx, state, explicit_asset_totals, false);
+}
+
+bool CheckTransactionWithoutAggregateTotals(const CTransaction& tx, TxValidationState& state)
+{
+    return CheckTransactionImpl(tx, state, false, true);
+}
+
+static bool CheckTransactionImpl(const CTransaction& tx, TxValidationState& state, bool explicit_asset_totals, bool defer_totals)
 {
     // Basic checks that don't depend on any context
     if (tx.vin.empty())
@@ -22,6 +40,7 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
 
     // Check for negative or overflow output values (see CVE-2010-5139)
     CAmount nValueOutExplicit = 0;
+    std::map<CAsset, CAmount> asset_totals;
     for (const auto& txout : tx.vout)
     {
         if (!txout.nValue.IsValid())
@@ -32,9 +51,15 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-negative");
         if (txout.nValue.GetAmount() > MAX_MONEY)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-toolarge");
-        nValueOutExplicit += txout.nValue.GetAmount();
-        if (!MoneyRange(nValueOutExplicit))
+        if (defer_totals) continue;
+        // The activated explicit-only rule supplies public asset identities.
+        // Never treat an unknown/confidential asset as a distinct public asset.
+        if (explicit_asset_totals && !txout.nAsset.IsExplicit())
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-asset-not-explicit");
+        CAmount& total = explicit_asset_totals ? asset_totals[txout.nAsset.GetAsset()] : nValueOutExplicit;
+        if (txout.nValue.GetAmount() > MAX_MONEY - total)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-txouttotal-toolarge");
+        total += txout.nValue.GetAmount();
     }
 
     // Check for duplicate inputs (see CVE-2018-17144)
@@ -68,4 +93,3 @@ bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
 
     return true;
 }
-

@@ -116,7 +116,9 @@ struct ChainTestingSetup : public BasicTestingSetup {
     bool m_block_tree_db_in_memory{true};
     std::function<void()> m_make_chainman{};
 
-    explicit ChainTestingSetup(const ChainType chainType = ChainType::MAIN, TestOpts = {}, const std::string& fedpegscript = "");
+    explicit ChainTestingSetup(const ChainType chainType = ChainType::MAIN, TestOpts opts = {}, const std::string& fedpegscript = "")
+        : ChainTestingSetup{ChainTypeMetaFrom(chainType), opts, fedpegscript} {}
+    explicit ChainTestingSetup(const ChainTypeMeta chainType, TestOpts = {}, const std::string& fedpegscript = "");
     ~ChainTestingSetup();
 
     // Supplies a chainstate, if one is needed
@@ -128,6 +130,11 @@ struct ChainTestingSetup : public BasicTestingSetup {
 struct TestingSetup : public ChainTestingSetup {
     explicit TestingSetup(
         const ChainType chainType = ChainType::MAIN,
+        TestOpts opts = {},
+        const std::string& fedpegscript = "")
+        : TestingSetup{ChainTypeMetaFrom(chainType), opts, fedpegscript} {}
+    explicit TestingSetup(
+        const ChainTypeMeta chainType,
         TestOpts = {},
         const std::string& fedpegscript = "");
 };

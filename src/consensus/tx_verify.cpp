@@ -19,6 +19,27 @@
 #include <util/check.h>
 #include <util/moneystr.h>
 
+bool Consensus::HasOnlyExplicitCreations(const CTransaction& tx)
+{
+    for (const auto& output : tx.vout) {
+        if (!output.nAsset.IsExplicit() || !output.nValue.IsExplicit() ||
+            !output.nNonce.IsNull()) return false;
+    }
+    for (const auto& input : tx.vin) {
+        const auto& issuance = input.assetIssuance;
+        if ((!issuance.nAmount.IsNull() && !issuance.nAmount.IsExplicit()) ||
+            (!issuance.nInflationKeys.IsNull() && !issuance.nInflationKeys.IsExplicit())) return false;
+    }
+    for (const auto& witness : tx.witness.vtxoutwit) {
+        if (!witness.vchRangeproof.empty() || !witness.vchSurjectionproof.empty()) return false;
+    }
+    for (const auto& witness : tx.witness.vtxinwit) {
+        if (!witness.vchIssuanceAmountRangeproof.empty() ||
+            !witness.vchInflationKeysRangeproof.empty()) return false;
+    }
+    return true;
+}
+
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 {
     if (tx.nLockTime == 0)
@@ -228,7 +249,8 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
             bool parent_unavailable{false};
             if (tx.witness.vtxinwit.size() <= i ||
                 !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts,
-                                     prevout, err, true, nullptr, &parent_unavailable)) {
+                                     prevout, err, true, nullptr, &parent_unavailable,
+                                     nSpendHeight)) {
                 if (parent_unavailable) {
                     return state.Error(strprintf("drivechain parent state unavailable: %s", err));
                 }

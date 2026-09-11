@@ -1633,6 +1633,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
 #ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
     argsman.AddArg("-ecxbondv2", "Enable exact two-transaction bond V2 activation on elementsregtest using the compiled reviewed catalogue", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxbondv2deploymenttx=<hex>", "Exact preauthorized fixed-supply bond issuance/inventory/token-burn transaction", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2deploymentversion=<n>", "Frozen deployment relation: 2 confidential, 3 explicit public; must match the configuration commitment", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxbondv2genesistx=<hex>", "Exact preauthorized V2 genesis-singleton transaction spending the deployment authority output", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxbondv2issuanceinput=<n>", "Issuance input index in the exact bond deployment transaction", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxbondv2inventoryoutput=<n>", "Full confidential bond inventory output index", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -1641,6 +1642,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     for (const char* name : {
              "-ecxbondv2inventoryassetblinder=<hex>",
              "-ecxbondv2inventoryvalueblinder=<hex>",
+             "-ecxbondv2issuancevalueblinder=<hex>",
              "-ecxbondv2transitionprogramid=<hex>",
              "-ecxbondv2configurationhash=<hex>",
              "-ecxbondv2publicstatedomain=<hex>",
@@ -1671,6 +1673,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     }
     argsman.AddArg("-ecxbondv2configurationbytes=<hex>", "Exact canonical FrozenConfigurationV2 bytes whose tagged hash is authorized", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-ecxbondv2genesismarkprice=<n>", "Exact positive genesis ECX/USDD mark price", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2initializationheight=<n>", "Reviewed ancestor height used to initialize empty genesis (V2)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2initializationblock=<hex>", "Reviewed initialization ancestor hash in raw internal byte order (V2)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-ecxbondv2initializationmtp=<n>", "Exact authenticated parent MTP of the initialization ancestor (V2)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
 #endif
     argsman.AddArg("-settings=<file>", strprintf("Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and not meant to be edited by users (use %s instead for custom settings). Relative paths will be prefixed by datadir location. (default: %s)", BITCOIN_CONF_FILENAME, BITCOIN_SETTINGS_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #if HAVE_SYSTEM

@@ -20,6 +20,7 @@
 #include <node/drivechain_withdrawal_bundle.h>
 #include <pegins.h>
 #include <logging.h>
+#include <mainchainrpc.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <pow.h>
@@ -229,6 +230,8 @@ void BlockAssembler::resetBlock()
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
 {
     auto authenticated_parent_height = m_options.authenticated_parent_height;
+    DrivechainParentValidationBudget parent_budget{
+        chainparams.GetConsensus().drivechain_slot.has_value()};
     const auto& min_tx_age = m_options.min_tx_age;
     const auto& proposed_entry = m_options.proposed_entry;
     const auto& commit_scripts = m_options.commit_scripts;
@@ -302,6 +305,27 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
         nBlockWeight += chainparams.GetConsensus().max_block_signature_size * WITNESS_SCALE_FACTOR;
         ResetProof(*pblock);
         ResetChallenge(*pblock, *pindexPrev, chainparams.GetConsensus());
+    }
+
+    // Select against the same authenticated P that the final coinbase names.
+    // A mempool entry may have been admitted before the parent tip advanced.
+    m_candidate_parent.reset();
+    if (chainparams.GetConsensus().drivechain_slot.has_value()) {
+        CMutableTransaction commitment_coinbase;
+        commitment_coinbase.vin.resize(1);
+        commitment_coinbase.vin[0].prevout.SetNull();
+        for (const auto& script : commit_scripts) {
+            commitment_coinbase.vout.emplace_back(policyAsset, 0, script);
+        }
+        CBlock commitment_block;
+        commitment_block.vtx.push_back(MakeTransactionRef(std::move(commitment_coinbase)));
+        DrivechainParentBlockContext parent;
+        std::string error;
+        if (!GetDrivechainParentBlockContext(commitment_block,
+                *chainparams.GetConsensus().drivechain_slot, parent, &error)) {
+            throw std::runtime_error("CreateNewBlock(): " + error);
+        }
+        m_candidate_parent = parent;
     }
 
     int nPackagesSelected = 0;
@@ -382,7 +406,23 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // produced an internally accepted header whose ECX parent height disagreed
     // with the BMM chainstate exposed to Simplicity and RPC consumers.
     if (chainparams.GetConsensus().elements_mode) {
-        if (!authenticated_parent_height.has_value()) {
+        if (chainparams.GetConsensus().drivechain_slot.has_value()) {
+            // Authenticate the P named by this candidate's canonical coinbase
+            // commitment, not the prior child's anchor or the future M7 block Q.
+            DrivechainParentBlockContext parent;
+            std::string parent_error;
+            if (!GetDrivechainParentBlockContext(
+                    *pblock, *chainparams.GetConsensus().drivechain_slot,
+                    parent, &parent_error)) {
+                throw std::runtime_error("CreateNewBlock(): " + parent_error);
+            }
+            if (authenticated_parent_height.has_value() &&
+                *authenticated_parent_height != parent.parent_height) {
+                throw std::runtime_error(
+                    "CreateNewBlock(): supplied parent height disagrees with authenticated candidate P");
+            }
+            authenticated_parent_height = parent.parent_height;
+        } else if (!authenticated_parent_height.has_value()) {
             drivechain::BmmL1State bmm_state;
             drivechain::BmmParentContext bmm_parent;
             std::string bmm_error;
@@ -481,6 +521,11 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             return false;
         }
         if (!IsFinalTx(it->GetTx(), nHeight, m_lock_time_cutoff)) {
+            return false;
+        }
+        if (m_candidate_parent &&
+            !CheckNativeCandidateTransactionScripts(it->GetTx(), m_chainstate,
+                *m_mempool, pblocktemplate->block, *m_candidate_parent)) {
             return false;
         }
         if (chainparams.GetConsensus().enable_usdd_sp1_annex) {
@@ -590,7 +635,7 @@ void BlockAssembler::SortForBlock(const CTxMemPool::setEntries& package, std::ve
 void BlockAssembler::addPackageTxs(int& nPackagesSelected, int& nDescendantsUpdated, std::chrono::seconds min_tx_age)
 {
     const auto& mempool{*Assert(m_mempool)};
-    LOCK(mempool.cs);
+    LOCK(m_mempool->cs);
 
     // A native BIP300 deposit gives the sidechain its entire backing value to
     // one committed recipient, so its one-input/one-output canonical form has

@@ -181,14 +181,84 @@ size_t CCoinsViewDB::EstimateSize() const
     return m_db->EstimateSize(DB_COIN, uint8_t(DB_COIN + 1));
 }
 
+namespace {
+// The generic DB decoder allows trailing data; checkpoint records must not.
+template <typename T> struct ExactDBRecord {
+    T value{};
+    template <typename Stream> void Unserialize(Stream& stream)
+    {
+        stream >> value;
+        if (!stream.empty()) throw std::ios_base::failure("Trailing checkpoint DB bytes");
+    }
+};
+struct ExactCoinKey {
+    COutPoint outpoint;
+    template <typename Stream> void Unserialize(Stream& stream)
+    {
+        CoinEntry entry{&outpoint};
+        stream >> entry;
+        if (entry.key != DB_COIN || !stream.empty())
+            throw std::ios_base::failure("Malformed checkpoint coin key");
+    }
+};
+}
+
+CSpentPeginCursor::CSpentPeginCursor(std::unique_ptr<CDBIterator> cursor)
+    : m_cursor(std::move(cursor))
+{
+    // Read metadata using the same LevelDB iterator snapshot as the claims.
+    m_cursor->Seek(DB_HEAD_BLOCKS);
+    m_cursor->CheckStatus();
+    uint8_t prefix{};
+    if (m_cursor->Valid() && (!m_cursor->GetKey(prefix) || prefix == DB_HEAD_BLOCKS))
+        throw dbwrapper_error("Cannot snapshot an incomplete chainstate transition");
+    m_cursor->Seek(DB_BEST_BLOCK);
+    m_cursor->CheckStatus();
+    ExactDBRecord<uint8_t> key;
+    ExactDBRecord<uint256> value;
+    if (!m_cursor->Valid() || !m_cursor->GetKey(key) || key.value != DB_BEST_BLOCK ||
+        !m_cursor->GetValue(value) || value.value.IsNull())
+        throw dbwrapper_error("Missing or malformed checkpoint best block");
+    m_best_block = value.value;
+    m_cursor->Seek(DB_PEGIN_FLAG);
+    ReadKey();
+}
+
+void CSpentPeginCursor::ReadKey()
+{
+    m_key.reset();
+    m_cursor->CheckStatus();
+    if (!m_cursor->Valid()) return;
+    uint8_t prefix{};
+    if (!m_cursor->GetKey(prefix)) throw dbwrapper_error("Malformed spent-claim prefix");
+    if (prefix != DB_PEGIN_FLAG) return;
+    ExactDBRecord<std::pair<uint8_t, std::pair<uint256, COutPoint>>> key;
+    ExactDBRecord<int> value;
+    if (!m_cursor->GetKey(key) || !m_cursor->GetValue(value) || value.value != 1)
+        throw dbwrapper_error("Malformed spent-claim record");
+    m_key = key.value.second;
+}
+
+void CSpentPeginCursor::Next()
+{
+    if (!Valid()) return;
+    m_cursor->Next();
+    ReadKey();
+}
+
+std::unique_ptr<CSpentPeginCursor> CCoinsViewDB::SpentPeginCursor() const
+{
+    return std::make_unique<CSpentPeginCursor>(std::unique_ptr<CDBIterator>{m_db->NewIterator()});
+}
+
 /** Specialization of CCoinsViewCursor to iterate over a CCoinsViewDB */
 class CCoinsViewDBCursor: public CCoinsViewCursor
 {
 public:
     // Prefer using CCoinsViewDB::Cursor() since we want to perform some
     // cache warmup on instantiation.
-    CCoinsViewDBCursor(CDBIterator* pcursorIn, const uint256&hashBlockIn):
-        CCoinsViewCursor(hashBlockIn), pcursor(pcursorIn) {}
+    CCoinsViewDBCursor(CDBIterator* pcursorIn, const uint256&hashBlockIn, bool strict = false):
+        CCoinsViewCursor(hashBlockIn), pcursor(pcursorIn), m_strict(strict) {}
     ~CCoinsViewDBCursor() = default;
 
     bool GetKey(COutPoint &key) const override;
@@ -200,9 +270,32 @@ public:
 private:
     std::unique_ptr<CDBIterator> pcursor;
     std::pair<char, COutPoint> keyTmp;
+    bool m_strict;
+    void ReadStrictKey();
 
     friend class CCoinsViewDB;
 };
+
+void CCoinsViewDBCursor::ReadStrictKey()
+{
+    keyTmp.first = 0;
+    pcursor->CheckStatus();
+    if (!pcursor->Valid()) return;
+    uint8_t prefix{};
+    if (!pcursor->GetKey(prefix)) throw dbwrapper_error("Malformed checkpoint coin prefix");
+    if (prefix != DB_COIN) return;
+    ExactCoinKey key;
+    if (!pcursor->GetKey(key)) throw dbwrapper_error("Malformed checkpoint coin key");
+    keyTmp = {DB_COIN, key.outpoint};
+}
+
+std::unique_ptr<CCoinsViewCursor> CCoinsViewDB::CheckpointCoinCursor() const
+{
+    auto cursor = std::make_unique<CCoinsViewDBCursor>(m_db->NewIterator(), GetBestBlock(), true);
+    cursor->pcursor->Seek(DB_COIN);
+    cursor->ReadStrictKey();
+    return cursor;
+}
 
 std::unique_ptr<CCoinsViewCursor> CCoinsViewDB::Cursor() const
 {
@@ -235,6 +328,15 @@ bool CCoinsViewDBCursor::GetKey(COutPoint &key) const
 
 bool CCoinsViewDBCursor::GetValue(Coin &coin) const
 {
+    if (m_strict) {
+        if (!Valid()) return false;
+        pcursor->CheckStatus();
+        ExactDBRecord<Coin> record;
+        if (!pcursor->GetValue(record) || record.value.IsSpent())
+            throw dbwrapper_error("Malformed checkpoint coin value");
+        coin = std::move(record.value);
+        return true;
+    }
     return pcursor->GetValue(coin);
 }
 
@@ -245,6 +347,12 @@ bool CCoinsViewDBCursor::Valid() const
 
 void CCoinsViewDBCursor::Next()
 {
+    if (m_strict) {
+        if (!Valid()) return;
+        pcursor->Next();
+        ReadStrictKey();
+        return;
+    }
     pcursor->Next();
     CoinEntry entry(&keyTmp.second);
     if (!pcursor->Valid() || !pcursor->GetKey(entry)) {

@@ -2071,13 +2071,15 @@ static RPCHelpMan importdrivechaindeposit_native()
     const uint256 mainchain_block_hash = uint256S(mainchain_block_hash_str);
     const COutPoint mainchain_outpoint(Txid::FromUint256(mainchain_txid), static_cast<uint32_t>(mainchain_vout));
     const std::vector<unsigned char> address_bytes(address.begin(), address.end());
+    const CBlockIndex* active_tip = pwallet->chain().getTip();
     std::string deposit_error;
     if (!IsConfirmedDrivechainDeposit(mainchain_block_hash,
                                       *drivechain_slot,
                                       mainchain_outpoint,
                                       deposit_amount,
                                       address_bytes,
-                                      &deposit_error)) {
+                                      &deposit_error,
+                                      active_tip ? active_tip->nHeight + 1 : -1)) {
         throw JSONRPCError(RPC_VERIFY_REJECTED, strprintf("BIP300 deposit validation failed: %s", deposit_error));
     }
 
@@ -2537,7 +2539,9 @@ RPCHelpMan blindrawtransaction()
 
     LOCK(pwallet->cs_wallet);
 
-    const auto& fedpegscripts = GetValidFedpegScripts(pwallet->chain().getTip(), Params().GetConsensus(), true /* nextblock_validation */);
+    const CBlockIndex* active_tip = pwallet->chain().getTip();
+    const int child_height = active_tip ? active_tip->nHeight + 1 : -1;
+    const auto& fedpegscripts = GetValidFedpegScripts(active_tip, Params().GetConsensus(), true /* nextblock_validation */);
 
     std::vector<uint256> input_blinds;
     std::vector<uint256> input_asset_blinds;
@@ -2550,7 +2554,8 @@ RPCHelpMan blindrawtransaction()
         // Special handling for peg-in inputs: no blinds and explicit amount/asset.
         if (tx.vin[nIn].m_is_pegin) {
             std::string err;
-            if (tx.witness.vtxinwit.size() != tx.vin.size() || !IsValidPeginWitness(tx.witness.vtxinwit[nIn].m_pegin_witness, fedpegscripts, prevout, err, false)) {
+            if (tx.witness.vtxinwit.size() != tx.vin.size() || !IsValidPeginWitness(tx.witness.vtxinwit[nIn].m_pegin_witness, fedpegscripts, prevout, err, false,
+                    nullptr, nullptr, child_height)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Transaction contains invalid peg-in input: %s", err));
             }
             CTxOut pegin_output = GetPeginOutputFromWitness(tx.witness.vtxinwit[nIn].m_pegin_witness);
