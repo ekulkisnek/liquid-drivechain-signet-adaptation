@@ -65,6 +65,9 @@ struct DrivechainParentBudgetState {
     uint32_t replay_snapshot_height{0};
     uint256 replay_snapshot_hash;
     uint64_t replay_snapshot_epoch{0};
+    // Hash-checked raw headers are immutable. Reuse them only within this
+    // bounded operation; active-chain metadata must always be read afresh.
+    std::map<uint256, Bitcoin::CBlockHeader> raw_headers;
 };
 
 thread_local DrivechainParentBudgetState g_drivechain_parent_budget;
@@ -266,6 +269,7 @@ DrivechainParentValidationBudget::DrivechainParentValidationBudget(const bool en
 {
     if (!m_enabled) return;
     if (g_drivechain_parent_budget.depth++ == 0) {
+        g_drivechain_parent_budget.raw_headers.clear();
         g_drivechain_parent_budget.deadline =
             std::chrono::steady_clock::now() + DRIVECHAIN_LOCKED_PARENT_DEADLINE;
         g_drivechain_parent_budget.replay_steps_remaining =
@@ -284,6 +288,7 @@ DrivechainParentValidationBudget::~DrivechainParentValidationBudget()
     assert(g_drivechain_parent_budget.depth > 0);
     --g_drivechain_parent_budget.depth;
     if (g_drivechain_parent_budget.depth == 0) {
+        g_drivechain_parent_budget.raw_headers.clear();
         g_drivechain_parent_budget.replay_steps_remaining = 0;
         g_drivechain_parent_budget.replay_snapshot_authenticated = false;
         g_drivechain_parent_budget.replay_snapshot_is_explicit_target = false;
@@ -608,6 +613,14 @@ bool CheckParentChainworkStep(const VerifiedMainchainHeader& parent,
 
 bool ReadRawBitcoinHeader(const uint256& hash, Bitcoin::CBlockHeader& header, std::string* error)
 {
+    CheckDrivechainParentDeadline();
+    if (DrivechainParentBudgetActive()) {
+        const auto found = g_drivechain_parent_budget.raw_headers.find(hash);
+        if (found != g_drivechain_parent_budget.raw_headers.end()) {
+            header = found->second;
+            return CheckParentProofOfWork(hash, header.nBits, error);
+        }
+    }
     UniValue params(UniValue::VARR);
     params.push_back(hash.GetHex());
     params.push_back(false);
@@ -627,7 +640,12 @@ bool ReadRawBitcoinHeader(const uint256& hash, Bitcoin::CBlockHeader& header, st
     if (header.GetHash() != hash) {
         return SetError(error, strprintf("raw parent header hashes to %s, expected %s", header.GetHash().GetHex(), hash.GetHex()));
     }
-    return CheckParentProofOfWork(hash, header.nBits, error);
+    if (!CheckParentProofOfWork(hash, header.nBits, error)) return false;
+    if (DrivechainParentBudgetActive() &&
+        g_drivechain_parent_budget.raw_headers.size() < 64) {
+        g_drivechain_parent_budget.raw_headers.emplace(hash, header);
+    }
+    return true;
 }
 
 bool ComputeVerifiedMedianTimePast(const uint256& start_hash, const uint32_t start_height,
