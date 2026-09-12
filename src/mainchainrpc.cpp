@@ -65,12 +65,14 @@ struct DrivechainParentBudgetState {
     uint32_t replay_snapshot_height{0};
     uint256 replay_snapshot_hash;
     uint64_t replay_snapshot_epoch{0};
-    // Hash-checked raw headers are immutable. Reuse them only within this
-    // bounded operation; active-chain metadata must always be read afresh.
-    std::map<uint256, Bitcoin::CBlockHeader> raw_headers;
 };
 
 thread_local DrivechainParentBudgetState g_drivechain_parent_budget;
+// Only content-addressed, hash-verified raw headers survive a retry. This
+// cache never stores height, confirmations, chainwork, or active-chain status.
+// Proof-of-work is rechecked on hits against the current network parameters.
+thread_local std::map<uint256, Bitcoin::CBlockHeader> g_verified_parent_headers;
+thread_local std::deque<uint256> g_verified_parent_header_order;
 thread_local std::optional<std::chrono::steady_clock::time_point> g_drivechain_anchor_warm_deadline;
 thread_local const util::SignalInterrupt* g_drivechain_anchor_warm_interrupt{nullptr};
 thread_local uint32_t g_drivechain_untrusted_parent_admission_depth{0};
@@ -269,7 +271,6 @@ DrivechainParentValidationBudget::DrivechainParentValidationBudget(const bool en
 {
     if (!m_enabled) return;
     if (g_drivechain_parent_budget.depth++ == 0) {
-        g_drivechain_parent_budget.raw_headers.clear();
         g_drivechain_parent_budget.deadline =
             std::chrono::steady_clock::now() + DRIVECHAIN_LOCKED_PARENT_DEADLINE;
         g_drivechain_parent_budget.replay_steps_remaining =
@@ -288,7 +289,6 @@ DrivechainParentValidationBudget::~DrivechainParentValidationBudget()
     assert(g_drivechain_parent_budget.depth > 0);
     --g_drivechain_parent_budget.depth;
     if (g_drivechain_parent_budget.depth == 0) {
-        g_drivechain_parent_budget.raw_headers.clear();
         g_drivechain_parent_budget.replay_steps_remaining = 0;
         g_drivechain_parent_budget.replay_snapshot_authenticated = false;
         g_drivechain_parent_budget.replay_snapshot_is_explicit_target = false;
@@ -615,8 +615,8 @@ bool ReadRawBitcoinHeader(const uint256& hash, Bitcoin::CBlockHeader& header, st
 {
     CheckDrivechainParentDeadline();
     if (DrivechainParentBudgetActive()) {
-        const auto found = g_drivechain_parent_budget.raw_headers.find(hash);
-        if (found != g_drivechain_parent_budget.raw_headers.end()) {
+        const auto found = g_verified_parent_headers.find(hash);
+        if (found != g_verified_parent_headers.end()) {
             header = found->second;
             return CheckParentProofOfWork(hash, header.nBits, error);
         }
@@ -641,9 +641,14 @@ bool ReadRawBitcoinHeader(const uint256& hash, Bitcoin::CBlockHeader& header, st
         return SetError(error, strprintf("raw parent header hashes to %s, expected %s", header.GetHash().GetHex(), hash.GetHex()));
     }
     if (!CheckParentProofOfWork(hash, header.nBits, error)) return false;
-    if (DrivechainParentBudgetActive() &&
-        g_drivechain_parent_budget.raw_headers.size() < 64) {
-        g_drivechain_parent_budget.raw_headers.emplace(hash, header);
+    if (DrivechainParentBudgetActive()) {
+        constexpr size_t MAX_VERIFIED_PARENT_HEADERS{256};
+        if (g_verified_parent_headers.size() == MAX_VERIFIED_PARENT_HEADERS) {
+            g_verified_parent_headers.erase(g_verified_parent_header_order.front());
+            g_verified_parent_header_order.pop_front();
+        }
+        g_verified_parent_headers.emplace(hash, header);
+        g_verified_parent_header_order.push_back(hash);
     }
     return true;
 }
