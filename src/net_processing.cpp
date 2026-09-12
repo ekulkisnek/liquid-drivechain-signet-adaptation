@@ -2937,7 +2937,7 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
                 const CBlockIndex* authenticated_elsewhere =
                     m_chainman.m_blockman.LookupBlockIndex(pending_hash);
                 if (authenticated_elsewhere &&
-                    IsDrivechainHeaderAuthenticated(
+                    IsDrivechainBlockReadyForDescendants(
                         authenticated_elsewhere,
                         m_chainparams.GetConsensus())) {
                     // Another peer may have delivered the same full block.
@@ -2968,8 +2968,20 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
                                 "indexed drivechain header lacks authenticated full block");
                             break;
                         }
-                        last_known = known;
-                        continue;
+                        if (IsDrivechainBlockReadyForDescendants(
+                                known, m_chainparams.GetConsensus())) {
+                            last_known = known;
+                            continue;
+                        }
+                        // Re-delivery retries ActivateBestChain for a stored
+                        // block whose parent validation was temporarily busy.
+                        nodestate->pending_drivechain_header = header;
+                        nodestate->pending_drivechain_predecessor = known->pprev;
+                        nodestate->pending_drivechain_deadline =
+                            now + DRIVECHAIN_EPHEMERAL_BLOCK_TIMEOUT;
+                        requested_hash = header.GetHash();
+                        request_block = true;
+                        break;
                     }
 
                     const CBlockIndex* predecessor{nullptr};
@@ -3533,7 +3545,21 @@ void PeerManagerImpl::ProcessBlock(CNode& node, const std::shared_ptr<const CBlo
             const bool authenticated = index && index->nHeight > 0 &&
                 IsDrivechainHeaderAuthenticated(index, m_chainparams.GetConsensus());
 
-            if (state && matches_pending && authenticated) {
+            const bool ready = IsDrivechainBlockReadyForDescendants(
+                index, m_chainparams.GetConsensus());
+            if (state && matches_pending && authenticated && !ready) {
+                // Admission succeeded, but connection may have exhausted its
+                // parent budget. Retry this block after the normal backoff;
+                // its successor cannot derive a checkpoint yet.
+                state->drivechain_retry_predecessor =
+                    state->pending_drivechain_predecessor;
+                state->pending_drivechain_header.reset();
+                state->pending_drivechain_predecessor = nullptr;
+                state->pending_drivechain_deadline = 0us;
+                state->drivechain_retry_after =
+                    GetTime<std::chrono::microseconds>() +
+                    DRIVECHAIN_PARENT_UNAVAILABLE_BACKOFF;
+            } else if (state && matches_pending && ready) {
                 state->pending_drivechain_header.reset();
                 state->pending_drivechain_predecessor = nullptr;
                 state->pending_drivechain_deadline = 0us;
@@ -5867,7 +5893,7 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             const CBlockIndex* authenticated_elsewhere =
                 m_chainman.m_blockman.LookupBlockIndex(pending_hash);
             if (authenticated_elsewhere &&
-                IsDrivechainHeaderAuthenticated(
+                IsDrivechainBlockReadyForDescendants(
                     authenticated_elsewhere, consensusParams)) {
                 state.pending_drivechain_header.reset();
                 state.pending_drivechain_predecessor = nullptr;

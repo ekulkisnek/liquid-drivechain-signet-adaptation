@@ -2037,6 +2037,11 @@ BOOST_AUTO_TEST_CASE(drivechain_best_header_requires_admitted_full_block)
     index.nTx = 1;
     index.m_chain_tx_count = 2;
     BOOST_CHECK(IsDrivechainHeaderAuthenticated(&index, drivechain));
+    // A parent timeout can leave the full block admitted but not connected.
+    // Header authentication must not advance download past that block.
+    BOOST_CHECK(!IsDrivechainBlockReadyForDescendants(&index, drivechain));
+    index.m_usdd_withdrawal_accumulator.emplace();
+    BOOST_CHECK(IsDrivechainBlockReadyForDescendants(&index, drivechain));
 
     // Pruning removes local block bytes, not the fact that this full block was
     // admitted. It must not dead-end later drivechain synchronization.
@@ -2045,9 +2050,11 @@ BOOST_AUTO_TEST_CASE(drivechain_best_header_requires_admitted_full_block)
 
     index.nStatus |= BLOCK_FAILED_VALID;
     BOOST_CHECK(!IsDrivechainHeaderAuthenticated(&index, drivechain));
+    BOOST_CHECK(!IsDrivechainBlockReadyForDescendants(&index, drivechain));
 
     Consensus::Params ordinary;
     BOOST_CHECK(IsDrivechainHeaderAuthenticated(&index, ordinary));
+    BOOST_CHECK(IsDrivechainBlockReadyForDescendants(&index, ordinary));
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_unknown_sibling_headers_are_not_indexed)

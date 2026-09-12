@@ -118,6 +118,12 @@ bool IsDrivechainHeaderAuthenticated(const CBlockIndex* index,
                                      const Consensus::Params& consensus)
     EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+/** Full-block admission may precede connection after a retryable parent timeout.
+ * Descendants need the accumulator produced by successful connection. */
+bool IsDrivechainBlockReadyForDescendants(const CBlockIndex* index,
+                                         const Consensus::Params& consensus)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
 /**
  * Return the parent MTP that mempool script checks may use. Only a non-genesis
  * active tip with a sane authenticated DrivechainAnchor supplies context.

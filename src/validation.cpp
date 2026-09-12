@@ -4036,6 +4036,14 @@ bool IsDrivechainHeaderAuthenticated(const CBlockIndex* index,
            index->m_drivechain_anchor->IsSane();
 }
 
+bool IsDrivechainBlockReadyForDescendants(const CBlockIndex* index,
+                                         const Consensus::Params& consensus)
+{
+    if (!consensus.drivechain_slot.has_value()) return true;
+    return IsDrivechainHeaderAuthenticated(index, consensus) &&
+           index->m_usdd_withdrawal_accumulator.has_value();
+}
+
 std::optional<uint64_t> GetDrivechainMempoolParentMtp(
     const CBlockIndex* tip,
     const Consensus::Params& consensus)

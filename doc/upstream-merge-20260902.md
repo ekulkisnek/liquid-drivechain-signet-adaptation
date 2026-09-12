@@ -58,6 +58,7 @@ them does not reproduce its frozen catalogue and activation profile.
 ```sh
 cmake -S . -B /absolute/path/to/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  '-DCMAKE_C_FLAGS=-DECX_SIMPLICITY_CATALOGUE_FROZEN=1' \
   '-DCMAKE_CXX_FLAGS=-DECX_SIMPLICITY_CATALOGUE_FROZEN=1 -DECX_PRODUCTION_ACTIVATION_PROFILE_FROZEN=1 -DECX_SIMPLICITY_CATALOGUE_SHA256_HEX=\"bc981c9ba6665d16d95fea6a329b5c7317eefe520ffc3b12722d76fad270af1f\"' \
   -DBUILD_GUI=OFF -DBUILD_TESTS=ON \
   -DUSDD_SP1_VERIFIER_ARCHIVE=/absolute/path/to/libusdd_sp1_verifier.a \
