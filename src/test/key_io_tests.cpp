@@ -20,6 +20,54 @@
 
 BOOST_FIXTURE_TEST_SUITE(key_io_tests, BasicTestingSetup)
 
+BOOST_AUTO_TEST_CASE(elements_lwk_address_aliases)
+{
+    CKey key;
+    key.MakeNewKey(true);
+    WitnessV0KeyHash plain(key.GetPubKey());
+    WitnessV0KeyHash blinded = plain;
+    blinded.blinding_pubkey = key.GetPubKey();
+    SelectParams("elementsregtest");
+    const auto alias = EncodeDestination(plain);
+    const auto confidential_alias = EncodeDestination(blinded);
+    BOOST_REQUIRE(alias.starts_with("ert1"));
+    BOOST_REQUIRE(confidential_alias.starts_with("el1"));
+
+    SelectParams("elements");
+    for (const bool confidential : {false, true}) {
+        const CTxDestination expected = confidential ? blinded : plain;
+        const auto& input = confidential ? confidential_alias : alias;
+        const auto decoded = DecodeDestination(input);
+        BOOST_REQUIRE(IsValidDestination(decoded));
+        BOOST_CHECK(decoded == expected);
+        BOOST_CHECK(GetScriptForDestination(decoded) == GetScriptForDestination(expected));
+        const auto canonical = EncodeDestination(decoded);
+        BOOST_CHECK(canonical.starts_with(confidential ? "elementsl1" : "elements1"));
+        BOOST_CHECK(DecodeDestination(canonical) == expected);
+        BOOST_CHECK(DecodeDestination(ToUpper(input)) == expected);
+        auto mixed_case = input;
+        mixed_case[0] = 'E';
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(mixed_case)));
+        std::string error;
+        BOOST_CHECK(!IsValidDestination(DecodeParentDestination(input, error)));
+        auto damaged = input;
+        damaged.back() = damaged.back() == 'q' ? 'p' : 'q';
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(damaged)));
+    }
+    for (const auto& chain : {"main", "test", "liquidv1", "liquidtestnet"}) {
+        SelectParams(std::string{chain});
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(alias)));
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(confidential_alias)));
+    }
+    SelectParams(ChainType::MAIN);
+    const auto mainchain_address = EncodeDestination(plain);
+    SelectParams("elements");
+    BOOST_CHECK(!IsValidDestination(DecodeDestination(mainchain_address)));
+    std::string error;
+    BOOST_CHECK(IsValidDestination(DecodeParentDestination(mainchain_address, error)));
+    SelectParams(ChainType::MAIN);
+}
+
 // Goal: check that parsed keys match test payload
 BOOST_AUTO_TEST_CASE(key_io_valid_parse)
 {

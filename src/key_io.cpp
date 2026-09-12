@@ -157,6 +157,10 @@ CTxDestination DecodeDestination(const std::string& str, const CChainParams& par
     uint160 hash;
     error_str = "";
 
+    // LWK CustomElements uses regtest HRPs. Accept these as input aliases only;
+    // retain canonical encoding and never accept them for parent-chain payments.
+    const bool lwk_alias = !for_parent && params.NetworkIDString() == "elements";
+
     bool is_bech32 = !(bech32::Decode(str).encoding == bech32::Encoding::INVALID);
     bool is_blech32 = !(blech32::Decode(str).encoding == blech32::Encoding::INVALID);
 
@@ -235,7 +239,7 @@ CTxDestination DecodeDestination(const std::string& str, const CChainParams& par
         // Bech32 decoding
         error_str = "";
 
-        if (dec.hrp != hrp) {
+        if (dec.hrp != hrp && !(lwk_alias && dec.hrp == "ert")) {
             error_str = strprintf("Invalid or unsupported prefix for Segwit (Bech32) address (expected %s, got %s).", params.Bech32HRP(), dec.hrp);
             return CNoDestination();
         }
@@ -310,7 +314,7 @@ CTxDestination DecodeDestination(const std::string& str, const CChainParams& par
         // Blech32 decoding
         error_str = "";
 
-        if (blech.hrp != bl_hrp) {
+        if (blech.hrp != bl_hrp && !(lwk_alias && blech.hrp == "el")) {
             error_str = "Invalid prefix for Blech32 address";
             return CNoDestination();
         }
