@@ -1492,7 +1492,20 @@ static RPCHelpMan getecxconsensuscontext()
     drivechain::BmmParentContext bmm;
     bool bmm_authenticated{true};
     drivechain::BmmL1State bmm_state;
-    if (drivechain::GetEffectiveBmmState(
+    if (Params().GetConsensus().drivechain_slot.has_value()) {
+        // Report the prior child's authenticated P, not its M7 inclusion block Q
+        // or the advancing mempool parent. Native Alpha has no signet BMM state.
+        // Use the same authentication gate as the covenant checkpoint context.
+        if (!GetPriorActiveBmmParentCheckpoint(tip, Params().GetConsensus())) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "active native ECX tip has no authenticated parent checkpoint");
+        }
+        const DrivechainAnchor& anchor{*tip->m_drivechain_anchor};
+        bmm.block_hash = anchor.parent_block_hash;
+        bmm.height = anchor.parent_height;
+        bmm.median_time_past = anchor.parent_median_time_past;
+    } else if (drivechain::GetEffectiveBmmState(
             chainman.ActiveChainstate().CoinsTip(),
             tip,
             bmm_state,
@@ -2319,6 +2332,115 @@ struct CompareBlocksByHeight
         return a < b;
     }
 };
+
+static RPCHelpMan getalphacheckpointevidence()
+{
+    return RPCHelpMan{"getalphacheckpointevidence",
+        "Capture raw checkpoint evidence at an exact active tip, including spent claims and source-block witnesses.\n"
+        "This flushes the coins cache and holds cs_main while taking the snapshot. It does not qualify a proof\n"
+        "or authenticate external configuration. Limited to 10,000 headers, 100,000 coins and 64 MiB raw evidence.\n",
+        {{"expectedblock", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Required exact active-chain tip"}},
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned raw checkpoint evidence",
+            {{RPCResult::Type::ELISION, "", "Exact block, coin, claim, withdrawal and optional capital/anchor records"}}},
+        RPCExamples{HelpExampleCli("getalphacheckpointevidence", "\"blockhash\"")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const uint256 expected = ParseHashV(request.params[0], "expectedblock");
+    LOCK(cs_main);
+    CChain& active = chainman.ActiveChain();
+    const CBlockIndex* tip = active.Tip();
+    if (!tip || tip->GetBlockHash() != expected || expected.IsNull()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Checkpoint tip changed or is unavailable");
+    }
+    if (tip->nHeight >= 10000) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint header limit exceeded");
+    if (!tip->m_usdd_withdrawal_accumulator || !tip->m_usdd_withdrawal_accumulator->IsSane()) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint withdrawal state unavailable or invalid");
+    }
+    auto sources = node::PrepareChildCheckpointSources(chainman);
+    auto& cursor = sources.coins;
+    if (cursor->GetBestBlock() != expected) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint database tip mismatch");
+    size_t raw_bytes{0};
+    auto encode = [&](const auto& value) {
+        DataStream bytes{};
+        bytes << value;
+        raw_bytes += bytes.size();
+        if (raw_bytes > 64 * 1024 * 1024) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint evidence size limit exceeded");
+        return HexStr(bytes);
+    };
+    UniValue result(UniValue::VOBJ), headers(UniValue::VARR), coins(UniValue::VARR),
+        spent(UniValue::VARR), blocks(UniValue::VARR);
+    result.pushKV("version", 1);
+    result.pushKV("proof_ready", false);
+    result.pushKV("network", Params().NetworkIDString());
+    result.pushKV("genesis", active.Genesis()->GetBlockHash().GetHex());
+    result.pushKV("blockhash", expected.GetHex());
+    result.pushKV("height", tip->nHeight);
+    for (int height = 0; height <= tip->nHeight; ++height) {
+        node.rpc_interruption_point();
+        CBlockIndex full;
+        const CBlockIndex* index = chainman.m_blockman.m_block_tree_db->RegenerateFullIndex(active[height], &full);
+        headers.push_back(encode(TX_WITH_WITNESS(index->GetBlockHeader())));
+    }
+    for (; sources.spent_claims->Valid(); sources.spent_claims->Next()) {
+        node.rpc_interruption_point();
+        if (spent.size() >= 100000) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint claim limit exceeded");
+        spent.push_back(encode(sources.spent_claims->GetKey()));
+    }
+    // The coin database omits output witnesses. Retain the original blocks,
+    // including all transaction witnesses, and cross-check every exported coin.
+    std::map<int, CBlock> source_blocks;
+    for (; cursor->Valid(); cursor->Next()) {
+        node.rpc_interruption_point();
+        if (coins.size() >= 100000) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint coin limit exceeded");
+        COutPoint outpoint;
+        Coin coin;
+        if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin) || coin.IsSpent() || coin.nHeight > uint32_t(tip->nHeight)) {
+            throw JSONRPCError(RPC_MISC_ERROR, "Unreadable or inconsistent checkpoint coin");
+        }
+        const int height = coin.nHeight;
+        auto [it, inserted] = source_blocks.try_emplace(height);
+        if (inserted) {
+            if (!chainman.m_blockman.ReadBlock(it->second, *active[height]) ||
+                it->second.GetHash() != active[height]->GetBlockHash()) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint coin source block unavailable or mismatched");
+            }
+            UniValue block(UniValue::VOBJ);
+            block.pushKV("height", height);
+            block.pushKV("block", encode(TX_WITH_WITNESS(it->second)));
+            blocks.push_back(std::move(block));
+        }
+        const auto& transactions = it->second.vtx;
+        auto tx = std::find_if(transactions.begin(), transactions.end(), [&](const auto& candidate) {
+            return candidate->GetHash() == outpoint.hash;
+        });
+        if (tx == transactions.end() || outpoint.n >= (*tx)->vout.size() ||
+            (*tx)->vout[outpoint.n] != coin.out || (*tx)->IsCoinBase() != coin.IsCoinBase()) {
+            throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint coin does not match its original transaction");
+        }
+        UniValue item(UniValue::VOBJ);
+        item.pushKV("outpoint", encode(outpoint));
+        item.pushKV("height", height);
+        item.pushKV("coinbase", coin.IsCoinBase());
+        item.pushKV("output", encode(coin.out));
+        coins.push_back(std::move(item));
+    }
+    result.pushKV("headers", std::move(headers));
+    result.pushKV("coins", std::move(coins));
+    result.pushKV("spent_claim_keys", std::move(spent));
+    result.pushKV("coin_source_blocks", std::move(blocks));
+    const auto& accumulator = sources.withdrawals;
+    UniValue withdrawals(UniValue::VOBJ), frontier(UniValue::VARR);
+    withdrawals.pushKV("count", accumulator.count);
+    withdrawals.pushKV("root", HexStr(accumulator.root));
+    for (const auto& entry : accumulator.frontier) frontier.push_back(HexStr(entry));
+    withdrawals.pushKV("frontier", std::move(frontier));
+    result.pushKV("withdrawals", std::move(withdrawals));
+    result.pushKV("capital_snapshot", tip->ecxBondV2Capital ? UniValue(encode(*tip->ecxBondV2Capital)) : UniValue());
+    result.pushKV("drivechain_anchor", tip->m_drivechain_anchor ? UniValue(encode(*tip->m_drivechain_anchor)) : UniValue());
+    return result;
+        }};
+}
 
 static RPCHelpMan getchaintips()
 {
@@ -4486,7 +4608,12 @@ static RPCHelpMan getsidechaininfo()
                         {RPCResult::Type::STR, "parent_chain_signblockscript_asm", /*optional=*/true, "If the parent chain has signed blocks, its signblockscript in ASM"},
                         {RPCResult::Type::STR_HEX, "parent_chain_signblockscript_hex", /*optional=*/true, "If the parent chain has signed blocks, its signblockscript in hex"},
                         {RPCResult::Type::STR_HEX, "parent_pegged_asset", /*optional=*/true, "If the parent chain has Confidential Assets, the asset id of the pegged asset in that chain"},
-                        {RPCResult::Type::NUM, "pegin_confirmation_depth", "The number of mainchain confirmations required for a peg-in transaction to become valid"},
+                        {RPCResult::Type::NUM, "pegin_confirmation_depth", "The mainchain confirmations required for a peg-in in the next child block (mempool admission)"},
+                        {RPCResult::Type::NUM, "pegin_confirmation_depth_historical", "The original depth committed by the genesis/protocol identity"},
+                        {RPCResult::Type::NUM, "pegin_confirmation_depth_current_block", "The depth required by the current child block's consensus rules"},
+                        {RPCResult::Type::NUM, "pegin_confirmation_depth_validation_height", "The next child block height used for pegin_confirmation_depth"},
+                        {RPCResult::Type::NUM, "pegin_confirmation_depth_activation_height", /*optional=*/true, "Child height of the fixed Alpha one-confirmation upgrade"},
+                        {RPCResult::Type::NUM, "pegin_confirmation_depth_after_activation", /*optional=*/true, "Required depth at and after the fixed Alpha upgrade"},
                         {RPCResult::Type::BOOL, "enforce_pak", "If peg-out authorization is being enforced"},
                         {RPCResult::Type::STR, "pegin_min_amount", /*optional=*/true, "minimum peg-in amount enforced by consensus"},
                         {RPCResult::Type::NUM, "pegin_min_height", /*optional=*/true, "block height from which the minimum peg-in amount applies"},
@@ -4526,7 +4653,15 @@ static RPCHelpMan getsidechaininfo()
     obj.pushKV("parent_blockhash", parent_blockhash.GetHex());
     obj.pushKV("parent_chain_has_pow", consensus.ParentChainHasPow());
     obj.pushKV("enforce_pak", Params().GetEnforcePak());
-    obj.pushKV("pegin_confirmation_depth", (uint64_t)consensus.pegin_min_depth);
+    const int child_tip_height = chainman.ActiveChain().Height();
+    obj.pushKV("pegin_confirmation_depth", (uint64_t)GetDrivechainPeginConfirmationDepth(Params(), child_tip_height + 1));
+    obj.pushKV("pegin_confirmation_depth_historical", (uint64_t)consensus.pegin_min_depth);
+    obj.pushKV("pegin_confirmation_depth_current_block", (uint64_t)GetDrivechainPeginConfirmationDepth(Params(), child_tip_height));
+    obj.pushKV("pegin_confirmation_depth_validation_height", child_tip_height + 1);
+    if (HasAlphaPeginOneConfirmationUpgrade(Params())) {
+        obj.pushKV("pegin_confirmation_depth_activation_height", ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT);
+        obj.pushKV("pegin_confirmation_depth_after_activation", 1);
+    }
     if (!consensus.ParentChainHasPow()) {
         obj.pushKV("parent_chain_signblockscript_asm", ScriptToAsmStr(consensus.parent_chain_signblockscript));
         obj.pushKV("parent_chain_signblockscript_hex", HexStr(consensus.parent_chain_signblockscript));
@@ -5266,6 +5401,7 @@ void RegisterBlockchainRPCCommands(CRPCTable &t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
+        {"blockchain", &getalphacheckpointevidence},
         {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},

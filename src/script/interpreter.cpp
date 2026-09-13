@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <script/interpreter.h>
+#include <script/ecx_activation_annex.h>
 
 #include <consensus/consensus.h>
 #include <crypto/ripemd160.h>
@@ -3421,6 +3422,16 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
     if (txdata->m_current_sidechain_height.has_value()) {
         ecx_root.current_sidechain_height =
             *txdata->m_current_sidechain_height;
+    }
+    if (txdata->m_ecx_activation_execution_anchor_authenticated &&
+        txdata->EcxBondV2IncrementalActivationIdentityPresence() == 1 &&
+        nIn < txTo->witness.vtxinwit.size()) {
+        budget = ecx::ActivationExecutionBudget(budget, nIn,
+            txTo->witness.vtxinwit[nIn].scriptWitness.stack,
+            txdata->m_bond_v2_incremental_activation_cmr ?
+                &*txdata->m_bond_v2_incremental_activation_cmr : nullptr,
+            txdata->m_bond_v2_incremental_activation_program_id ?
+                &*txdata->m_bond_v2_incremental_activation_program_id : nullptr);
     }
     if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &ecx_root, &simplicityRawBlock, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
         assert(!"simplicity_elements_execSimplicity internal error");

@@ -35,10 +35,36 @@
 #endif
 
 class CBlockIndex;
+class CBlockUndo;
+class Coin;
 class CCoinsView;
 class CCoinsViewCache;
 
 namespace ecx {
+// Cryptographically verify a confidential fixed-supply bond issuance opening.
+bool VerifyBondIssuance(const CTransaction& tx, uint32_t index, const uint256& vbf);
+// Public v3 relation only; input authorization and coin conservation remain
+// the responsibility of native transaction validation.
+bool VerifyPublicBondDeployment(const CTransaction& tx, uint32_t issuance_index,
+    uint32_t inventory_index, uint32_t burn_index);
+
+// Raw hash bytes (not display-order hex); integer fields use big endian.
+// Encoding only: callers must separately validate the deployment relation.
+struct BondDeploymentCommitmentFields {
+    uint256 transaction_id;
+    uint256 previous_transaction_id;
+    uint32_t previous_output_index;
+    uint256 bond_asset;
+    uint256 token_asset;
+    uint32_t inventory_output_index;
+    uint32_t burn_output_index;
+    uint256 inventory_script_hash;
+    uint256 burn_script_hash;
+};
+std::vector<unsigned char> EncodeBondDeploymentCommitment(
+    uint32_t version, const BondDeploymentCommitmentFields& fields);
+uint256 BondDeploymentCommitment(
+    uint32_t version, const BondDeploymentCommitmentFields& fields);
 
 #ifdef ECX_ENABLE_SP1_GROTH16_VERIFIER
 extern "C" bool ecx_witness_availability_verify_custody_receipts_v1(
@@ -80,6 +106,7 @@ struct ExchangeConsensus
     struct BondV2FrozenConsensus {
         bool activation_enabled{false};
         bool identities_frozen{false};
+        uint32_t deployment_version{2}; // 2: confidential; 3: explicit public issuance
         CTransactionRef deployment_transaction;
         CTransactionRef genesis_transaction;
         uint32_t issuance_input_index{0};
@@ -88,6 +115,7 @@ struct ExchangeConsensus
         uint32_t state_authority_source_output_index{0};
         uint256 inventory_asset_blinding_factor;
         uint256 inventory_value_blinding_factor;
+        uint256 issuance_value_blinding_factor;
         std::vector<unsigned char> canonical_configuration_bytes;
         uint256 transition_program_id;
         uint256 configuration_hash;
@@ -153,6 +181,12 @@ struct ExchangeConsensus
         CAsset usdd_asset_id;
         std::array<unsigned char, 32> keyless_internal_key{};
         uint64_t genesis_mark_price{0};
+        // V2 initialization is pinned before constructing the genesis output.
+        // Zero retains the legacy relation for historical/test configurations.
+        uint8_t genesis_initialization_version{0};
+        uint32_t genesis_initialization_height{0};
+        uint256 genesis_initialization_block_hash;
+        uint64_t genesis_initialization_parent_mtp{0};
     } bond_v2;
 };
 
@@ -270,10 +304,18 @@ bool DecodeBondV2IncrementalSuccessorCapitalProjection(
     std::string& error,
     const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
 
+/** Bind the consumed finite-state coin; this does not verify its input script. */
+bool CheckBondV2ActivationPredecessorCoin(
+    const CTransaction& transition,
+    const Coin& predecessor_coin,
+    const uint256& previous_exchange_root,
+    const BondV2CapitalSnapshot& prior_capital,
+    std::string& error,
+    const ExchangeConsensus& consensus);
+
 /**
- * Derive the reorg-safe per-block V2 projection after every input script and
- * Groth16 verifier has succeeded. A fresh activation remains fail-closed until
- * the physical deployment and exact canonical-genesis verifier is frozen.
+ * Derive the reorg-safe per-block V2 projection after input script validation.
+ * Incremental activation requires ConnectBlock's exact consumed-coin undo.
  */
 bool DeriveBondV2CapitalProjectionAfterScripts(
     const CBlock& block,
@@ -285,15 +327,28 @@ bool DeriveBondV2CapitalProjectionAfterScripts(
     uint64_t prior_parent_mtp,
     BondV2CapitalSnapshot& snapshot,
     std::string& error,
-    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
+    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus(),
+    const CBlockUndo* block_undo = nullptr,
+    std::optional<uint256> activation_execution_hash = std::nullopt,
+    std::optional<uint64_t> activation_execution_mtp = std::nullopt);
 
 /** Exact one-time physical deployment and canonical empty V2 initializer. */
+bool ResolveBondV2GenesisInitialization(
+    const CBlockIndex* previous,
+    uint32_t state_creation_height,
+    uint64_t activation_parent_mtp,
+    uint64_t& initialization_height,
+    uint64_t& initialization_parent_mtp,
+    std::string& error,
+    const ExchangeConsensus& consensus);
+
 bool VerifyBondV2DeploymentAndGenesis(
     const CCoinsViewCache& view,
     uint64_t prior_parent_mtp,
     BondV2CapitalSnapshot& snapshot,
     std::string& error,
-    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
+    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus(),
+    const CBlockIndex* previous = nullptr);
 
 /** Deterministic finite-state singleton script. The Taproot tree preauthorizes
  * both ordinary V18 transitions and the one-shot incremental activation leaf. */
@@ -301,6 +356,17 @@ bool ComputeBondV2FiniteStateScript(
     const ExchangeConsensus& consensus,
     const uint256& covenant_state_hash,
     CScript& script);
+
+/** Offline derivation only: does not authenticate the checkpoint, configuration,
+ * deployment, or coin. Activation must still validate all of those separately. */
+bool ComputeBondV2EmptyGenesisRoots(
+    const ExchangeConsensus& consensus,
+    uint64_t initialization_height,
+    uint64_t initialization_parent_mtp,
+    uint256& private_state_root,
+    uint256& bond_state_root,
+    uint256& funding_state_root,
+    uint256& covenant_state_hash);
 
 /** Deterministic post-activation incremental successor singleton script. */
 bool ComputeBondV2IncrementalSuccessorScript(

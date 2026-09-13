@@ -11,11 +11,14 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <node/miner.h>
+#include <node/blockstorage.h>
 #include <pow.h>
 #include <random.h>
+#include <rpc/server.h>
 #include <script/solver.h>
 #include <streams.h>
 #include <test/util/random.h>
+#include <test/util/logging.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <util/time.h>
@@ -23,14 +26,20 @@
 #include <validationinterface.h>
 
 #include <set>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 using node::BlockAssembler;
 
 namespace validation_block_tests {
 struct MinerTestingSetup : public TestingSetup {
-    MinerTestingSetup()
-        : TestingSetup{ChainType::REGTEST, {.extra_args = {"-con_elementsmode=0"}}} {}
+    explicit MinerTestingSetup(bool elements_mode = false, bool funded_checkpoint = false)
+        : TestingSetup{elements_mode ? ChainTypeMetaFrom(std::string{"elementsregtest"}) : ChainTypeMetaFrom(ChainType::REGTEST),
+                       {.extra_args = {elements_mode ? "-con_elementsmode=1" : "-con_elementsmode=0",
+                                       funded_checkpoint ? "-con_blocksubsidy=5000000000" : "-con_blocksubsidy=0"}}} {}
+
+    void CheckExplicitGatePaths();
 
     std::shared_ptr<CBlock> Block(const uint256& prev_hash);
     std::shared_ptr<const CBlock> GoodBlock(const uint256& prev_hash);
@@ -41,6 +50,95 @@ struct MinerTestingSetup : public TestingSetup {
 } // namespace validation_block_tests
 
 BOOST_FIXTURE_TEST_SUITE(validation_block_tests, MinerTestingSetup)
+
+void MinerTestingSetup::CheckExplicitGatePaths()
+{
+    auto& chainman = *Assert(m_node.chainman);
+    bool ignored{false};
+    BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    auto block = Block(Params().GenesisBlock().GetHash());
+    CMutableTransaction coinbase(*block->vtx.front());
+    for (auto& output : coinbase.vout) {
+        output.nAsset = chainman.GetConsensus().subsidy_asset;
+        // Match the Elements assembler: zero-valued coinbase outputs must
+        // be unspendable, unlike the standard-regtest mining helper.
+        if (g_con_elementsmode && output.nValue.GetAmount() == 0) {
+            output.scriptPubKey = CScript{} << OP_RETURN;
+        }
+    }
+    block->vtx.front() = MakeTransactionRef(coinbase);
+    block->hashMerkleRoot = BlockMerkleRoot(*block);
+    auto& consensus = const_cast<Consensus::Params&>(chainman.GetConsensus());
+    struct RestoreHeight {
+        Consensus::Params& params;
+        int previous;
+        ~RestoreHeight() { params.explicit_only_height = previous; }
+    } restore{consensus, consensus.explicit_only_height};
+    LOCK(cs_main);
+    auto& chainstate = chainman.ActiveChainstate();
+    auto* previous = chainstate.m_chain.Tip();
+    const auto check = [&](const CBlock& candidate, bool direct) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        AssertLockHeld(cs_main);
+        BlockValidationState state;
+        if (direct) {
+            // This is the entry used when contextual checks are skipped during
+            // chainstate reconstruction. Use an isolated, uncommitted view.
+            CCoinsViewCache view(&chainstate.CoinsTip());
+            const uint256 hash = candidate.GetHash();
+            CBlockIndex index(candidate);
+            index.pprev = previous;
+            index.nHeight = previous->nHeight + 1;
+            index.phashBlock = &hash;
+            chainstate.ConnectBlock(candidate, state, &index, view, nullptr, true);
+        } else {
+            TestBlockValidity(state, chainman.GetParams(), chainstate, candidate, previous, false, false);
+        }
+        return state;
+    };
+    for (int activation : {1, 2}) {
+        consensus.explicit_only_height = activation;
+        for (bool direct : {false, true}) {
+            const auto valid = check(*block, direct);
+            BOOST_CHECK_MESSAGE(valid.IsValid(), valid.ToString());
+            CBlock changed = *block;
+            CMutableTransaction tx(*changed.vtx.front());
+            tx.vout.front().nNonce.vchCommitment.assign(33, 1);
+            tx.vout.front().nNonce.vchCommitment.front() = 2;
+            changed.vtx.front() = MakeTransactionRef(std::move(tx));
+            // An already-screened block must still receive the height gate.
+            changed.fChecked = true;
+            const auto result = check(changed, direct);
+            if (activation == 1) {
+                BOOST_CHECK_EQUAL(result.GetRejectReason(), "bad-txns-confidential-disabled");
+            } else {
+                BOOST_CHECK_MESSAGE(result.IsValid(), result.ToString());
+            }
+            // Context-free/cached screening must never bypass the aggregate
+            // check, including the direct reconstruction entry point.
+            CBlock excessive = *block;
+            CMutableTransaction excessive_coinbase(*excessive.vtx.front());
+            excessive_coinbase.vout[0].nValue = MAX_MONEY;
+            excessive_coinbase.vout[1].nValue = 1;
+            excessive.vtx.front() = MakeTransactionRef(excessive_coinbase);
+            excessive.fChecked = true;
+            const auto same_asset = check(excessive, direct);
+            BOOST_CHECK_EQUAL(same_asset.GetRejectReason(), "bad-txns-txouttotal-toolarge");
+            // Distinct assets pass the activated aggregate check, but this
+            // unfunded coinbase must still fail conservation/reward checks.
+            excessive_coinbase.vout[1].nAsset = CAsset(uint256S("02"));
+            excessive.vtx.front() = MakeTransactionRef(excessive_coinbase);
+            const auto distinct_assets = check(excessive, direct);
+            BOOST_CHECK_EQUAL(distinct_assets.GetRejectReason(), activation == 1
+                ? "bad-cb-amount" : "bad-txns-txouttotal-toolarge");
+        }
+    }
+    // This isolates gate routing, not a complete disk reindex or Alpha BMM.
+}
+
+BOOST_AUTO_TEST_CASE(explicit_gate_contextual_and_direct_connect)
+{
+    CheckExplicitGatePaths();
+}
 
 BOOST_AUTO_TEST_CASE(bits16_through20_remain_ordinary_on_standard_regtest)
 {
@@ -353,14 +451,18 @@ std::shared_ptr<CBlock> MinerTestingSetup::FinalizeBlock(std::shared_ptr<CBlock>
 
     pblock->hashMerkleRoot = BlockMerkleRoot(*pblock);
 
-    while (!CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus())) {
+    while (!g_signed_blocks && !CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus())) {
         ++(pblock->nNonce);
     }
 
     // submit block header, so that miner can get the block height from the
     // global state and the node has the topology of the chain
     BlockValidationState ignored;
-    BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders({{pblock->GetBlockHeader()}}, true, ignored));
+    // GetBlockHeader omits the dynafed witness; validation needs the complete
+    // header base including that witness for signed-block fixtures.
+    const CBlockHeader header = static_cast<const CBlockHeader&>(*pblock);
+    const bool accepted = Assert(m_node.chainman)->ProcessNewBlockHeaders({&header, 1}, true, ignored);
+    BOOST_CHECK_MESSAGE(accepted, ignored.ToString());
 
     return pblock;
 }
@@ -622,3 +724,155 @@ BOOST_AUTO_TEST_CASE(witness_commitment_index)
     BOOST_CHECK_EQUAL(GetWitnessCommitmentIndex(pblock), 2);
 }
 BOOST_AUTO_TEST_SUITE_END()
+
+struct ElementsModeGateSetup : public validation_block_tests::MinerTestingSetup {
+    ElementsModeGateSetup() : MinerTestingSetup(true) {}
+};
+
+struct ElementsCheckpointSetup : public validation_block_tests::MinerTestingSetup {
+    ElementsCheckpointSetup() : MinerTestingSetup(true, true) {}
+};
+
+// Codec fixture only: private Elements regtest is never live Alpha evidence.
+BOOST_FIXTURE_TEST_CASE(elements_checkpoint_rpc_nonempty_source, ElementsCheckpointSetup)
+{
+    BOOST_REQUIRE(g_con_elementsmode);
+    const auto& consensus = Params().GetConsensus();
+    BOOST_REQUIRE_EQUAL(consensus.genesis_subsidy, 5000000000);
+    bool ignored{false};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    auto block = Block(Params().GenesisBlock().GetHash());
+    CMutableTransaction tx(*block->vtx.front());
+    // The miner template omits subsidy when it differs from policyAsset.
+    // Claim the actual consensus subsidy explicitly in this codec fixture.
+    tx.vout.at(1).nValue = GetBlockSubsidy(1, consensus);
+    for (auto& output : tx.vout) {
+        output.nAsset = consensus.subsidy_asset;
+        if (output.nValue.GetAmount() == 0) output.scriptPubKey = CScript{} << OP_RETURN;
+    }
+    block->vtx.front() = MakeTransactionRef(tx);
+    BOOST_REQUIRE(consensus.signblockscript == (CScript{} << OP_TRUE));
+    BOOST_REQUIRE(!block->m_dynafed_params.IsNull());
+    block->m_signblock_witness.stack = {{OP_TRUE}};
+    FinalizeBlock(block);
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(block, true, true, &ignored));
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveHeight()), 1);
+
+    JSONRPCRequest request;
+    request.context = &m_node;
+    request.strMethod = "getalphacheckpointevidence";
+    request.params = UniValue(UniValue::VARR);
+    request.params.push_back(block->GetHash().GetHex());
+    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+    const auto result = tableRPC.execute(request);
+    BOOST_CHECK(!result["proof_ready"].get_bool());
+    BOOST_CHECK_EQUAL(result["network"].get_str(), "elementsregtest");
+    BOOST_CHECK_EQUAL(result["headers"].size(), 2U);
+    BOOST_REQUIRE(result["coins"].size() > 0);
+    BOOST_REQUIRE(result["coin_source_blocks"].size() > 0);
+    if (const char* path = std::getenv("ECX_ELEMENTS_CODEC_FIXTURE")) {
+        // Expectations come from the validated fixture, not RPC fields.
+        UniValue fixture(UniValue::VOBJ);
+        fixture.pushKV("stage", "private-elementsregtest-codec-only");
+        fixture.pushKV("expected_genesis", Params().GenesisBlock().GetHash().GetHex());
+        fixture.pushKV("expected_tip", block->GetHash().GetHex());
+        fixture.pushKV("expected_height", 1);
+        UniValue buried(UniValue::VOBJ);
+        buried.pushKV("height_in_coinbase", consensus.BIP34Height);
+        buried.pushKV("strict_der", consensus.BIP66Height);
+        buried.pushKV("cltv", consensus.BIP65Height);
+        buried.pushKV("csv", consensus.CSVHeight);
+        buried.pushKV("segwit", consensus.SegwitHeight);
+        UniValue deployments(UniValue::VOBJ);
+        deployments.pushKV("buried", buried);
+        const auto deployment = [&](Consensus::DeploymentPos pos) {
+            const auto& d = consensus.vDeployments[pos];
+            UniValue value(UniValue::VOBJ);
+            value.pushKV("bit", d.bit);
+            value.pushKV("start", d.nStartTime);
+            value.pushKV("timeout", d.nTimeout);
+            value.pushKV("min_activation_height", d.min_activation_height);
+            value.pushKV("period", d.nPeriod.value_or(consensus.nMinerConfirmationWindow));
+            value.pushKV("threshold", d.nThreshold.value_or(consensus.nRuleChangeActivationThreshold));
+            return value;
+        };
+        deployments.pushKV("taproot", deployment(Consensus::DEPLOYMENT_TAPROOT));
+        deployments.pushKV("dynafed", deployment(Consensus::DEPLOYMENT_DYNA_FED));
+        deployments.pushKV("simplicity", deployment(Consensus::DEPLOYMENT_SIMPLICITY));
+        UniValue exception(UniValue::VARR);
+        BOOST_REQUIRE(consensus.script_flag_exceptions.empty());
+        for (int i = 0; i < 32; ++i) exception.push_back(0);
+        deployments.pushKV("bip16_exception_internal", exception);
+        deployments.pushKV("usdd_sp1_annex", consensus.enable_usdd_sp1_annex);
+        fixture.pushKV("deployments", deployments);
+        fixture.pushKV("export", result);
+        const auto bytes = fixture.write(2) + "\n";
+        // Exclusive creation prevents overwriting a previously pinned fixture.
+        FILE* output = std::fopen(path, "wx");
+        BOOST_REQUIRE(output != nullptr);
+        const auto written = std::fwrite(bytes.data(), 1, bytes.size(), output);
+        const auto closed = std::fclose(output);
+        BOOST_REQUIRE_EQUAL(written, bytes.size());
+        BOOST_REQUIRE_EQUAL(closed, 0);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(explicit_gate_elements_mode, ElementsModeGateSetup)
+{
+    BOOST_REQUIRE(g_con_elementsmode);
+    CheckExplicitGatePaths();
+}
+
+BOOST_FIXTURE_TEST_CASE(explicit_gate_disk_reindex, ElementsModeGateSetup)
+{
+    auto& consensus = const_cast<Consensus::Params&>(Params().GetConsensus());
+    struct RestoreHeight {
+        Consensus::Params& params;
+        int previous;
+        ~RestoreHeight() { params.explicit_only_height = previous; }
+    } restore{consensus, consensus.explicit_only_height};
+    consensus.explicit_only_height = 2;
+    bool ignored{false};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+    auto block = Block(Params().GenesisBlock().GetHash());
+    CMutableTransaction tx(*block->vtx.front());
+    for (auto& output : tx.vout) {
+        output.nAsset = consensus.subsidy_asset;
+        if (output.nValue.GetAmount() == 0) output.scriptPubKey = CScript{} << OP_RETURN;
+    }
+    tx.vout.front().nNonce.vchCommitment.assign(33, 1);
+    tx.vout.front().nNonce.vchCommitment.front() = 2;
+    block->vtx.front() = MakeTransactionRef(tx);
+    // The default dynafed challenge wraps the fixture's OP_TRUE script in
+    // P2WSH. Supply the real script witness, rather than bypassing proof checks.
+    BOOST_REQUIRE(consensus.signblockscript == (CScript{} << OP_TRUE));
+    BOOST_REQUIRE(!block->m_dynafed_params.IsNull());
+    block->m_signblock_witness.stack = {{OP_TRUE}};
+    FinalizeBlock(block);
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(block, true, true, &ignored));
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveHeight()), 1);
+    m_node.chainman->ActiveChainstate().ForceFlushStateToDisk();
+
+    // Rebuild from the fixture's actual blk files with fresh index/coins DBs.
+    // First retain the historical block, then reject it at activation.
+    for (int activation : {2, 1}) {
+        m_node.validation_signals->SyncWithValidationInterfaceQueue();
+        m_node.chainman.reset();
+        consensus.explicit_only_height = activation;
+        m_args.ForceSetArg("-reindex", "1");
+        m_make_chainman();
+        LoadVerifyActivateChainstate();
+        BOOST_REQUIRE(!m_node.chainman->m_blockman.m_blockfiles_indexed);
+        if (activation == 1) {
+            ASSERT_DEBUG_LOG("bad-txns-confidential-disabled");
+            node::ImportBlocks(*m_node.chainman, {});
+        } else {
+            node::ImportBlocks(*m_node.chainman, {});
+        }
+        BOOST_CHECK(m_node.chainman->m_blockman.m_blockfiles_indexed);
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveHeight()), activation == 2 ? 1 : 0);
+        if (activation == 2) {
+            BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveTip()->GetBlockHash()), block->GetHash());
+        }
+    }
+}

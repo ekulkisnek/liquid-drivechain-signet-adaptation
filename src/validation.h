@@ -493,6 +493,14 @@ bool TestBlockCandidateValidity(BlockValidationState& state,
                                 bool fCheckPOW = true,
                                 bool fCheckMerkleRoot = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+/** Mining-only script precheck against an already authenticated candidate P.
+ * Does not replace full candidate/block validation or mutate the mempool.
+ */
+bool CheckNativeCandidateTransactionScripts(
+    const CTransaction& tx, Chainstate& chainstate, const CTxMemPool& pool,
+    const CBlockHeader& header, const DrivechainParentBlockContext& parent)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main, pool.cs);
+
 /** Return the consensus script flags selected for a block index. Test-only. */
 unsigned int GetBlockScriptFlagsForTesting(const CBlockIndex* pindex,
                                            const Consensus::Params& consensusparams);

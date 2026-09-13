@@ -22,6 +22,7 @@
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
 #include <ecx_exchange_state.h>
+#include <script/ecx_activation_annex.h>
 #include <drivechain_peg.h>
 #include <flatfile.h>
 #include <hash.h>
@@ -584,7 +585,7 @@ static void ClearExchangeScriptContext(PrecomputedTransactionData& txdata)
 static void BindPriorActiveExchangeStateRoot(
     PrecomputedTransactionData& txdata,
     const CBlockIndex* previous,
-    const drivechain::BmmL1State* prior_bmm_state)
+    const drivechain::BmmParentContext* authenticated_parent)
 {
     uint256 exchange_root;
     uint256 forced_root;
@@ -610,12 +611,10 @@ static void BindPriorActiveExchangeStateRoot(
         txdata.m_prior_active_deposit_processed_cursor.reset();
     }
 
-    drivechain::BmmParentContext parent;
-    if (prior_bmm_state &&
-        drivechain::GetBmmParentContext(*prior_bmm_state, parent, error)) {
-        txdata.m_current_bmm_parent_block_hash = parent.block_hash;
-        txdata.m_current_bmm_parent_height = parent.height;
-        txdata.m_current_bmm_parent_mtp = parent.median_time_past;
+    if (authenticated_parent) {
+        txdata.m_current_bmm_parent_block_hash = authenticated_parent->block_hash;
+        txdata.m_current_bmm_parent_height = authenticated_parent->height;
+        txdata.m_current_bmm_parent_mtp = authenticated_parent->median_time_past;
     } else {
         txdata.m_current_bmm_parent_block_hash.reset();
         txdata.m_current_bmm_parent_height.reset();
@@ -725,6 +724,60 @@ static void BindPriorActiveExchangeStateRoot(
     }
 }
 
+// Version-5 one-shot activation alone exposes its historical execution anchor
+// through the frozen leaf's parent jets. The BIP301 parent and locktime clock
+// remain separate and are never overwritten by this transaction context.
+static void BindActivationExecutionAnchor(PrecomputedTransactionData& data,
+    const CTransaction& tx, const CBlockIndex* previous)
+{
+    data.m_ecx_activation_execution_anchor_authenticated = false;
+    const auto& consensus = Params().GetConsensus();
+    const auto& config = ecx::LayerTwoLabsExchangeConsensus();
+    if (!consensus.drivechain_slot || !previous || !previous->ecxBondV2Capital ||
+        previous->ecxBondV2Capital->proof_profile != 0 ||
+        !config.bond_v2.activation_enabled || !config.bond_v2.identities_frozen ||
+        tx.vin.empty() || tx.vin[0].prevout != config.genesis_state_outpoint ||
+        tx.witness.vtxinwit.empty()) return;
+    std::array<unsigned char, 32> program{};
+    std::array<unsigned char, 364> values{};
+    const auto& stack = tx.witness.vtxinwit[0].scriptWitness.stack;
+    if (!ecx::ParseActivationAnnex(stack, program, values)) return;
+    const auto equal_hash = [](const auto& bytes, size_t offset, const auto& hash) {
+        return std::equal(bytes.begin() + offset, bytes.begin() + offset + 32,
+            hash.begin(), [](unsigned char a, auto b) { return a == static_cast<unsigned char>(b); });
+    };
+    if (!equal_hash(program, 0, config.bond_v2.incremental_activation_program_id) ||
+        !equal_hash(stack[2], 0, config.bond_v2.incremental_activation_cmr) ||
+        !equal_hash(values, 4, config.bond_v2.incremental_activation_configuration_hash) ||
+        !equal_hash(values, 36, config.bond_v2.configuration_hash) ||
+        !equal_hash(values, 100, config.bond_v2.incremental_successor_configuration_hash) ||
+        !equal_hash(values, 164, tx.GetHash()) || !equal_hash(values, 228, config.chain_id)) return;
+    DrivechainParentBlockContext bid, anchor;
+    if (data.m_current_bmm_parent_block_hash && data.m_current_bmm_parent_height && data.m_current_bmm_parent_mtp) {
+        bid.parent_hash = *data.m_current_bmm_parent_block_hash;
+        bid.parent_height = *data.m_current_bmm_parent_height;
+        bid.parent_median_time_past = *data.m_current_bmm_parent_mtp;
+    }
+    // Clear first: unavailable/reorged authentication must fail closed, not
+    // accidentally retain a successful earlier admission context.
+    data.m_current_bmm_parent_block_hash.reset();
+    data.m_current_bmm_parent_height.reset();
+    data.m_current_bmm_parent_mtp.reset();
+    if (!previous->m_drivechain_anchor || bid.parent_hash.IsNull()) return;
+    uint256 hash;
+    std::copy_n(values.begin() + 196, 32, hash.begin());
+    uint64_t mtp{0};
+    for (size_t i = 332; i < 340; ++i) mtp = (mtp << 8) | values[i];
+    std::string error;
+    if (!GetDrivechainExecutionAnchor(*consensus.drivechain_slot, hash,
+            previous->m_drivechain_anchor->parent_height, bid, anchor, &error) ||
+        mtp != anchor.parent_median_time_past) return;
+    data.m_current_bmm_parent_block_hash = anchor.parent_hash;
+    data.m_current_bmm_parent_height = anchor.parent_height;
+    data.m_current_bmm_parent_mtp = anchor.parent_median_time_past;
+    data.m_ecx_activation_execution_anchor_authenticated = true;
+}
+
 static void BindPriorActiveExchangeStateRootFromView(
     PrecomputedTransactionData& txdata,
     const CBlockIndex* previous,
@@ -738,14 +791,40 @@ static void BindPriorActiveExchangeStateRootFromView(
         ClearExchangeScriptContext(txdata);
         return;
     }
+    const auto& consensus = Params().GetConsensus();
+    if (consensus.drivechain_slot.has_value()) {
+        // Native Alpha has no private BmmL1State. Admission uses the active
+        // parent P, as the native bidder does. Block validation independently
+        // authenticates the P committed in its coinbase; the script cache key
+        // includes the complete parent tuple, so a different P cannot reuse
+        // this admission result.
+        DrivechainParentBlockContext native_parent;
+        drivechain::BmmParentContext parent;
+        const auto& frozen = ecx::LayerTwoLabsExchangeConsensus().bond_v2;
+        std::string error;
+        const bool have_parent = previous && frozen.activation_enabled &&
+            previous->nHeight + 1 >= ecx::LayerTwoLabsExchangeConsensus().activation_height &&
+            GetDrivechainMempoolParentContext(
+                *consensus.drivechain_slot, native_parent, &error);
+        if (have_parent) {
+            parent.block_hash = native_parent.parent_hash;
+            parent.height = native_parent.parent_height;
+            parent.median_time_past = native_parent.parent_median_time_past;
+        }
+        BindPriorActiveExchangeStateRoot(txdata, previous, have_parent ? &parent : nullptr);
+        return;
+    }
     drivechain::BmmL1State prior_bmm_state;
     std::string error;
     const bool have_bmm_state{drivechain::GetEffectiveBmmState(
         view, previous, prior_bmm_state, error)};
+    drivechain::BmmParentContext parent;
+    const bool have_parent{have_bmm_state &&
+        drivechain::GetBmmParentContext(prior_bmm_state, parent, error)};
     BindPriorActiveExchangeStateRoot(
         txdata,
         previous,
-        have_bmm_state ? &prior_bmm_state : nullptr);
+        have_parent ? &parent : nullptr);
 }
 
 const CBlockIndex* Chainstate::FindForkInGlobalIndex(const CBlockLocator& locator) const
@@ -1093,7 +1172,7 @@ bool Chainstate::RevalidateDrivechainMempoolForParentEpoch(
             if (!IsValidPeginWitness(
                     witness, fedpegscripts, input.prevout, witness_error,
                     /*check_depth=*/true, nullptr,
-                    &input_parent_unavailable)) {
+                    &input_parent_unavailable, m_chain.Height() + 1)) {
                 if (input_parent_unavailable) {
                     parent_unavailable = true;
                     if (unavailable_error.empty()) {
@@ -1701,7 +1780,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     TxValidationState& state = ws.m_state;
     std::set<std::pair<uint256, COutPoint>>& setPeginsSpent = ws.m_set_pegins_spent;
 
-    if (!CheckTransaction(tx, state)) {
+    if (!CheckTransaction(tx, state, chainparams.GetConsensus().ExplicitOnlyActive(m_active_chainstate.m_chain.Height() + 1))) {
         return false; // state filled in by CheckTransaction
     }
 
@@ -1724,7 +1803,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
-    if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes, m_pool.m_opts.permit_bare_multisig, m_pool.m_opts.dust_relay_feerate, reason)) {
+    if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes, m_pool.m_opts.permit_bare_multisig, m_pool.m_opts.dust_relay_feerate, reason,
+            chainparams.GetConsensus().elements_mode ? &ecx::LayerTwoLabsExchangeConsensus() : nullptr)) {
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reason);
     }
 
@@ -1837,7 +1917,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                      IsDrivechainDepositPeginWitness(pegin_witness, txin.prevout)) ||
                     IsValidPeginWitness(pegin_witness, fedpegscripts,
                                         txin.prevout, err_msg, false, nullptr,
-                                        &parent_unavailable);
+                                        &parent_unavailable,
+                                        m_active_chainstate.m_chain.Height() + 1);
             }
             if (!preliminary_valid) {
                 if (parent_unavailable) {
@@ -1897,6 +1978,10 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
+    if (chainparams.GetConsensus().ExplicitOnlyActive(m_active_chainstate.m_chain.Height() + 1) &&
+        !Consensus::HasOnlyExplicitCreations(tx)) {
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-confidential-disabled");
+    }
     CAmountMap fee_map;
     if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, fee_map, setPeginsSpent, nullptr, true, true, fedpegscripts)) {
         return false; // state filled in by CheckTxInputs
@@ -2295,6 +2380,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
         m_active_chainstate.m_chain.Tip(),
         m_active_chainstate.CoinsTip(),
         args.m_chainparams.GetConsensus().elements_mode);
+    BindActivationExecutionAnchor(ws.m_precomputed_txdata, tx, m_active_chainstate.m_chain.Tip());
 
     // Temporarily add additional script flags based on the activation of
     // Dynamic Federations. This can be included in the
@@ -2336,6 +2422,7 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
         m_active_chainstate.m_chain.Tip(),
         m_active_chainstate.CoinsTip(),
         chainparams.GetConsensus().elements_mode);
+    BindActivationExecutionAnchor(ws.m_precomputed_txdata, tx, m_active_chainstate.m_chain.Tip());
 
     // Re-read the still-locked active tip for the consensus-flags pass and
     // clear any stale context if the network, tip, or anchor is unsuitable.
@@ -3306,6 +3393,8 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     // transaction).
     uint256 hashCacheEntry;
     CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
+    const unsigned char activation_anchor_authenticated = txdata.m_ecx_activation_execution_anchor_authenticated ? 1 : 0;
+    hasher.Write(&activation_anchor_authenticated, 1);
     unsigned char bmm_mtp_context[9]{};
     if (txdata.m_bmm_parent_mtp.has_value()) {
         bmm_mtp_context[0] = 1;
@@ -3845,6 +3934,46 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index,
     return GetBlockScriptFlags(block_index, chainman.GetConsensus(), chainman.m_versionbitscache);
 }
 
+bool CheckNativeCandidateTransactionScripts(
+    const CTransaction& tx, Chainstate& chainstate, const CTxMemPool& pool,
+    const CBlockHeader& header, const DrivechainParentBlockContext& parent)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(pool.cs);
+    const auto& params = chainstate.m_chainman.GetParams();
+    CBlockIndex* previous = chainstate.m_chain.Tip();
+    if (!params.GetConsensus().drivechain_slot || !previous || parent.parent_hash.IsNull()) return false;
+    CCoinsViewMemPool mempool_view(&chainstate.CoinsTip(), pool);
+    CCoinsViewCache inputs(&mempool_view);
+    for (const auto& input : tx.vin) {
+        if (!input.m_is_pegin && inputs.AccessCoin(input.prevout).IsSpent()) return false;
+    }
+    drivechain::BmmParentContext context;
+    context.block_hash = parent.parent_hash;
+    context.height = parent.parent_height;
+    context.median_time_past = parent.parent_median_time_past;
+    PrecomputedTransactionData txdata(params.HashGenesisBlock());
+    BindPriorActiveExchangeStateRoot(txdata, previous, &context);
+    BindActivationExecutionAnchor(txdata, tx, previous);
+    txdata.m_bmm_parent_mtp = parent.parent_median_time_past;
+    txdata.m_prior_active_bmm_parent_checkpoint =
+        GetPriorActiveBmmParentCheckpoint(previous, params.GetConsensus());
+    CBlockIndex candidate(header);
+    const uint256 hash = header.GetHash();
+    candidate.phashBlock = &hash;
+    candidate.pprev = previous;
+    candidate.nHeight = previous->nHeight + 1;
+    TxValidationState state;
+    const bool valid = CheckInputScripts(tx, state, inputs,
+        GetBlockScriptFlags(candidate, chainstate.m_chainman), true, true,
+        txdata, chainstate.m_chainman.m_validation_cache);
+    if (!valid) {
+        LogDebug(BCLog::VALIDATION, "Native candidate script precheck rejected %s: %s\n",
+                 tx.GetHash().ToString(), state.ToString());
+    }
+    return valid;
+}
+
 unsigned int GetBlockScriptFlagsForTesting(const CBlockIndex* pindex,
                                            const Consensus::Params& consensusparams)
 {
@@ -3853,7 +3982,8 @@ unsigned int GetBlockScriptFlagsForTesting(const CBlockIndex* pindex,
 }
 
 
-bool CheckPeginRipeness(const CBlock& block, const std::vector<std::pair<CScript, CScript>>& fedpegscripts) {
+bool CheckPeginRipeness(const CBlock& block, const std::vector<std::pair<CScript, CScript>>& fedpegscripts,
+                       const int child_height) {
     for (unsigned int i = 0; i < block.vtx.size(); i++) {
         const CTransaction &tx = *(block.vtx[i]);
 
@@ -3866,7 +3996,7 @@ bool CheckPeginRipeness(const CBlock& block, const std::vector<std::pair<CScript
                     if ((tx.witness.vtxinwit.size() <= i) ||
                         !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts,
                                              tx.vin[i].prevout, err, true, &depth_failed,
-                                             &parent_unavailable)) {
+                                             &parent_unavailable, child_height)) {
                         if (depth_failed || parent_unavailable) {
                             return false;  // Pegins not ripe.
                         } else {
@@ -4026,7 +4156,7 @@ static bool PreflightDrivechainDeposits(const CBlock& block,
                 !IsValidPeginWitness(tx.witness.vtxinwit[input_index].m_pegin_witness,
                                      fedpegscripts, tx.vin[input_index].prevout,
                                      error_message, true, nullptr,
-                                     &parent_unavailable)) {
+                                     &parent_unavailable, pindex->nHeight)) {
                 if (parent_unavailable) {
                     return state.Error(strprintf("drivechain deposit parent state unavailable: %s",
                                                  error_message));
@@ -4238,6 +4368,20 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     // BMM proof advances chainstate. Simplicity deliberately receives this
     // known prior context, never the future successor that approved the block.
     std::optional<drivechain::BmmL1State> prior_bmm_state;
+    std::optional<drivechain::BmmParentContext> exchange_parent;
+    if (consensusParams.drivechain_slot.has_value()) {
+        // Both inputs were authenticated above. Candidate context is permitted
+        // only in fJustCheck; finalized context retains the M7 and anchor checks.
+        // Bind P, never its successor Q, identically for scripts and capital.
+        const DrivechainParentBlockContext* parent = candidate_context;
+        if (!parent && bmm_context) parent = &*bmm_context;
+        if (parent && !parent->parent_hash.IsNull() &&
+            parent->parent_median_time_past != 0) {
+            exchange_parent = drivechain::BmmParentContext{
+                parent->parent_hash, parent->parent_height,
+                parent->parent_median_time_past};
+        }
+    }
     if (m_chainman.GetParams().GetConsensus().elements_mode) {
         drivechain::BmmL1State prior_bmm_candidate;
         std::string prior_bmm_error;
@@ -4247,6 +4391,12 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
                 prior_bmm_candidate,
                 prior_bmm_error)) {
             prior_bmm_state = std::move(prior_bmm_candidate);
+        }
+        if (!consensusParams.drivechain_slot.has_value() && prior_bmm_state) {
+            drivechain::BmmParentContext parent;
+            if (drivechain::GetBmmParentContext(*prior_bmm_state, parent, prior_bmm_error)) {
+                exchange_parent = parent;
+            }
         }
 
         std::string bmm_error;
@@ -4275,7 +4425,9 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
                 pindex->nHeight,
                 exchange_error,
                 ecx::LayerTwoLabsExchangeConsensus(),
-                std::nullopt,
+                consensusParams.drivechain_slot.has_value() && exchange_parent
+                    ? std::optional<uint64_t>{exchange_parent->height}
+                    : std::nullopt,
                 allow_incomplete_candidate)) {
             return state.Invalid(
                 BlockValidationResult::BLOCK_CONSENSUS,
@@ -4467,7 +4619,8 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
             BindPriorActiveExchangeStateRoot(
                 txsdata.back(),
                 pindex->pprev,
-                prior_bmm_state ? &*prior_bmm_state : nullptr);
+                exchange_parent ? &*exchange_parent : nullptr);
+            BindActivationExecutionAnchor(txsdata.back(), *block.vtx[i], pindex->pprev);
         } else {
             ClearExchangeScriptContext(txsdata.back());
         }
@@ -4507,6 +4660,18 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     {
         if (!state.IsValid()) break;
         const CTransaction &tx = *(block.vtx[i]);
+
+        // Recheck here: historical/reindex paths may omit ContextualCheckBlock.
+        if (m_chainman.GetConsensus().explicit_only_height >= 0) {
+            TxValidationState tx_state;
+            if (!CheckTransaction(tx, tx_state, m_chainman.GetConsensus().ExplicitOnlyActive(pindex->nHeight))) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(), tx_state.GetDebugMessage());
+            }
+        }
+        if (m_chainman.GetConsensus().ExplicitOnlyActive(pindex->nHeight) &&
+            !Consensus::HasOnlyExplicitCreations(tx)) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-confidential-disabled");
+        }
 
         nInputs += tx.vin.size();
 
@@ -4684,30 +4849,43 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     // reorg selects the corresponding already-verified predecessor snapshot.
     const ecx::ExchangeConsensus& exchange_consensus{
         ecx::LayerTwoLabsExchangeConsensus()};
-    if (exchange_consensus.bond_v2.activation_enabled) {
-        drivechain::BmmParentContext prior_parent;
+    // A configured future activation must not project capital for historical
+    // blocks. The projection routine deliberately rejects pre-activation calls.
+    if (exchange_consensus.bond_v2.activation_enabled &&
+        pindex->nHeight >= exchange_consensus.activation_height) {
         std::string capital_error;
-        if (!prior_bmm_state || !drivechain::GetBmmParentContext(
-                *prior_bmm_state, prior_parent, capital_error)) {
+        if (!exchange_parent) {
             return state.Invalid(
                 BlockValidationResult::BLOCK_CONSENSUS,
                 "bad-ecx-bond-v2-parent-context",
-                capital_error.empty()
-                    ? "ECX bond V2 requires authenticated prior BMM state"
-                    : capital_error);
+                "ECX bond V2 requires authenticated BMM parent context");
         }
         ecx::BondV2CapitalSnapshot capital;
+        std::optional<uint256> activation_execution_hash;
+        std::optional<uint64_t> activation_execution_mtp;
+        for (size_t i = 1; i < block.vtx.size(); ++i) {
+            if (!block.vtx[i]->vin.empty() &&
+                block.vtx[i]->vin[0].prevout == exchange_consensus.genesis_state_outpoint) {
+                // Reuse only the context whose scripts just succeeded. Keep
+                // the fresh bidding height for inbox observation/accounting.
+                activation_execution_hash = txsdata[i].m_current_bmm_parent_block_hash;
+                activation_execution_mtp = txsdata[i].m_current_bmm_parent_mtp;
+            }
+        }
         if (!ecx::DeriveBondV2CapitalProjectionAfterScripts(
                 block,
                 pindex->pprev,
                 view,
                 pindex->nHeight,
-                prior_parent.block_hash,
-                prior_parent.height,
-                prior_parent.median_time_past,
+                exchange_parent->block_hash,
+                exchange_parent->height,
+                exchange_parent->median_time_past,
                 capital,
                 capital_error,
-                exchange_consensus)) {
+                exchange_consensus,
+                &blockundo,
+                activation_execution_hash,
+                activation_execution_mtp)) {
             return state.Invalid(
                 BlockValidationResult::BLOCK_CONSENSUS,
                 "bad-ecx-bond-v2-capital",
@@ -5303,7 +5481,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
     }
 
     const auto& fedpegscripts = GetValidFedpegScripts(pindexNew, m_chainman.GetParams().GetConsensus(), false /* nextblock_validation */);
-    if (!CheckPeginRipeness(blockConnecting, fedpegscripts)) {
+    if (!CheckPeginRipeness(blockConnecting, fedpegscripts, pindexNew->nHeight)) {
         LogPrintf("STALLING further progress in ConnectTip while waiting for parent chain daemon to catch up! Chain will not grow until this is remedied!\n");
         fStall = true;
         return true;
@@ -6616,7 +6794,13 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     // Must check for duplicate inputs (see CVE-2018-17144)
     for (const auto& tx : block.vtx) {
         TxValidationState tx_state;
-        if (!CheckTransaction(*tx, tx_state)) {
+        // Height is unavailable here. Defer only the aggregate total, retaining
+        // per-output limits and all other checks. Both contextual paths below
+        // enforce the historical or activated total even when fChecked is set.
+        const bool valid = consensusParams.explicit_only_height >= 0
+            ? CheckTransactionWithoutAggregateTotals(*tx, tx_state)
+            : CheckTransaction(*tx, tx_state);
+        if (!valid) {
             // CheckBlock() does context-free validation checks. The only
             // possible failures are consensus failures.
             assert(tx_state.GetResult() == TxValidationResult::TX_CONSENSUS);
@@ -7043,7 +7227,23 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
  */
 static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev)
 {
+    const auto& consensusParams = chainman.GetConsensus();
     const int nHeight = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
+    if (consensusParams.explicit_only_height >= 0) {
+        for (const auto& tx : block.vtx) {
+            TxValidationState tx_state;
+            if (!CheckTransaction(*tx, tx_state, consensusParams.ExplicitOnlyActive(nHeight))) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(), tx_state.GetDebugMessage());
+            }
+        }
+    }
+    if (consensusParams.ExplicitOnlyActive(nHeight)) {
+        for (const auto& tx : block.vtx) {
+            if (!Consensus::HasOnlyExplicitCreations(*tx)) {
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-confidential-disabled");
+            }
+        }
+    }
 
     // Enforce BIP113 (Median Time Past).
     bool enforce_locktime_median_time_past{false};

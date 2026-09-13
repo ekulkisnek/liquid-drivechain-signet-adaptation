@@ -218,6 +218,8 @@ struct PrecomputedTransactionData
     std::optional<uint256> m_current_bmm_parent_block_hash;
     std::optional<uint64_t> m_current_bmm_parent_height;
     std::optional<uint64_t> m_current_bmm_parent_mtp;
+    /** Set only for the frozen genesis spend after historical-anchor authentication. */
+    bool m_ecx_activation_execution_anchor_authenticated{false};
     /** Reorg-safe V2 identity tuple, present only after verified activation. */
     std::optional<uint256> m_bond_v2_configuration_hash;
     std::optional<uint256> m_bond_v2_asset_id;

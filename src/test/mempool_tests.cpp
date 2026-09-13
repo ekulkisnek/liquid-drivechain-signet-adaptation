@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chain.h>
 #include <common/system.h>
 #include <policy/policy.h>
 #include <policy/fees.h>
@@ -23,6 +24,44 @@ class MemPoolTest final : public CTxMemPool
 public:
     using CTxMemPool::GetMinFee;
 };
+
+BOOST_AUTO_TEST_CASE(MempoolReorgRemovesPeginDescendants)
+{
+    // A reorg below the Alpha peg-in depth upgrade must not retain claims
+    // admitted under the relaxed rules, or transactions spending those claims.
+    // This tests eviction only; unchecked insertion does not authorize a claim.
+    CMutableTransaction pegin;
+    pegin.vin.resize(1);
+    pegin.vin[0].prevout = COutPoint(Txid::FromUint256(uint256::ONE), 0);
+    pegin.vin[0].m_is_pegin = true;
+    pegin.vout.resize(1);
+    pegin.vout[0].nValue = 10000;
+    pegin.vout[0].scriptPubKey = CScript() << OP_TRUE;
+
+    CMutableTransaction child;
+    child.vin.resize(1);
+    child.vin[0].prevout = COutPoint(pegin.GetHash(), 0);
+    child.vout.resize(1);
+    child.vout[0].nValue = 9000;
+    child.vout[0].scriptPubKey = CScript() << OP_TRUE;
+
+    CMutableTransaction unrelated = child;
+    unrelated.vin[0].prevout = COutPoint(Txid::FromUint256(uint256::ONE), 1);
+
+    CTxMemPool& pool = *Assert(m_node.mempool);
+    TestMemPoolEntryHelper entry;
+    CChain chain;
+    LOCK2(cs_main, pool.cs);
+    AddToMempool(pool, entry.FromTx(pegin));
+    AddToMempool(pool, entry.FromTx(child));
+    AddToMempool(pool, entry.FromTx(unrelated));
+    BOOST_REQUIRE_EQUAL(pool.size(), 3U);
+    pool.removeForReorg(chain, [](CTxMemPool::txiter) { return false; });
+    BOOST_CHECK_EQUAL(pool.size(), 1U);
+    BOOST_CHECK(!pool.exists(GenTxid::Txid(pegin.GetHash())));
+    BOOST_CHECK(!pool.exists(GenTxid::Txid(child.GetHash())));
+    BOOST_CHECK(pool.exists(GenTxid::Txid(unrelated.GetHash())));
+}
 
 BOOST_AUTO_TEST_CASE(MempoolRemoveTest)
 {

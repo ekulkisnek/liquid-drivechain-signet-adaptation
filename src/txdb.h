@@ -33,6 +33,24 @@ struct CoinsViewOptions {
     int simulate_crash_ratio = 0;
 };
 
+/** Read-only spent-claim snapshot. Keep the backing database alive.
+ * Callers joining this with coins must flush and create both cursors while
+ * holding cs_main, and check their best blocks against the active tip.
+ */
+class CSpentPeginCursor
+{
+    std::unique_ptr<CDBIterator> m_cursor;
+    uint256 m_best_block;
+    std::optional<std::pair<uint256, COutPoint>> m_key;
+    void ReadKey();
+public:
+    explicit CSpentPeginCursor(std::unique_ptr<CDBIterator> cursor);
+    const uint256& GetBestBlock() const { return m_best_block; }
+    bool Valid() const { return m_key.has_value(); }
+    const std::pair<uint256, COutPoint>& GetKey() const { return m_key.value(); }
+    void Next();
+};
+
 /** CCoinsView backed by the coin database (chainstate/) */
 class CCoinsViewDB final : public CCoinsView
 {
@@ -49,8 +67,11 @@ public:
     std::vector<uint256> GetHeadBlocks() const override;
     bool BatchWrite(CoinsViewCacheCursor& cursor, const uint256 &hashBlock) override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
+    //! Strict decoding/error reporting for proof-checkpoint export.
+    std::unique_ptr<CCoinsViewCursor> CheckpointCoinCursor() const;
     // ELEMENTS:
     bool IsPeginSpent(const std::pair<uint256, COutPoint> &outpoint) const override;
+    std::unique_ptr<CSpentPeginCursor> SpentPeginCursor() const;
 
     //! Whether an unsupported database format is used.
     bool NeedsUpgrade();

@@ -27,6 +27,14 @@ bool IsCanonicalElementsProductionIdentity(const CChainParams& params,
                                            const CBaseChainParams& base_params,
                                            std::string* error = nullptr);
 
+/** Post-genesis Alpha-only consensus upgrade; never part of the historical M1/genesis commitment. */
+inline constexpr int ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT{64};
+bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params);
+/** child_height is the validated block-index height (active tip + 1 for admission).
+ * Unknown/negative heights retain the historical depth. No witness/RPC height override is accepted.
+ */
+uint32_t GetDrivechainPeginConfirmationDepth(const CChainParams& params, int child_height = -1);
+
 /**
  * Return the currently selected parameters. This won't change after app
  * startup, except for unit tests.

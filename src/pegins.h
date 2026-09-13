@@ -34,14 +34,19 @@ bool GetAmountFromParentChainPegin(CAmount& amount, const Sidechain::Bitcoin::CT
 bool GetAmountFromParentChainPegin(CAmount& amount, const CTransaction& txBTC, unsigned int nOut);
 /** Check whether a parent chain block hash satisfies the proof-of-work requirement specified by nBits */
 bool CheckParentProofOfWork(uint256 hash, unsigned int nBits, const Consensus::Params&);
-/** Checks pegin witness for validity */
+/**
+ * Check pegin witness validity. For native deposits, child_height must come
+ * from the validated block index or active tip + 1, not witness data. The
+ * default unknown height retains the historical confirmation depth.
+ */
 bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
                          const std::vector<std::pair<CScript, CScript>>& fedpegscripts,
                          const COutPoint& prevout,
                          std::string& err_msg,
                          bool check_depth,
                          bool* depth_failed = nullptr,
-                         bool* parent_unavailable = nullptr);
+                         bool* parent_unavailable = nullptr,
+                         int child_height = -1);
 /** Parse a BIP300 deposit witness. This does not by itself authorize minting. */
 bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
                                      const COutPoint& prevout,

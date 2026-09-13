@@ -6,6 +6,7 @@
 #include <blind.h>
 #include <blindpsbt.h>
 #include <coins.h>
+#include <consensus/tx_verify.h>
 #include <issuance.h>
 #include <random.h>
 #include <uint256.h>
@@ -20,6 +21,10 @@
 
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
+#include <streams.h>
+#include <util/strencodings.h>
 #include <thread>
 
 // For elements serialization rules
@@ -28,6 +33,41 @@ struct ElementsSetup : public TestingSetup {
 };
 
 BOOST_FIXTURE_TEST_SUITE(blind_tests, ElementsSetup)
+
+// Opt-in, stdin-only differential harness. Never print input transactions or
+// private wallet data. Each line is one consensus-serialized transaction
+// followed by a consensus-serialized vector of spent outputs.
+BOOST_AUTO_TEST_CASE(shared_amount_kernel_stdin)
+{
+    if (std::getenv("ECX_AMOUNT_KERNEL_STDIN") == nullptr) return;
+    BOOST_REQUIRE(InitRangeproofCache(DEFAULT_VALIDATION_CACHE_BYTES / 4));
+    BOOST_REQUIRE(InitSurjectionproofCache(DEFAULT_VALIDATION_CACHE_BYTES / 4));
+    std::string line;
+    size_t cases{0};
+    while (std::getline(std::cin, line)) {
+        BOOST_REQUIRE(line.size() <= 2'000'000);
+        BOOST_REQUIRE(IsHex(line));
+        DataStream stream{ParseHex(line)};
+        CMutableTransaction tx;
+        std::vector<CTxOut> previous;
+        stream >> TX_WITH_WITNESS(tx) >> previous;
+        BOOST_REQUIRE(stream.empty());
+        BOOST_REQUIRE_EQUAL(previous.size(), tx.vin.size());
+        if (std::getenv("ECX_DIAGNOSTIC_WITNESS_SHAPE") != nullptr) {
+            // Amount-only diagnostic for unsigned issuance; no signatures,
+            // no production validation change, no claim of wire acceptance.
+            tx.witness.vtxinwit.resize(tx.vin.size());
+        }
+        if (std::getenv("ECX_CREATION_ONLY") == nullptr) {
+            std::cout << "AMOUNT_KERNEL " << cases << " "
+                      << VerifyAmounts(previous, CTransaction(tx), nullptr, false)
+                      << std::endl;
+        }
+        ++cases;
+        std::cout << "EXPLICIT_CREATIONS " << Consensus::HasOnlyExplicitCreations(CTransaction(tx)) << std::endl;
+    }
+    BOOST_REQUIRE(cases > 0);
+}
 
 // TODO: Make deterministic blinding wrapper function, test caching more exactly
 

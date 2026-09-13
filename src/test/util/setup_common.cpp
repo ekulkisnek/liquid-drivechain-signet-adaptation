@@ -280,10 +280,17 @@ BasicTestingSetup::~BasicTestingSetup()
     gArgs.ClearArgs();
 }
 
-ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts, const std::string& fedpegscript)
+ChainTestingSetup::ChainTestingSetup(const ChainTypeMeta chainType, TestOpts opts, const std::string& fedpegscript)
     : BasicTestingSetup(chainType, opts, fedpegscript)
 {
     const CChainParams& chainparams = Params();
+
+    // Native Alpha production startup resolves the fee asset before loading
+    // the frozen ECX profile. BasicTestingSetup deliberately clears it, so
+    // restore that production invariant before constructing the chainstate.
+    if (chainparams.GetConsensus().drivechain_slot.has_value()) {
+        ::policyAsset = chainparams.GetConsensus().pegged_asset;
+    }
 
     // We have to run a scheduler thread to prevent ActivateBestChain
     // from blocking due to queue overrun.
@@ -372,7 +379,7 @@ void ChainTestingSetup::LoadVerifyActivateChainstate()
 }
 
 TestingSetup::TestingSetup(
-    const ChainType chainType,
+    const ChainTypeMeta chainType,
     TestOpts opts,
     const std::string& fedpegscript)
     : ChainTestingSetup(chainType, opts, fedpegscript)
