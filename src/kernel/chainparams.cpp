@@ -774,6 +774,10 @@ public:
     {
         m_chain_type = ChainTypeMetaFrom(ChainType::ELEMENTS);
 
+        // Alpha supports confidential payments. Do not activate the optional
+        // explicit-only rule used by isolated validation fixtures.
+        consensus.explicit_only_height = -1;
+
         // The sidechain itself uses an OP_TRUE signed-block challenge. Its
         // security boundary is the mandatory, independently verified BIP301
         // commitment on the parent chain, not a second native PoW race.

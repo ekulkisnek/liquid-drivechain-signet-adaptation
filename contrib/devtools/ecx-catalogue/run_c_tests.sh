@@ -8,7 +8,7 @@ printf 'Build/test artifacts: %s\n' "$ecx_build_dir"
 cd "$ecx_build_dir"
 ecx_compiler=${CC:-cc}
 ecx_objects=
-for ecx_unit in bitstream dag deserialize eval frame jets jets-secp256k1 rsort sha256 type typeInference \
+for ecx_unit in bitstream cmr dag deserialize eval frame jets jets-secp256k1 rsort sha256 type typeInference \
   elements/env elements/exec elements/ops elements/elementsJets elements/cmr elements/txEnv; do
   ecx_object=$(printf '%s' "$ecx_unit" | tr / _).o
   "$ecx_compiler" -std=c11 -O2 -DPRODUCTION -Wall -Wextra -Werror ${CFLAGS:-} \

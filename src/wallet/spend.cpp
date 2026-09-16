@@ -2232,14 +2232,17 @@ util::Result<CreatedTransactionResult> FundTransaction(CWallet& wallet, const CM
     // Check any existing inputs for peg-in data and add to external txouts if so
     // Fetch specified UTXOs from the UTXO set to get the scriptPubKeys and values of the outputs being selected
     // and to match with the given solving_data. Only used for non-wallet outputs.
-    const auto& fedpegscripts = GetValidFedpegScripts(wallet.chain().getTip(), Params().GetConsensus(), true /* nextblock_validation */);
+    const CBlockIndex* active_tip = wallet.chain().getTip();
+    const int child_height = active_tip ? active_tip->nHeight + 1 : -1;
+    const auto& fedpegscripts = GetValidFedpegScripts(active_tip, Params().GetConsensus(), true /* nextblock_validation */);
     std::map<COutPoint, Coin> coins;
     for (unsigned int i = 0; i < tx.vin.size(); ++i ) {
         const CTxIn& txin = tx.vin[i];
         coins[txin.prevout]; // Create empty map entry keyed by prevout.
         if (txin.m_is_pegin) {
             std::string err;
-            if (tx.witness.vtxinwit.size() != tx.vin.size() || !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, txin.prevout, err, false)) {
+            if (tx.witness.vtxinwit.size() != tx.vin.size() || !IsValidPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, txin.prevout, err, false,
+                    nullptr, nullptr, child_height)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Transaction contains invalid peg-in input: %s", err));
             }
         }

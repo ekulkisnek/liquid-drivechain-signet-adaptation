@@ -737,7 +737,8 @@ void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigne
                          !IsValidPeginWitness(tx.witness.vtxinwit[nIn].m_pegin_witness,
                                               fedpegscripts, in.prevout, err,
                                               true /* check_depth */, nullptr,
-                                              &parent_unavailable)) &&
+                                              &parent_unavailable,
+                                              p_block_index_new->nHeight + 1)) &&
                         !parent_unavailable) {
                         tx_to_remove.push_back(MakeTransactionRef(tx));
                         break;

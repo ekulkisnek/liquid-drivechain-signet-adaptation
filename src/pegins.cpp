@@ -458,7 +458,8 @@ bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
                          std::string& err_msg,
                          bool check_depth,
                          bool* depth_failed,
-                         bool* parent_unavailable) {
+                         bool* parent_unavailable,
+                         const int child_height) {
     if (depth_failed) {
         *depth_failed = false;
     }
@@ -534,7 +535,8 @@ bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
 
         std::string deposit_error;
         const DrivechainDepositStatus deposit_status = GetConfirmedDrivechainDepositStatus(
-            mainchain_block_hash, *drivechain_slot, prevout, value, address, &deposit_error);
+            mainchain_block_hash, *drivechain_slot, prevout, value, address,
+            &deposit_error, child_height);
         if (deposit_status != DrivechainDepositStatus::VALID) {
             if (deposit_status == DrivechainDepositStatus::UNAVAILABLE && parent_unavailable) {
                 *parent_unavailable = true;

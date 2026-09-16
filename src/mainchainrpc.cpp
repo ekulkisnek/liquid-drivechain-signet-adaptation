@@ -1871,13 +1871,22 @@ bool ApplyDrivechainParentBlockState(
     return true;
 }
 
+bool HasRequiredDrivechainDepositDepth(const uint32_t deposit_height,
+                                      const uint32_t confirmed_through_height,
+                                      const uint32_t required_depth)
+{
+    return required_depth > 0 && deposit_height <= confirmed_through_height &&
+        confirmed_through_height - deposit_height >= required_depth - 1;
+}
+
 DrivechainDepositStatus GetConfirmedDrivechainDepositStatus(
     const uint256& mainchain_block_hash,
     const int sidechain_slot,
     const COutPoint& outpoint,
     const CAmount value,
     const std::vector<unsigned char>& address,
-    std::string* error)
+    std::string* error,
+    const int child_height)
 {
     if (error) error->clear();
     if (!CheckConfiguredDrivechainSlot(sidechain_slot, error) ||
@@ -2009,11 +2018,10 @@ DrivechainDepositStatus GetConfirmedDrivechainDepositStatus(
         }
 
         const uint32_t required_depth =
-            std::max<uint32_t>(1, consensus.pegin_min_depth);
+            std::max<uint32_t>(1, GetDrivechainPeginConfirmationDepth(Params(), child_height));
         const bool sufficiently_deep =
-            deposit.block_height <= confirmed_through_height &&
-            confirmed_through_height - deposit.block_height >=
-                required_depth - 1;
+            HasRequiredDrivechainDepositDepth(deposit.block_height,
+                                             confirmed_through_height, required_depth);
         if (!sufficiently_deep) {
             return SetDepositError(
                 error,
@@ -2058,10 +2066,11 @@ bool IsConfirmedDrivechainDeposit(const uint256& mainchain_block_hash,
                                   const COutPoint& outpoint,
                                   const CAmount value,
                                   const std::vector<unsigned char>& address,
-                                  std::string* error)
+                                  std::string* error,
+                                  const int child_height)
 {
     return GetConfirmedDrivechainDepositStatus(mainchain_block_hash, sidechain_slot,
-                                                outpoint, value, address, error) ==
+                                                outpoint, value, address, error, child_height) ==
            DrivechainDepositStatus::VALID;
 }
 
@@ -3361,6 +3370,68 @@ bool WarmDrivechainParentState(std::string* error)
         return EnsurePinnedDrivechainParentStateThrough(
             static_cast<uint32_t>(height), tip_hash,
             /* require_elements_active= */ false, error);
+    } catch (const std::exception& e) {
+        return SetError(error, e.what());
+    }
+}
+
+bool GetDrivechainExecutionAnchor(const int slot, const uint256& hash,
+    const uint32_t minimum_height, const DrivechainParentBlockContext& bid_parent,
+    DrivechainParentBlockContext& anchor, std::string* error)
+{
+    DrivechainParentValidationBudget parent_budget{true};
+    anchor = {};
+    if (error) error->clear();
+    if (!CheckConfiguredDrivechainSlot(slot, error)) return false;
+    try {
+        const UniValue no_params(UniValue::VARR);
+        uint256 before, after, active_anchor, active_bid;
+        if (!ParseCanonicalHash(CallMainChainRPCChecked("getbestblockhash", no_params), before))
+            return SetError(error, "invalid active tip for execution anchor");
+        DrivechainParentBlockContext checked, checked_bid;
+        if (!GetDrivechainParentContextForHash(hash, checked, error) ||
+            !GetDrivechainParentContextForHash(bid_parent.parent_hash, checked_bid, error)) return false;
+        if (checked.parent_height < minimum_height ||
+            checked.parent_height > checked_bid.parent_height ||
+            checked.parent_median_time_past > checked_bid.parent_median_time_past ||
+            checked_bid.parent_height != bid_parent.parent_height ||
+            checked_bid.parent_median_time_past != bid_parent.parent_median_time_past)
+            return SetError(error, "execution anchor outside authenticated parent interval");
+        if (!ReadActiveMainchainHash(checked.parent_height, active_anchor, error) ||
+            !ReadActiveMainchainHash(checked_bid.parent_height, active_bid, error)) return false;
+        if (active_anchor != hash || active_bid != bid_parent.parent_hash ||
+            !ParseCanonicalHash(CallMainChainRPCChecked("getbestblockhash", no_params), after) || before != after)
+            return SetError(error, "execution anchor chain changed or is not active");
+        anchor = checked;
+        return true;
+    } catch (const std::exception& e) {
+        return SetError(error, e.what());
+    }
+}
+
+bool GetDrivechainMempoolParentContext(const int sidechain_slot,
+                                      DrivechainParentBlockContext& context,
+                                      std::string* error)
+{
+    DrivechainParentValidationBudget parent_budget{true};
+    context = {};
+    if (error) error->clear();
+    if (!CheckConfiguredDrivechainSlot(sidechain_slot, error)) return false;
+    try {
+        const UniValue no_params(UniValue::VARR);
+        uint256 before;
+        if (!ParseCanonicalHash(CallMainChainRPCChecked("getbestblockhash", no_params), before)) {
+            return SetError(error, "parent best-block hash is not canonical");
+        }
+        DrivechainParentBlockContext authenticated;
+        if (!GetDrivechainParentContextForHash(before, authenticated, error)) return false;
+        uint256 after;
+        if (!ParseCanonicalHash(CallMainChainRPCChecked("getbestblockhash", no_params), after) ||
+            after != before) {
+            return SetError(error, "parent tip changed during mempool context authentication");
+        }
+        context = authenticated;
+        return true;
     } catch (const std::exception& e) {
         return SetError(error, e.what());
     }

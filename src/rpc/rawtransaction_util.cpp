@@ -588,19 +588,22 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore,
 bool ValidateTransactionPeginInputs(const CMutableTransaction& mtx, const CBlockIndex* active_chain_tip, std::map<int, bilingual_str>& input_errors)
 {
     const auto& fedpegscripts = GetValidFedpegScripts(active_chain_tip, Params().GetConsensus(), true /* nextblock_validation */);
+    const int child_height = active_chain_tip ? active_chain_tip->nHeight + 1 : -1;
     // Track an immature peg-in that's otherwise valid, give warning
     bool immature_pegin = false;
 
     for (unsigned int i = 0; i < mtx.vin.size(); i++) {
         const CTxIn& txin = mtx.vin[i];
         std::string err;
-        if (txin.m_is_pegin && (mtx.witness.vtxinwit.size() <= i || !IsValidPeginWitness(mtx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, txin.prevout, err, false))) {
+        if (txin.m_is_pegin && (mtx.witness.vtxinwit.size() <= i || !IsValidPeginWitness(mtx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, txin.prevout, err, false,
+                nullptr, nullptr, child_height))) {
             input_errors[i] = _("Peg-in input has invalid proof.");
             continue;
         }
         // Report warning about immature peg-in though
         bool depth_failed = false;
-        if(txin.m_is_pegin && !IsValidPeginWitness(mtx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, txin.prevout, err, true, &depth_failed)) {
+        if(txin.m_is_pegin && !IsValidPeginWitness(mtx.witness.vtxinwit[i].m_pegin_witness, fedpegscripts, txin.prevout, err, true, &depth_failed,
+                nullptr, child_height)) {
             CHECK_NONFATAL(depth_failed);
             immature_pegin = true;
         }

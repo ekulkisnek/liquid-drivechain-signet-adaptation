@@ -155,6 +155,9 @@ public:
 
     void Next();
 
+    //! Throw on an iterator storage error; exhaustion alone is not an error.
+    void CheckStatus() const;
+
     template<typename K> bool GetKey(K& key) {
         try {
             DataStream ssKey{GetKeyImpl()};

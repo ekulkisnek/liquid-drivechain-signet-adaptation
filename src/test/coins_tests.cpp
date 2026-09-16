@@ -111,6 +111,92 @@ public:
 
 BOOST_FIXTURE_TEST_SUITE(coins_tests, BasicTestingSetup)
 
+BOOST_AUTO_TEST_CASE(spent_pegin_snapshot_flush_and_reorg)
+{
+    CCoinsViewDB db{{.path = "claims", .cache_bytes = 1 << 20, .memory_only = true}, {}};
+    CCoinsViewCache cache{&db};
+    const auto tip1 = uint256::ONE;
+    const auto tip2 = uint256S("02");
+    const auto claim = std::make_pair(tip1, COutPoint{Txid::FromUint256(tip2), 7});
+    const auto claim2 = std::make_pair(tip1, COutPoint{Txid::FromUint256(tip2), 8});
+    cache.SetBestBlock(tip1);
+    BOOST_REQUIRE(cache.Flush());
+    BOOST_CHECK(!db.SpentPeginCursor()->Valid());
+    cache.SetPeginSpent(claim, true);
+    cache.SetPeginSpent(claim2, true);
+    BOOST_CHECK(!db.SpentPeginCursor()->Valid()); // cache is not silently included
+    BOOST_REQUIRE(cache.Flush());
+    auto snapshot = db.SpentPeginCursor();
+    BOOST_REQUIRE(snapshot->Valid());
+    BOOST_CHECK(snapshot->GetKey() == claim);
+    BOOST_CHECK(snapshot->GetBestBlock() == tip1);
+    cache.SetPeginSpent(claim, false);
+    cache.SetPeginSpent(claim2, false);
+    cache.SetBestBlock(tip2);
+    BOOST_REQUIRE(cache.Flush());
+    BOOST_CHECK(!db.SpentPeginCursor()->Valid());
+    BOOST_CHECK(snapshot->GetKey() == claim); // old snapshot survives reorg
+    BOOST_CHECK(snapshot->GetBestBlock() == tip1);
+    snapshot->Next();
+    BOOST_REQUIRE(snapshot->Valid());
+    BOOST_CHECK(snapshot->GetKey() == claim2); // read after deletion, not cached
+    snapshot->Next();
+    BOOST_CHECK(!snapshot->Valid());
+}
+
+BOOST_AUTO_TEST_CASE(spent_pegin_snapshot_rejects_malformed_records)
+{
+    CDBWrapper db{{.path = "claims-raw", .cache_bytes = 1 << 20, .memory_only = true}};
+    auto snapshot = [&] { return CSpentPeginCursor{std::unique_ptr<CDBIterator>{db.NewIterator()}}; };
+    BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
+    db.Write(uint8_t{'B'}, uint256::ONE);
+    BOOST_CHECK(!snapshot().Valid());
+    db.Write(uint8_t{'H'}, std::vector<uint256>{uint256S("02"), uint256::ONE});
+    BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
+    db.Erase(uint8_t{'H'});
+    const auto key = std::make_pair(uint8_t{'w'}, std::make_pair(uint256::ONE, COutPoint{Txid::FromUint256(uint256S("02")), 3}));
+    db.Write(key, 0);
+    BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
+    db.Write(key, std::make_pair(1, uint8_t{0})); // trailing value byte
+    BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
+    db.Erase(key);
+    const auto extended_key = std::make_pair(key, uint8_t{0});
+    db.Write(extended_key, 1);
+    BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
+    db.Erase(extended_key);
+    db.Write(uint8_t{'w'}, 1); // truncated key
+    BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_coin_cursor_rejects_malformed_records)
+{
+    // Reopen the same test-owned database to inject bytes without exposing
+    // production database internals or changing the ordinary cursor API.
+    const auto path = m_path_root / "checkpoint-coins-raw";
+    auto check = [&](const auto& key, bool malformed_key) {
+        {
+            CDBWrapper raw{{.path = path, .cache_bytes = 1 << 20, .wipe_data = true}};
+            raw.Write(uint8_t{'B'}, uint256::ONE);
+            raw.Write(key, uint8_t{0}); // incomplete serialized Coin
+        }
+        CCoinsViewDB db{{.path = path, .cache_bytes = 1 << 20}, {}};
+        if (malformed_key) {
+            BOOST_CHECK_THROW(db.CheckpointCoinCursor(), dbwrapper_error);
+        } else {
+            auto cursor = db.CheckpointCoinCursor();
+            BOOST_REQUIRE(cursor->Valid());
+            Coin coin;
+            BOOST_CHECK_THROW(cursor->GetValue(coin), dbwrapper_error);
+        }
+    };
+    check(uint8_t{'C'}, true); // truncated outpoint
+    std::array<uint8_t, 34> key{}; // prefix, txid, canonical VARINT(0)
+    key[0] = 'C';
+    key[1] = 1;
+    check(std::make_pair(key, uint8_t{0}), true); // trailing key byte
+    check(key, false);
+}
+
 static const unsigned int NUM_SIMULATION_ITERATIONS = 40000;
 
 BOOST_AUTO_TEST_CASE(drivechain_pegin_undo_is_network_scoped)

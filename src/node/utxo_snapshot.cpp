@@ -20,6 +20,35 @@
 
 namespace node {
 
+ChildCheckpointSources PrepareChildCheckpointSources(ChainstateManager& chainman)
+{
+    AssertLockHeld(::cs_main);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+    const CBlockIndex* tip = chainstate.m_chain.Tip();
+    if (!tip || !tip->IsValid(BLOCK_VALID_SCRIPTS) ||
+        (chainman.IsSnapshotActive() && !chainman.IsSnapshotValidated())) {
+        throw std::runtime_error("Child checkpoint requires a validated active chain");
+    }
+    if (!tip->m_usdd_withdrawal_accumulator || !tip->m_usdd_withdrawal_accumulator->IsSane()) {
+        throw std::runtime_error("Child checkpoint withdrawal frontier unavailable or malformed");
+    }
+    const uint256 expected = tip->GetBlockHash();
+    // Check before flushing too: do not persist an inconsistent cache tip.
+    if (chainstate.CoinsTip().GetBestBlock() != expected) {
+        throw std::runtime_error("Child checkpoint cache/active tip mismatch");
+    }
+    chainstate.ForceFlushStateToDisk();
+    auto& db = chainstate.CoinsDB();
+    auto claims = db.SpentPeginCursor();
+    auto coins = db.CheckpointCoinCursor();
+    if (db.GetBestBlock() != expected || claims->GetBestBlock() != expected ||
+        !coins || coins->GetBestBlock() != expected || !db.GetHeadBlocks().empty()) {
+        throw std::runtime_error("Child checkpoint database/active tip mismatch");
+    }
+    return {chainstate.m_chain.Genesis()->GetBlockHash(), expected, tip->nHeight,
+        *tip->m_usdd_withdrawal_accumulator, std::move(coins), std::move(claims)};
+}
+
 bool WriteSnapshotBaseBlockhash(Chainstate& snapshot_chainstate)
 {
     AssertLockHeld(::cs_main);

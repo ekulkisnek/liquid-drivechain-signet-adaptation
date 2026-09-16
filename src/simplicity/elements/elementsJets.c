@@ -646,9 +646,10 @@ bool simplicity_prior_active_deposit_processed_cursor_required(frameItem* dst, f
  * current_bmm_parent_height_required     : ONE |- TWO^64
  * current_bmm_parent_mtp_required        : ONE |- TWO^64
  *
- * "Current" is the BMM state already authenticated at the prior active
- * sidechain tip. It is therefore known while constructing this transaction;
- * the candidate block's future BMM successor is intentionally not exposed.
+ * The caller supplies authenticated parent context. Native Alpha block
+ * validation uses P named by the candidate coinbase commitment, not the
+ * prior child's P and not the future accepting block Q. Private BMM callers
+ * retain their separate prior-active-state context convention.
  */
 bool simplicity_current_bmm_parent_block_hash_required(frameItem* dst, frameItem src, const txEnv* env) {
   (void) src;

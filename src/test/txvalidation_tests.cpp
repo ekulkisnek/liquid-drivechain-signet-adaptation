@@ -3,6 +3,10 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/validation.h>
+#include <limits>
+#include <consensus/params.h>
+#include <consensus/tx_check.h>
+#include <consensus/tx_verify.h>
 #include <key_io.h>
 #include <policy/packages.h>
 #include <policy/policy.h>
@@ -19,6 +23,159 @@
 
 
 BOOST_AUTO_TEST_SUITE(txvalidation_tests)
+
+BOOST_AUTO_TEST_CASE(alpha_confidential_payments_remain_enabled)
+{
+    const auto alpha = CChainParams::ElementsDrivechain();
+    BOOST_CHECK_EQUAL(alpha->GetConsensus().explicit_only_height, -1);
+    for (int height : {0, 83, 84, 85, 1'000'000, std::numeric_limits<int>::max()}) {
+        BOOST_CHECK(!alpha->GetConsensus().ExplicitOnlyActive(height));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(explicit_deferred_totals_preserve_screening)
+{
+    BasicTestingSetup setup(ChainType::ELEMENTS);
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("03")), 0));
+    tx.vout.resize(2);
+    for (auto& output : tx.vout) {
+        output.nAsset = CAsset(uint256S("01"));
+        output.nValue = MAX_MONEY;
+    }
+    // Screening alone is deliberately insufficient for either height regime.
+    TxValidationState screened, old_rules, new_rules;
+    BOOST_CHECK(CheckTransactionWithoutAggregateTotals(CTransaction(tx), screened));
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), old_rules, false));
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), new_rules, true));
+    tx.vout[1].nAsset = CAsset(uint256S("02"));
+    Consensus::Params params;
+    params.explicit_only_height = 100;
+    for (int height : {99, 100, 101}) {
+        TxValidationState state;
+        BOOST_CHECK_EQUAL(CheckTransaction(CTransaction(tx), state, params.ExplicitOnlyActive(height)), height >= 100);
+    }
+    tx.vout[0].nValue = MAX_MONEY + 1;
+    TxValidationState oversized;
+    BOOST_CHECK(!CheckTransactionWithoutAggregateTotals(CTransaction(tx), oversized));
+    BOOST_CHECK_EQUAL(oversized.GetRejectReason(), "bad-txns-vout-toolarge");
+    tx.vout[0].nValue = -1;
+    TxValidationState negative;
+    BOOST_CHECK(!CheckTransactionWithoutAggregateTotals(CTransaction(tx), negative));
+    BOOST_CHECK_EQUAL(negative.GetRejectReason(), "bad-txns-vout-negative");
+    tx.vout[0].nValue = 1;
+    tx.vin.push_back(tx.vin[0]);
+    TxValidationState duplicate;
+    BOOST_CHECK(!CheckTransactionWithoutAggregateTotals(CTransaction(tx), duplicate));
+    BOOST_CHECK_EQUAL(duplicate.GetRejectReason(), "bad-txns-inputs-duplicate");
+    tx.vin.pop_back();
+    // A historical confidential output must not be rejected by screening.
+    // Cryptographic proof verification remains a separate mandatory check.
+    tx.vout[0].nValue.vchCommitment.assign(33, 0);
+    tx.vout[0].nValue.vchCommitment[0] = 8;
+    TxValidationState historical;
+    BOOST_CHECK(CheckTransactionWithoutAggregateTotals(CTransaction(tx), historical));
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+}
+
+BOOST_AUTO_TEST_CASE(explicit_asset_total_boundaries)
+{
+    BasicTestingSetup setup(ChainType::ELEMENTS);
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("03")), 0));
+    tx.vout.resize(2);
+    tx.vout[0].nAsset = CAsset(uint256S("01"));
+    tx.vout[1].nAsset = CAsset(uint256S("02"));
+    tx.vout[0].nValue = MAX_MONEY;
+    tx.vout[1].nValue = MAX_MONEY;
+    TxValidationState legacy;
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), legacy));
+    BOOST_CHECK_EQUAL(legacy.GetRejectReason(), "bad-txns-txouttotal-toolarge");
+    TxValidationState separate;
+    BOOST_CHECK(CheckTransaction(CTransaction(tx), separate, true));
+
+    tx.vout[1].nAsset = tx.vout[0].nAsset;
+    tx.vout[1].nValue = 1;
+    TxValidationState overflow;
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), overflow, true));
+    BOOST_CHECK_EQUAL(overflow.GetRejectReason(), "bad-txns-txouttotal-toolarge");
+    tx.vout[0].nValue = MAX_MONEY - 1;
+    TxValidationState exact;
+    BOOST_CHECK(CheckTransaction(CTransaction(tx), exact, true));
+    tx.vout[0].nValue = MAX_MONEY + 1;
+    TxValidationState oversized;
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), oversized, true));
+    BOOST_CHECK_EQUAL(oversized.GetRejectReason(), "bad-txns-vout-toolarge");
+    tx.vout[0].nValue = -1;
+    TxValidationState negative;
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), negative, true));
+    BOOST_CHECK_EQUAL(negative.GetRejectReason(), "bad-txns-vout-negative");
+    tx.vout[0].nValue = 1;
+    tx.vout[0].nAsset.vchCommitment.assign(33, 0);
+    tx.vout[0].nAsset.vchCommitment[0] = 10;
+    TxValidationState hidden;
+    BOOST_CHECK(!CheckTransaction(CTransaction(tx), hidden, true));
+    BOOST_CHECK_EQUAL(hidden.GetRejectReason(), "bad-txns-asset-not-explicit");
+}
+
+BOOST_AUTO_TEST_CASE(explicit_only_activation_and_creations)
+{
+    // Confidential transaction serialization is defined only in Elements mode.
+    BasicTestingSetup setup(ChainType::ELEMENTS);
+    Consensus::Params params;
+    BOOST_CHECK(!params.ExplicitOnlyActive(1000));
+    params.explicit_only_height = 100;
+    BOOST_CHECK(!params.ExplicitOnlyActive(99));
+    BOOST_CHECK(params.ExplicitOnlyActive(100));
+    BOOST_CHECK(params.ExplicitOnlyActive(101));
+
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    tx.vout[0].nAsset = CAsset(uint256S("01"));
+    tx.vout[0].nValue = 1;
+    BOOST_CHECK(Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.witness.vtxoutwit.resize(1);
+    tx.witness.vtxoutwit[0].vchRangeproof = {1};
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.witness.vtxoutwit[0].vchRangeproof.clear();
+    tx.witness.vtxoutwit[0].vchSurjectionproof = {1};
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.witness.vtxoutwit[0].vchSurjectionproof.clear();
+    tx.witness.vtxinwit.resize(1);
+    tx.witness.vtxinwit[0].vchIssuanceAmountRangeproof = {1};
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.witness.vtxinwit[0].vchIssuanceAmountRangeproof.clear();
+    tx.witness.vtxinwit[0].vchInflationKeysRangeproof = {1};
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.witness.vtxinwit[0].vchInflationKeysRangeproof.clear();
+    BOOST_CHECK(Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+
+    // Reject commitments even when the sender omits their proofs.
+    tx.vout[0].nValue.vchCommitment.assign(33, 0);
+    tx.vout[0].nValue.vchCommitment[0] = 8;
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.vout[0].nValue = 1;
+    tx.vout[0].nAsset.vchCommitment.assign(33, 0);
+    tx.vout[0].nAsset.vchCommitment[0] = 10;
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.vout[0].nAsset = CAsset(uint256S("01"));
+    tx.vout[0].nNonce.vchCommitment.assign(33, 0);
+    tx.vout[0].nNonce.vchCommitment[0] = 2;
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.vout[0].nNonce.SetNull();
+
+    tx.vin[0].assetIssuance.nAmount = 1;
+    tx.vin[0].assetIssuance.nInflationKeys = 1;
+    BOOST_CHECK(Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.vin[0].assetIssuance.nAmount.vchCommitment.assign(33, 0);
+    tx.vin[0].assetIssuance.nAmount.vchCommitment[0] = 8;
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    tx.vin[0].assetIssuance.nAmount = 1;
+    tx.vin[0].assetIssuance.nInflationKeys.vchCommitment.assign(33, 0);
+    tx.vin[0].assetIssuance.nInflationKeys.vchCommitment[0] = 8;
+    BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+}
 
 /**
  * Ensure that the mempool won't accept coinbase transactions.

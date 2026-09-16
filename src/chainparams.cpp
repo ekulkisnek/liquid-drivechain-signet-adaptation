@@ -111,6 +111,29 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
 
 static std::unique_ptr<const CChainParams> globalChainParams;
 
+bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params)
+{
+    const auto& consensus = params.GetConsensus();
+    // Pin the existing Alpha identity, not just a mutable network name or slot.
+    // Keep pegin_min_depth=100 in the historical protocol manifest and genesis.
+    return params.NetworkIDString() == CBaseChainParams::ELEMENTS &&
+        consensus.elements_mode && consensus.has_parent_chain &&
+        consensus.drivechain_slot == 24 &&
+        consensus.hashGenesisBlock == uint256S("672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd") &&
+        params.ParentGenesisBlockHash() == uint256S("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f") &&
+        consensus.drivechain_protocol_manifest_hash == uint256S("fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6") &&
+        consensus.pegin_min_depth == 100;
+}
+
+uint32_t GetDrivechainPeginConfirmationDepth(const CChainParams& params, const int child_height)
+{
+    if (child_height >= ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT &&
+        HasAlphaPeginOneConfirmationUpgrade(params)) {
+        return 1;
+    }
+    return params.GetConsensus().pegin_min_depth;
+}
+
 const CChainParams &Params() {
     assert(globalChainParams);
     return *globalChainParams;

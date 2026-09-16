@@ -6,6 +6,7 @@
 // NOTE: This file is intended to be customised by the end user, and includes only local node policy logic
 
 #include <policy/policy.h>
+#include <script/ecx_activation_annex.h>
 
 #include <coins.h>
 #include <ecx_exchange_state.h>
@@ -37,6 +38,27 @@ CAsset policyAsset;
 
 namespace {
 
+bool IsFrozenActivationAnnex(const CTransaction& tx, size_t input,
+    const ecx::ExchangeConsensus* consensus)
+{
+    if (!consensus || input != 0 || tx.witness.vtxinwit.empty() ||
+        !consensus->bond_v2.activation_enabled || !consensus->bond_v2.identities_frozen) return false;
+    const auto& stack = tx.witness.vtxinwit[input].scriptWitness.stack;
+    std::array<unsigned char, 32> program{};
+    std::array<unsigned char, 364> values{};
+    const auto& frozen = consensus->bond_v2;
+    return ecx::ParseActivationAnnex(stack, program, values) &&
+        !frozen.incremental_activation_cmr.IsNull() &&
+        std::equal(stack[2].begin(), stack[2].end(), frozen.incremental_activation_cmr.begin()) &&
+        std::equal(program.begin(), program.end(), frozen.incremental_activation_program_id.begin()) &&
+        std::equal(values.begin() + 4, values.begin() + 36, frozen.incremental_activation_configuration_hash.begin()) &&
+        std::equal(values.begin() + 36, values.begin() + 68, frozen.configuration_hash.begin()) &&
+        std::equal(values.begin() + 100, values.begin() + 132, frozen.incremental_successor_configuration_hash.begin()) &&
+        std::equal(values.begin() + 164, values.begin() + 196, tx.GetHash().begin(),
+            [](unsigned char a, std::byte b) { return a == std::to_integer<unsigned char>(b); }) &&
+        std::equal(values.begin() + 228, values.begin() + 260, consensus->chain_id.begin());
+}
+
 bool UsddSp1AnnexPolicyEnabled()
 {
     const CChainParams& params = Params();
@@ -53,7 +75,8 @@ bool UsddSp1AnnexPolicyEnabled()
  */
 bool GetUsddSp1AnnexPolicyWeight(const CTransaction& tx,
                                  uint64_t& annex_weight,
-                                 std::string& reason)
+                                 std::string& reason,
+                                 const ecx::ExchangeConsensus* consensus)
 {
     annex_weight = 0;
     const usdd::Sp1AnnexResourceUsage resource_usage =
@@ -88,12 +111,16 @@ bool GetUsddSp1AnnexPolicyWeight(const CTransaction& tx,
     }
 
     bool found{false};
-    for (const auto& input_witness : tx.witness.vtxinwit) {
+    for (size_t input = 0; input < tx.witness.vtxinwit.size(); ++input) {
+        const auto& input_witness = tx.witness.vtxinwit[input];
         const auto& stack = input_witness.scriptWitness.stack;
         if (stack.size() < 2 || stack.back().empty() ||
             stack.back()[0] != usdd::SP1_ANNEX_TAG) {
             continue;
         }
+        // ECX activation is a disjoint, frozen lane. It receives no USDD
+        // transaction-weight discount and remains fully script-validated.
+        if (IsFrozenActivationAnnex(tx, input, consensus)) continue;
         if (!UsddSp1AnnexPolicyEnabled()) {
             reason = "usdd-sp1-annex";
             return false;
@@ -271,7 +298,7 @@ bool IsStandardTx(
     const uint64_t total_weight = GetTransactionWeight(tx);
     uint64_t usdd_annex_weight{0};
     if (Params().GetConsensus().drivechain_slot.has_value() &&
-        !GetUsddSp1AnnexPolicyWeight(tx, usdd_annex_weight, reason)) {
+        !GetUsddSp1AnnexPolicyWeight(tx, usdd_annex_weight, reason, ecx_consensus)) {
         return false;
     }
     // Exceptions are independently bounded and cannot be combined to bypass
@@ -479,7 +506,9 @@ bool IsWitnessStandard(
                                stack.back()[0] == usdd::SP1_ANNEX_TAG;
         const bool is_native_taproot = witnessversion == 1 &&
             witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh;
-        if (has_annex && Params().GetConsensus().drivechain_slot.has_value()) {
+        if (has_annex && is_native_taproot && IsFrozenActivationAnnex(tx, i, ecx_consensus)) {
+            SpanPopBack(stack);
+        } else if (has_annex && Params().GetConsensus().drivechain_slot.has_value()) {
             if (!is_native_taproot || !UsddSp1AnnexPolicyEnabled() ||
                 found_usdd_sp1_annex) {
                 return false;

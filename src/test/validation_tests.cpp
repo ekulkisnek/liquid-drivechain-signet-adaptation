@@ -10,6 +10,8 @@
 #include <consensus/consensus.h>
 #include <crypto/sha256.h>
 #include <drivechain_bmm.h>
+#include <drivechain_parent_replay.h>
+#include <dbwrapper.h>
 #include <elements_drivechain_identity.h>
 #include <init.h>
 #include <key_io.h>
@@ -20,10 +22,12 @@
 #include <net.h>
 #include <net_processing.h>
 #include <node/kernel_notifications.h>
+#include <node/miner.h>
 #include <pegins.h>
 #include <policy/policy.h>
 #include <rpc/request.h>
 #include <signet.h>
+#include <script/signingprovider.h>
 #include <streams.h>
 #include <uint256.h>
 #include <util/strencodings.h>
@@ -37,9 +41,11 @@
 #include <string>
 
 #include <test/util/setup_common.h>
+#include <test/util/txmempool.h>
 
 #include <limits>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <thread>
 
@@ -53,6 +59,86 @@
 namespace Bitcoin = Sidechain::Bitcoin;
 
 BOOST_FIXTURE_TEST_SUITE(validation_tests, TestingSetup)
+
+BOOST_AUTO_TEST_CASE(inspect_preserved_alpha_replay_copy)
+{
+    // Diagnostic fixture only. Never point this at a live or preserved original
+    // database: LevelDB opening can recover/write metadata even without writes.
+    const char* path = std::getenv("ECX_REPLAY_INSPECTION_COPY");
+    if (!path) {
+        BOOST_TEST_MESSAGE("No isolated replay copy supplied; inspection not performed");
+        return;
+    }
+    const fs::path copy{path};
+    BOOST_REQUIRE(copy.filename() == "replay-copy");
+    const char* credential_file = std::getenv("ECX_REPLAY_INSPECTION_CREDENTIAL_FILE");
+    BOOST_REQUIRE_MESSAGE(credential_file && *credential_file,
+        "Explicit local parent RPC credentials required for replay inspection");
+    std::pair<uint32_t, uint256> identity;
+    {
+        CDBWrapper db(DBParams{.path = copy, .cache_bytes = 1 << 20,
+            .memory_only = false, .wipe_data = false, .obfuscate = false});
+        BOOST_REQUIRE(db.Read(uint8_t{'I'}, identity));
+    }
+    BOOST_REQUIRE_EQUAL(identity.first, DrivechainParentReplayStore::SCHEMA_VERSION);
+    // Independently serialize the selected Alpha parameters, not the DB identity.
+    const auto alpha = CreateChainParams(ArgsManager{}, CBaseChainParams::ELEMENTS);
+    const auto& consensus = alpha->GetConsensus();
+    HashWriter writer;
+    writer << std::string{"ELEMENTS_AUTHENTICATED_PARENT_REPLAY_STORE_V4"}
+           << std::string{ElementsDrivechainIdentity::BIP300301_ENFORCER_REVISION}
+           << std::string{ElementsDrivechainIdentity::BIP300301_LOCAL_RULE_DOMAIN}
+           << std::string{ElementsDrivechainIdentity::BIP300301_LOCAL_RULE_ID}
+           << alpha->HashGenesisBlock()
+           << alpha->ParentGenesisBlockHash()
+           << consensus.parentChainPowLimit
+           << consensus.parent_signet_challenge
+           << consensus.pegin_min_depth
+           << *consensus.drivechain_slot
+           << consensus.drivechain_protocol_manifest_hash
+           << consensus.drivechain_proposal_description
+           << *consensus.drivechain_proposal_hash
+           << consensus.drivechain_parent_state_active_proposal_description
+           << consensus.drivechain_parent_state_active_proposal_hash.value_or(uint256{})
+           << consensus.drivechain_parent_state_proposal_height
+           << consensus.drivechain_parent_state_proposal_block_hash
+           << consensus.drivechain_parent_state_activation_height
+           << consensus.drivechain_parent_state_activation_block_hash
+           << consensus.drivechain_parent_state_height
+           << consensus.drivechain_parent_state_hash
+           << consensus.drivechain_parent_state_chainwork
+           << consensus.drivechain_parent_state_ctip_txid
+           << consensus.drivechain_parent_state_ctip_vout
+           << consensus.drivechain_parent_state_ctip_value
+           << uint256S(ElementsDrivechainIdentity::PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT)
+           << consensus.drivechain_unused_slot_proposal_max_age
+           << consensus.drivechain_unused_slot_activation_threshold
+           << consensus.drivechain_used_slot_proposal_max_age
+           << consensus.drivechain_used_slot_activation_threshold
+           << consensus.drivechain_withdrawal_bundle_max_age
+           << consensus.drivechain_withdrawal_bundle_inclusion_threshold
+           << consensus.drivechain_m6_withdrawal_validation
+           << consensus.drivechain_parent_state_replay_version;
+    const uint256 expected_identity = writer.GetHash();
+    BOOST_TEST_MESSAGE("SELECTED_ALPHA identity=" << expected_identity.GetHex()
+        << " genesis=" << alpha->HashGenesisBlock().GetHex());
+    BOOST_REQUIRE_EQUAL(identity.second.GetHex(), expected_identity.GetHex());
+    DrivechainParentReplayStore store(copy, 1 << 20, false);
+    DrivechainParentReplayTip tip;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(store.Load(identity.second, tip, &error) ==
+        DrivechainReplayStoreLoadStatus::LOADED, error);
+    BOOST_TEST_MESSAGE("STRUCTURAL_ONLY identity=" << identity.second.GetHex()
+        << " height=" << tip.height << " hash=" << tip.hash.GetHex()
+        << " activated=" << tip.state.required_proposal_activated
+        << " activation_height=" << tip.state.required_activation_height);
+    // Loading with a substituted identity must not accept the same database.
+    uint256 wrong = identity.second;
+    wrong.begin()[0] ^= 1;
+    BOOST_CHECK(store.Load(wrong, tip, &error) ==
+        DrivechainReplayStoreLoadStatus::IDENTITY_MISMATCH);
+    // Matching configuration identity does not authenticate the active parent tip.
+}
 
 BOOST_AUTO_TEST_CASE(drivechain_parent_checkpoint_ctip_tuple)
 {
@@ -568,6 +654,43 @@ BOOST_AUTO_TEST_CASE(usdd_bip301_critical_hash_commits_exact_candidate_and_trans
     BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
         parent_with_unrelated_invalid_message, slot, critical_a, nullptr,
         &error));
+}
+
+BOOST_AUTO_TEST_CASE(explicit_block_screening_defers_only_aggregate)
+{
+    Consensus::Params consensus = Params().GetConsensus();
+    consensus.signet_blocks = false;
+    const auto make_block = [](CAmount amount, bool duplicate) {
+        CMutableTransaction coinbase;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_0;
+        coinbase.vout.emplace_back(CAsset(uint256::ONE), 0, CScript() << OP_TRUE);
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256::ONE), 0));
+        if (duplicate) tx.vin.push_back(tx.vin.front());
+        tx.vout.emplace_back(CAsset(uint256::ONE), amount, CScript() << OP_TRUE);
+        tx.vout.emplace_back(CAsset(uint256S("02")), MAX_MONEY, CScript() << OP_TRUE);
+        CBlock block;
+        block.vtx = {MakeTransactionRef(std::move(coinbase)), MakeTransactionRef(std::move(tx))};
+        return block;
+    };
+    // Use fresh blocks/states so cached validation cannot mask a failure.
+    consensus.explicit_only_height = -1;
+    BlockValidationState legacy;
+    BOOST_CHECK(!CheckBlock(make_block(MAX_MONEY, false), legacy, consensus, false, false));
+    BOOST_CHECK_EQUAL(legacy.GetRejectReason(), "bad-txns-txouttotal-toolarge");
+    consensus.explicit_only_height = 100;
+    BlockValidationState deferred;
+    BOOST_CHECK(CheckBlock(make_block(MAX_MONEY, false), deferred, consensus, false, false));
+    BlockValidationState oversized;
+    BOOST_CHECK(!CheckBlock(make_block(MAX_MONEY + 1, false), oversized, consensus, false, false));
+    BOOST_CHECK_EQUAL(oversized.GetRejectReason(), "bad-txns-vout-toolarge");
+    BlockValidationState duplicate;
+    BOOST_CHECK(!CheckBlock(make_block(1, true), duplicate, consensus, false, false));
+    BOOST_CHECK_EQUAL(duplicate.GetRejectReason(), "bad-txns-inputs-duplicate");
+    // Passing context-free screening does not establish contextual validity,
+    // input conservation, script validity, or acceptance into a chain.
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_native_deposit_block_cap)
@@ -1294,6 +1417,83 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK_MESSAGE(
         IsCanonicalElementsProductionIdentity(*params, *base_params, &identity_error),
         identity_error);
+}
+
+BOOST_AUTO_TEST_CASE(alpha_pegin_depth_upgrade_preserves_identity_and_is_height_scoped)
+{
+    ArgsManager args;
+    // An ordinary configuration override cannot disable or move this upgrade.
+    args.ForceSetArg("-peginconfirmationdepth", "0");
+    const auto alpha = CreateChainParams(args, CBaseChainParams::ELEMENTS);
+    const auto alpha_base = CreateBaseChainParams(CBaseChainParams::ELEMENTS);
+    const auto& consensus = alpha->GetConsensus();
+    BOOST_CHECK(HasAlphaPeginOneConfirmationUpgrade(*alpha));
+    BOOST_CHECK_EQUAL(ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT, 64);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha), 100U);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, -1), 100U);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, 0), 100U);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, 63), 100U);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, 64), 1U);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, 65), 1U);
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, std::numeric_limits<int>::max()), 1U);
+    BOOST_CHECK_EQUAL(consensus.pegin_min_depth, 100U);
+    BOOST_CHECK_EQUAL(consensus.hashGenesisBlock.GetHex(), "672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd");
+    BOOST_CHECK_EQUAL(consensus.pegged_asset.GetHex(), "62dce3bd80dc4b0503e7ccbb3fcfa4d7adfd64b4e0cc78fa5e1754b88f1d2da4");
+    BOOST_CHECK_EQUAL(consensus.drivechain_protocol_manifest_hash.GetHex(), "fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6");
+    BOOST_REQUIRE(consensus.drivechain_proposal_hash.has_value());
+    BOOST_CHECK_EQUAL(consensus.drivechain_proposal_hash->GetHex(), "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400");
+    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_max_age, 144U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_inclusion_threshold, 72U);
+    std::string error;
+    BOOST_CHECK_MESSAGE(IsCanonicalElementsProductionIdentity(*alpha, *alpha_base, &error), error);
+
+    class MutatedIdentity final : public CChainParams {
+    public:
+        explicit MutatedIdentity(const CChainParams& source) : CChainParams(source) {}
+        void WrongGenesis() { consensus.hashGenesisBlock = uint256::ONE; }
+        void WrongSlot() { consensus.drivechain_slot = 25; }
+        void WrongNetwork() { m_chain_type.chain_name = "elementsregtest"; }
+        void WrongManifest() { consensus.drivechain_protocol_manifest_hash = uint256::ONE; }
+        void WrongParent() { parentGenesisBlockHash = uint256::ONE; }
+        void WrongMode() { consensus.elements_mode = false; }
+        void NoParentChain() { consensus.has_parent_chain = false; }
+        void NoSlot() { consensus.drivechain_slot.reset(); }
+    };
+    for (const auto mutate : {&MutatedIdentity::WrongGenesis, &MutatedIdentity::WrongSlot,
+                             &MutatedIdentity::WrongNetwork, &MutatedIdentity::WrongManifest,
+                             &MutatedIdentity::WrongParent, &MutatedIdentity::WrongMode,
+                             &MutatedIdentity::NoParentChain, &MutatedIdentity::NoSlot}) {
+        MutatedIdentity other{*alpha};
+        (other.*mutate)();
+        BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(other));
+        BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(other, 64), 100U);
+    }
+    const auto private_chain = CreateChainParams(ArgsManager{}, "elementsregtest");
+    BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(*private_chain));
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*private_chain, 64), private_chain->GetConsensus().pegin_min_depth);
+    const auto signet = CreateChainParams(ArgsManager{}, CBaseChainParams::SIGNET);
+    BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(*signet));
+    BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*signet, 64), signet->GetConsensus().pegin_min_depth);
+}
+
+BOOST_AUTO_TEST_CASE(alpha_pegin_depth_counts_authenticated_parent_inclusion)
+{
+    const auto alpha = CreateChainParams(ArgsManager{}, CBaseChainParams::ELEMENTS);
+    const uint32_t before = GetDrivechainPeginConfirmationDepth(*alpha, 63);
+    const uint32_t after = GetDrivechainPeginConfirmationDepth(*alpha, 64);
+    BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 1000, before));
+    BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 1098, before));
+    BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1099, before));
+    BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1000, after));
+    BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1001, after));
+    BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 999, after));
+    BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 1000, 0));
+    BOOST_CHECK(!HasRequiredDrivechainDepositDepth(std::numeric_limits<uint32_t>::max(), 0, after));
+    BOOST_CHECK(HasRequiredDrivechainDepositDepth(std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max(), after));
+    BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1, std::numeric_limits<uint32_t>::max() - 1, std::numeric_limits<uint32_t>::max()));
+    BOOST_CHECK(HasRequiredDrivechainDepositDepth(1, std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max()));
+    // The separate legacy federated coinbase-maturity safeguard is unchanged.
+    BOOST_CHECK_EQUAL(COINBASE_MATURITY, 100);
 }
 
 BOOST_AUTO_TEST_CASE(elements_height_one_uses_simplicity_consensus_flags)
@@ -2668,11 +2868,300 @@ BOOST_AUTO_TEST_CASE(drivechain_withdrawal_capability_requires_replay_or_explici
 
 BOOST_AUTO_TEST_SUITE_END()
 
+struct AlphaParentInspectionSetup : BasicTestingSetup {
+    AlphaParentInspectionSetup() : BasicTestingSetup(ChainTypeMetaFrom(CBaseChainParams::ELEMENTS)) {}
+};
+
+BOOST_FIXTURE_TEST_SUITE(alpha_parent_inspection, AlphaParentInspectionSetup)
+BOOST_AUTO_TEST_CASE(execution_anchor_clears_on_wrong_slot)
+{
+    DrivechainParentBlockContext anchor, bid;
+    anchor.parent_hash = uint256::ONE;
+    anchor.parent_height = 42;
+    anchor.parent_median_time_past = 123;
+    anchor.parent_chainwork = uint256::ONE;
+    std::string error;
+    BOOST_CHECK(!GetDrivechainExecutionAnchor(23, uint256::ONE, 0, bid, anchor, &error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(anchor.parent_hash.IsNull());
+    BOOST_CHECK(anchor.parent_chainwork.IsNull());
+    BOOST_CHECK_EQUAL(anchor.parent_height, 0U);
+    BOOST_CHECK_EQUAL(anchor.parent_median_time_past, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(execution_anchor_clears_on_authentication_error)
+{
+    gArgs.ForceSetArg("-mainchainrpccredentialfile", "unused-test-credential-file");
+    gArgs.ForceSetArg("-mainchainrpcuser", "test-only");
+    DrivechainParentBlockContext anchor, bid;
+    anchor.parent_hash = uint256::ONE;
+    anchor.parent_height = 42;
+    anchor.parent_median_time_past = 123;
+    anchor.parent_chainwork = uint256::ONE;
+    std::string error;
+    BOOST_CHECK(!GetDrivechainExecutionAnchor(24, uint256::ONE, 0, bid, anchor, &error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(anchor.parent_hash.IsNull());
+    BOOST_CHECK(anchor.parent_chainwork.IsNull());
+    BOOST_CHECK_EQUAL(anchor.parent_height, 0U);
+    BOOST_CHECK_EQUAL(anchor.parent_median_time_past, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(mempool_parent_context_clears_on_failure)
+{
+    DrivechainParentBlockContext context;
+    context.parent_hash = uint256::ONE;
+    context.parent_height = 42;
+    context.parent_median_time_past = 123;
+    context.parent_chainwork = uint256::ONE;
+    std::string error;
+    // Reject the wrong slot before attempting any parent RPC.
+    BOOST_CHECK(!GetDrivechainMempoolParentContext(23, context, &error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(context.parent_hash.IsNull());
+    BOOST_CHECK(context.parent_chainwork.IsNull());
+    BOOST_CHECK_EQUAL(context.parent_height, 0U);
+    BOOST_CHECK_EQUAL(context.parent_median_time_past, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(mempool_parent_context_clears_on_authentication_error)
+{
+    // Conflicting authentication sources are rejected before network I/O.
+    gArgs.ForceSetArg("-mainchainrpccredentialfile", "unused-test-credential-file");
+    gArgs.ForceSetArg("-mainchainrpcuser", "test-only");
+    DrivechainParentBlockContext context;
+    context.parent_hash = uint256::ONE;
+    context.parent_height = 42;
+    context.parent_median_time_past = 123;
+    context.parent_chainwork = uint256::ONE;
+    std::string error;
+    BOOST_CHECK(!GetDrivechainMempoolParentContext(24, context, &error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(context.parent_hash.IsNull());
+    BOOST_CHECK(context.parent_chainwork.IsNull());
+    BOOST_CHECK_EQUAL(context.parent_height, 0U);
+    BOOST_CHECK_EQUAL(context.parent_median_time_past, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(native_context_from_preserved_replay)
+{
+    const char* path = std::getenv("ECX_REPLAY_INSPECTION_COPY");
+    if (!path) {
+        BOOST_TEST_MESSAGE("No isolated replay copy supplied; inspection not performed");
+        return;
+    }
+    const fs::path copy{path};
+    const char* credential_file = std::getenv("ECX_REPLAY_INSPECTION_CREDENTIAL_FILE");
+    BOOST_REQUIRE_MESSAGE(credential_file && *credential_file,
+        "ECX_REPLAY_INSPECTION_CREDENTIAL_FILE is required for replay inspection");
+    BOOST_REQUIRE(copy.filename() == "replay-copy");
+    const auto destination = gArgs.GetDataDirNet() / "parent-replay";
+    fs::create_directories(destination.parent_path());
+    fs::copy(copy, destination, fs::copy_options::recursive);
+    gArgs.ForceSetArg("-mainchainrpchost", "127.0.0.1");
+    gArgs.ForceSetArg("-mainchainrpcport", "8532");
+    gArgs.ForceSetArg("-mainchainrpccredentialfile", credential_file);
+    gArgs.ForceSetArg("-mainchainrpctimeout", "15");
+    const uint256 parent = uint256S("00000000000000003ca6e8ca1c504080e0e70e8982790553e23b6b6fc65ae222");
+    const auto& tag = ElementsDrivechainIdentity::PARENT_COMMITMENT_TAG;
+    std::vector<unsigned char> payload(tag.begin(), tag.end());
+    payload.insert(payload.end(), parent.begin(), parent.end());
+    CMutableTransaction coinbase;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vout.resize(1);
+    coinbase.vout[0].scriptPubKey = CScript() << OP_RETURN << payload;
+    CBlock block;
+    block.vtx.push_back(MakeTransactionRef(coinbase));
+    DrivechainParentBlockContext context;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(GetDrivechainParentBlockContext(block, 24, context, &error), error);
+    BOOST_CHECK_EQUAL(context.parent_hash.GetHex(), parent.GetHex());
+    BOOST_CHECK_EQUAL(context.parent_height, 996913U);
+    BOOST_CHECK_EQUAL(context.parent_median_time_past, 1788790347U);
+    BOOST_TEST_MESSAGE("NATIVE_ALPHA_CONTEXT height=" << context.parent_height
+        << " mtp=" << context.parent_median_time_past);
+    BOOST_CHECK(!GetDrivechainParentBlockContext(block, 23, context, &error));
+    std::ifstream input(copy.parent_path() / "alpha-block-82.hex");
+    std::string hex;
+    BOOST_REQUIRE(bool(input >> hex));
+    CBlock actual;
+    BOOST_REQUIRE(DecodeHexBlk(actual, hex));
+    BOOST_REQUIRE_EQUAL(actual.GetHash().GetHex(),
+        "b1117286fc95abdffc88726a76dad7b45c68207f482df3d4529771a1345f4a92");
+    const auto previous = usdd::WithdrawalAccumulatorState::Empty();
+    usdd::WithdrawalAccumulatorState next;
+    uint256 critical;
+    BOOST_REQUIRE_MESSAGE(usdd::DeriveWithdrawalBip301CriticalHash(actual,
+        Params().HashGenesisBlock(), 24, previous, next, critical, &error), error);
+    BOOST_REQUIRE(next == previous);
+    DrivechainBmmBlockContext finalized;
+    BOOST_REQUIRE_MESSAGE(GetDrivechainBmmBlockContext(actual, critical, 24,
+        finalized, &error), error);
+    BOOST_TEST_MESSAGE("NATIVE_FINALIZED_CONTEXT P=" << finalized.parent_hash.GetHex()
+        << " Q=" << finalized.bmm_block_hash.GetHex()
+        << " critical=" << critical.GetHex());
+    uint256 substituted = critical;
+    substituted.begin()[0] ^= 1;
+    const auto rejected = GetDrivechainBmmBlockStatus(actual, substituted, 24,
+        finalized, &error);
+    BOOST_CHECK(rejected == DrivechainBmmStatus::UNAVAILABLE);
+    BOOST_CHECK(error.find("does not match the cached enforcer-recognized M7") != std::string::npos);
+    BOOST_CHECK(finalized.parent_hash.IsNull());
+    BOOST_CHECK(finalized.bmm_block_hash.IsNull());
+    BOOST_REQUIRE_MESSAGE(GetDrivechainBmmBlockContext(actual, critical, 24,
+        finalized, &error), error);
+}
+BOOST_AUTO_TEST_SUITE_END()
+
 struct ElementsTestingSetup : public TestingSetup {
     ElementsTestingSetup() : TestingSetup{ChainType::ELEMENTS} {}
 };
 
+namespace node {
+// Test access to the real selection loop; no production authentication bypass.
+struct NativePackageSelectionTestAccess {
+    static std::vector<CTransactionRef> Select(Chainstate& chainstate,
+        CTxMemPool& pool, const DrivechainParentBlockContext& parent)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main) LOCKS_EXCLUDED(pool.cs)
+    {
+        BlockAssembler::Options options;
+        options.blockMinFeeRate = CFeeRate(0);
+        BlockAssembler assembler(chainstate, &pool, options);
+        assembler.resetBlock();
+        assembler.pblocktemplate = std::make_unique<CBlockTemplate>();
+        assembler.nHeight = chainstate.m_chain.Tip()->nHeight + 1;
+        assembler.m_lock_time_cutoff = chainstate.m_chain.Tip()->GetMedianTimePast();
+        assembler.m_candidate_parent = parent;
+        int packages{0}, descendants{0};
+        assembler.addPackageTxs(packages, descendants);
+        return assembler.pblocktemplate->block.vtx;
+    }
+};
+}
+
 BOOST_FIXTURE_TEST_SUITE(elements_startup_validation_tests, ElementsTestingSetup)
+
+BOOST_AUTO_TEST_CASE(native_candidate_script_precheck)
+{
+    LOCK(cs_main);
+    LOCK(m_node.mempool->cs);
+    auto& chainstate = m_node.chainman->ActiveChainstate();
+    const COutPoint outpoint(Txid::FromUint256(uint256::ONE), 0);
+    chainstate.CoinsTip().AddCoin(outpoint,
+        Coin(CTxOut(policyAsset, 1000, CScript() << OP_TRUE), 0, false), false);
+    CMutableTransaction spend;
+    spend.vin.emplace_back(outpoint);
+    spend.vout.emplace_back(policyAsset, 900, CScript() << OP_TRUE);
+    CBlockHeader header;
+    DrivechainParentBlockContext parent;
+    parent.parent_hash = uint256::ONE;
+    parent.parent_height = 1;
+    parent.parent_median_time_past = 100;
+    const auto check = [&](const CMutableTransaction& tx) {
+        return CheckNativeCandidateTransactionScripts(CTransaction(tx), chainstate,
+            *m_node.mempool, header, parent);
+    };
+    BOOST_CHECK(check(spend));
+    // Ordinary spends remain eligible when P advances, including cached checks.
+    parent.parent_hash = uint256S("02");
+    ++parent.parent_height;
+    ++parent.parent_median_time_past;
+    BOOST_CHECK(check(spend));
+    parent.parent_hash.SetNull();
+    BOOST_CHECK(!check(spend));
+    parent.parent_hash = uint256::ONE;
+    spend.vin[0].prevout.n = 1;
+    BOOST_CHECK(!check(spend));
+    spend.vin[0].prevout = outpoint;
+    spend.vin[0].scriptSig = CScript() << OP_RETURN;
+    BOOST_CHECK(!check(spend));
+}
+
+BOOST_AUTO_TEST_CASE(native_candidate_parent_bound_script_cache)
+{
+    LOCK(cs_main);
+    auto& chainstate = m_node.chainman->ActiveChainstate();
+    // Compiled test-only assertion: current_bmm_parent_height_required() == 42.
+    const auto program = DecodeBase64("3J+OYIswAAAAAAAAAqBgFWbcgRgECakHAoA=");
+    BOOST_REQUIRE(program.has_value());
+    const auto cmr = ParseHex("cdb3e60033b50c8e4c4d4d5e96a89cd8b1e08878bc57a43d6ff827cf3bf0c595");
+    const CScript leaf(cmr.begin(), cmr.end());
+    TaprootBuilder builder;
+    builder.Add(0, leaf, TAPROOT_LEAF_TAPSIMPLICITY);
+    builder.Finalize(XOnlyPubKey::NUMS_H);
+    const auto data = builder.GetSpendData();
+    BOOST_REQUIRE_EQUAL(data.scripts.size(), 1U);
+    const auto& controls = data.scripts.begin()->second;
+    BOOST_REQUIRE_EQUAL(controls.size(), 1U);
+    const COutPoint outpoint(Txid::FromUint256(uint256::ONE), 0);
+    chainstate.CoinsTip().AddCoin(outpoint,
+        Coin(CTxOut(policyAsset, 1000, GetScriptForDestination(builder.GetOutput())), 0, false), false);
+    CMutableTransaction spend;
+    spend.vin.emplace_back(outpoint);
+    spend.vout.emplace_back(policyAsset, 900, CScript() << OP_TRUE);
+    spend.witness.vtxinwit.resize(1);
+    spend.witness.vtxinwit[0].scriptWitness.stack = {{}, *program, cmr, *controls.begin()};
+    CBlockHeader header;
+    DrivechainParentBlockContext parent;
+    parent.parent_hash = uint256::ONE;
+    parent.parent_height = 42;
+    parent.parent_median_time_past = 100;
+    const auto check = [&] {
+        LOCK(m_node.mempool->cs);
+        return CheckNativeCandidateTransactionScripts(CTransaction(spend), chainstate,
+            *m_node.mempool, header, parent);
+    };
+    BOOST_CHECK(check());
+    parent.parent_height = 43;
+    BOOST_CHECK(!check());
+    parent.parent_height = 42;
+    BOOST_CHECK(check());
+
+    // A dependent transaction must resolve its input from the mempool view,
+    // but that does not make its stale ancestor eligible for a package.
+    WITH_LOCK(m_node.mempool->cs, AddToMempool(*m_node.mempool, TestMemPoolEntryHelper{}.Fee(100).FromTx(spend)));
+    CMutableTransaction child;
+    child.vin.emplace_back(CTransaction(spend).GetHash(), 0);
+    child.vout.emplace_back(policyAsset, 800, CScript() << OP_TRUE);
+    const auto check_child = [&] {
+        LOCK(m_node.mempool->cs);
+        return CheckNativeCandidateTransactionScripts(CTransaction(child), chainstate,
+            *m_node.mempool, header, parent);
+    };
+    BOOST_CHECK(check_child());
+    parent.parent_height = 43;
+    BOOST_CHECK(check_child());
+    BOOST_CHECK(!check());
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_node.mempool->cs, return m_node.mempool->size()), 1U);
+    parent.parent_height = 42;
+    BOOST_CHECK(check());
+    const COutPoint independent_input(Txid::FromUint256(uint256S("03")), 0);
+    chainstate.CoinsTip().AddCoin(independent_input,
+        Coin(CTxOut(policyAsset, 1000, CScript() << OP_TRUE), 0, false), false);
+    CMutableTransaction independent;
+    independent.vin.emplace_back(independent_input);
+    independent.vout.emplace_back(policyAsset, 900, CScript() << OP_TRUE);
+    {
+        LOCK(m_node.mempool->cs);
+        AddToMempool(*m_node.mempool, TestMemPoolEntryHelper{}.Fee(100).FromTx(child));
+        AddToMempool(*m_node.mempool, TestMemPoolEntryHelper{}.Fee(100).FromTx(independent));
+    }
+    const auto select = [&] {
+        return node::NativePackageSelectionTestAccess::Select(chainstate, *m_node.mempool, parent);
+    };
+    parent.parent_height = 43;
+    const auto stale = select();
+    BOOST_REQUIRE_EQUAL(stale.size(), 1U);
+    BOOST_CHECK(stale.front()->GetHash() == CTransaction(independent).GetHash());
+    parent.parent_height = 42;
+    const auto fresh = select();
+    BOOST_REQUIRE_EQUAL(fresh.size(), 3U);
+    auto parent_pos = std::find_if(fresh.begin(), fresh.end(), [&](const auto& tx) { return tx->GetHash() == CTransaction(spend).GetHash(); });
+    auto child_pos = std::find_if(fresh.begin(), fresh.end(), [&](const auto& tx) { return tx->GetHash() == CTransaction(child).GetHash(); });
+    BOOST_CHECK(parent_pos < child_pos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_node.mempool->cs, return m_node.mempool->size()), 3U);
+}
 
 BOOST_AUTO_TEST_CASE(activates_genesis_from_empty_chain)
 {

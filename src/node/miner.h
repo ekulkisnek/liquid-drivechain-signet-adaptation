@@ -7,6 +7,7 @@
 #define BITCOIN_NODE_MINER_H
 
 #include <node/types.h>
+#include <mainchainrpc.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
 #include <txmempool.h>
@@ -154,6 +155,7 @@ struct update_for_parent_inclusion
 /** Generate a new block, without valid proof-of-work */
 class BlockAssembler
 {
+    friend struct NativePackageSelectionTestAccess;
 private:
     // The constructed block template
     std::unique_ptr<CBlockTemplate> pblocktemplate;
@@ -172,6 +174,7 @@ private:
     int nHeight;
     int64_t m_lock_time_cutoff;
     bool m_include_drivechain_pegins{true};
+    std::optional<DrivechainParentBlockContext> m_candidate_parent;
 
     const CChainParams& chainparams;
     const CTxMemPool* const m_mempool;
@@ -220,7 +223,7 @@ private:
       *
       * @pre BlockAssembler::m_mempool must not be nullptr
     */
-    void addPackageTxs(int& nPackagesSelected, int& nDescendantsUpdated, std::chrono::seconds required_wait = std::chrono::seconds(0)) EXCLUSIVE_LOCKS_REQUIRED(!m_mempool->cs);
+    void addPackageTxs(int& nPackagesSelected, int& nDescendantsUpdated, std::chrono::seconds required_wait = std::chrono::seconds(0)) EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_mempool->cs);
 
     // helper functions for addPackageTxs()
     /** Remove confirmed (inBlock) entries from given set */
@@ -231,7 +234,7 @@ private:
       * locktime, premature-witness, serialized size (if necessary)
       * These checks should always succeed, and they're here
       * only as an extra check in case of suboptimal node configuration */
-    bool TestPackageTransactions(const CTxMemPool::setEntries& package) const;
+    bool TestPackageTransactions(const CTxMemPool::setEntries& package) const EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
     /** Sort the package in an order that is valid to appear in a block */
     void SortForBlock(const CTxMemPool::setEntries& package, std::vector<CTxMemPool::txiter>& sortedEntries);
 };

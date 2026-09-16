@@ -51,11 +51,14 @@ project files have been removed upstream. Do not reuse an Autotools build
 directory. The inherited dependency recipes are not themselves evidence of
 a validated fork release.
 
-Example configuration from the repository root (replace the absolute paths):
+Current Alpha configuration from the repository root (replace the absolute paths).
+The three compiler definitions below match the running Alpha release: omitting
+them does not reproduce its frozen catalogue and activation profile.
 
 ```sh
 cmake -S . -B /absolute/path/to/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  '-DCMAKE_CXX_FLAGS=-DECX_SIMPLICITY_CATALOGUE_FROZEN=1 -DECX_PRODUCTION_ACTIVATION_PROFILE_FROZEN=1 -DECX_SIMPLICITY_CATALOGUE_SHA256_HEX=\"bc981c9ba6665d16d95fea6a329b5c7317eefe520ffc3b12722d76fad270af1f\"' \
   -DBUILD_GUI=OFF -DBUILD_TESTS=ON \
   -DUSDD_SP1_VERIFIER_ARCHIVE=/absolute/path/to/libusdd_sp1_verifier.a \
   -DECX_SP1_VERIFIER_ARCHIVE=/absolute/path/to/libecx_sp1_verifier.a
