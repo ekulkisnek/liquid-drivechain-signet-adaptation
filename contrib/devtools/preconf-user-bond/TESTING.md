@@ -2,7 +2,8 @@
 
 ## Recorded local run
 
-- `cargo test --locked`: **22 passed**.
+- `cargo test --locked`: **23 passed** on macOS (22 covenant tests plus one
+  Unix-only CLI response-boundary test).
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - Pinned-fork C interpreter: **15 checks passed**, including all three valid
@@ -59,16 +60,49 @@ The C fixture driver deliberately supports only explicit, no-annex test
 transactions. Mutated negative fixtures are interpreter tests, not claims that
 each malformed transaction would reach script evaluation in a full node.
 
+## Full-node functional test
+
+`scripts/check-node.py` reuses `BitcoinTestFramework`, `MiniWallet`, transaction
+serialization and RPC helpers from this repository. It manages a fresh regtest
+datadir, with Simplicity active and public deterministic fixture keys. No live
+chain, wallet, funds, or service is involved. The Rust `regtest` example only
+adapts dynamic node parameters to the same library used by the unit tests.
+
+Build the repository's dedicated functional-test targets (production binaries
+intentionally reject regtest), then from this crate run:
+
+```sh
+cargo build --locked --example regtest
+python3 scripts/check-node.py \
+  --fixture="$PWD/target/debug/examples/regtest" \
+  --configfile=/absolute/path/to/node/test/config.ini \
+  --tmpdir="$PWD/target/preconf-regtest" \
+  --cachedir="$PWD/target/node-cache"
+```
+
+Use an unused `--tmpdir`. The framework resolves binaries from that config's
+build directory; `BITCOIND` and `BITCOINCLI` can select explicit test binaries.
+Build targets: `elements-functional-test-node` and `elements-functional-test-cli`.
+Windows uses the corresponding `.exe` fixture and node binaries.
+
+Recorded run: passed against a clean node checkout at
+`4041a8ba5d9c0870dbe22c188bce28410c10348a`. Checks cover actual funded UTXOs,
+both conflicting principal proposals accepted before signing, invalid value
+conservation rejected by the node-backed helper, all three covenant paths
+accepted and mined, premature refunds rejected as non-final, corrupted Taproot
+control block rejection, spent principal rejection across restart, and fail-closed
+CLI behavior when the node is stopped. The CLI boundary unit test separately
+rejects malformed/negative/mismatched replies and process failures.
+
 ## Not tested / not claimed
 
-- Full node mempool/block acceptance, actual-height finality, UTXO existence or
-  confirmation, complete fee/asset conservation and live validator activation.
+- Live validator activation, adversarial blocks bypassing the mempool, reorg
+  scenarios, and exhaustive consensus/policy coverage.
 - Actual frozen matcher service/profile integration or live signing.
 - Statechain ownership transfer, recipient exit, full DEX or wallet flows.
 - Economic security, collateral sufficiency, withholding/censorship, reorgs or
   adversarial network scheduling.
 - An independent audit or production readiness.
 
-The isolated native interpreter tests establish considerably more than a mocked
-unit test, but they do not close the full-node/regtest integration gate listed
-in PROTOCOL.md.
+These regtest checks cover the prototype's ordinary node integration; they do
+not close the broader deployment, reorg and protocol gates in PROTOCOL.md.

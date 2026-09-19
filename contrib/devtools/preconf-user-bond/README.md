@@ -5,9 +5,11 @@ penalty using **separate user collateral**, paid entirely to miners as fees.
 The frozen matcher remains a co-signer. This is a reviewable building block,
 **not a complete preconfirmation network, statechain, DEX, or production wallet**.
 
-Nothing here connects to a node, broadcasts transactions, activates a fork,
-reads real wallet keys, or changes the running dashboard. All examples use
-public deterministic test keys, an invented genesis, and an invented asset.
+The library never broadcasts, activates a fork, reads wallet keys, or changes
+the running dashboard. Authorization validation optionally calls a trusted,
+caller-configured `elements-cli testmempoolaccept` (read-only). The functional
+test broadcasts only to its disposable regtest node. All examples use public
+deterministic test keys; `vectors` uses an invented genesis and asset.
 **Do not fund the example addresses.**
 
 ## What is implemented
@@ -30,6 +32,9 @@ public deterministic test keys, an invented genesis, and an invented asset.
   deadline**. No unrestricted matcher early-release bypass.
 - Rust construction/serialization helpers, adversarial tests, and a native
   interpreter harness against the unmodified, pinned Elements+ source.
+- Typed SimplicityHL arguments/witnesses, without a JSON/text parsing roundtrip.
+- Authorization transaction validity delegated to the node, plus a full-node
+  regtest using the repository's existing functional framework and MiniWallet.
 
 ## Run locally
 

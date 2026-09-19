@@ -2,7 +2,7 @@ mod common;
 use common::*;
 use elements::{confidential, hashes::Hash, AssetId, BlockHash, Sequence, TxOut, Txid};
 use elementsplus_preconf::{
-    check_authorized_transaction, cooperative_action, elements, penalty_action, simplicity,
+    check_authorization_subject, cooperative_action, elements, penalty_action, simplicity,
     unilateral_action,
 };
 use simplicity::jet::elements::ElementsUtxo;
@@ -289,8 +289,9 @@ fn complete_witness_serializes_and_commits_to_the_single_nums_tapleaf() {
 
 #[test]
 fn malformed_witness_does_not_get_a_signature_or_a_spend() {
-    for text in ["Left(())", "Right(Right(0x00))", "garbage", ""] {
-        assert!(bond().satisfy(&penalty_env(), text).is_err());
+    use simplicityhl::value::{Value, ValueConstructible};
+    for action in [Value::unit(), Value::from(false), Value::byte_array([0])] {
+        assert!(bond().satisfy(&penalty_env(), &action).is_err());
     }
 }
 
@@ -399,16 +400,13 @@ fn malformed_config_and_principal_as_collateral_are_rejected() {
 #[test]
 fn certificates_are_only_requested_for_the_protected_output() {
     let mut tx = transfer(1);
-    assert_eq!(
-        check_authorized_transaction(config().protected_output, &tx).unwrap(),
-        tx.txid()
-    );
+    check_authorization_subject(config().protected_output, &tx).unwrap();
     tx.input[0].previous_output.vout += 1;
-    assert!(check_authorized_transaction(config().protected_output, &tx).is_err());
+    assert!(check_authorization_subject(config().protected_output, &tx).is_err());
     let mut tx = transfer(1);
     tx.input.push(tx.input[0].clone());
-    assert!(check_authorized_transaction(config().protected_output, &tx).is_err());
+    assert!(check_authorization_subject(config().protected_output, &tx).is_err());
     let mut tx = transfer(1);
     tx.input[0].is_pegin = true;
-    assert!(check_authorized_transaction(config().protected_output, &tx).is_err());
+    assert!(check_authorization_subject(config().protected_output, &tx).is_err());
 }

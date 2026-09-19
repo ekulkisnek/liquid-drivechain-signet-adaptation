@@ -62,8 +62,16 @@ The owner, matcher and recipient must obtain and validate the actual proposed
 transaction before signing/accepting: it consumes the protected output, has
 valid ownership authorization, exact asset/amount destinations, acceptable
 fees and no incompatible prior state. The library's
-`check_authorized_transaction` is **only a structural filter**, not that full
-validation. The on-chain evidence verifies signed authorizations; it does not
+`check_authorization_subject` is **only an application-specific structural
+filter**. `check_authorized_transaction` also asks the caller's trusted node to
+validate the exact serialized transaction with `testmempoolaccept`, requiring
+an affirmative result for the same txid. It reuses the CLI's RPC authentication
+and transport; callers must configure the trusted executable, intended network,
+datadir and connection timeout. It does not broadcast. Node acceptance is a
+point-in-time consensus/policy check, not a reservation, deployment/profile
+authentication, recipient approval, or proof that a future spend will succeed.
+Callers still enforce destinations, fee limits and protocol state before signing.
+The on-chain evidence verifies signed authorizations; it does not
 decode/revalidate the two original raw transactions or prove their publication.
 
 Quotes, abandoned drafts, backup transactions, unilateral exits, RBF updates

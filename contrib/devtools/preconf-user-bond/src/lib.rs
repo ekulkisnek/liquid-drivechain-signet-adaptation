@@ -1,8 +1,9 @@
-//! Experimental separate-collateral covenant. No networking, wallet key storage,
+//! Experimental separate-collateral covenant. No wallet key storage,
 //! live-chain defaults, matcher service, or production preconfirmation claims.
+//! Optional transaction validation delegates to a caller-configured node CLI.
 //! See PROTOCOL.md for the deliberately restricted, fixed-session trust model.
 
-use std::{str::FromStr, sync::Arc};
+use std::{process::Command, str::FromStr, sync::Arc};
 
 use elements::{
     confidential,
@@ -15,6 +16,10 @@ use simplicity::{
     jet::elements::{ElementsEnv, ElementsUtxo},
     BitMachine, Cmr,
 };
+use simplicityhl::str::WitnessName;
+use simplicityhl::types::{ResolvedType, TypeConstructible};
+pub use simplicityhl::value::Value as Action;
+use simplicityhl::value::{UIntValue, ValueConstructible};
 pub use simplicityhl::{elements, simplicity};
 use simplicityhl::{Arguments, CompiledProgram, WitnessValues};
 
@@ -23,7 +28,31 @@ pub const RECEIPT_DOMAIN: &[u8] = b"ECX/PreconfUserBond/TransferAuthorization/v1
 // BIP341 NUMS point: x coordinate of lift_x(SHA256(uncompressed generator)).
 // Nobody may supply a known-secret internal key; that would bypass the covenant.
 const NUMS: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
-pub const ACTION_TYPE: &str = "Either<((u256, Signature, Signature), (u256, Signature, Signature)), Either<(Signature, Signature), Signature>>";
+
+fn word(bytes: &[u8; 32]) -> Action {
+    UIntValue::try_from(bytes.as_slice())
+        .expect("32-byte word")
+        .into()
+}
+
+fn signature_type() -> ResolvedType {
+    ResolvedType::array(ResolvedType::u8(), 64)
+}
+
+fn authorization_type() -> ResolvedType {
+    ResolvedType::tuple([ResolvedType::u256(), signature_type(), signature_type()])
+}
+
+fn evidence_type() -> ResolvedType {
+    ResolvedType::tuple([authorization_type(), authorization_type()])
+}
+
+fn release_type() -> ResolvedType {
+    ResolvedType::either(
+        ResolvedType::tuple([signature_type(), signature_type()]),
+        signature_type(),
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -63,25 +92,36 @@ impl Config {
 
     pub fn compile(&self) -> Result<Bond, String> {
         self.validate()?;
-        let word = |bytes: &[u8]| serde_json::json!({"type": "u256", "value": format!("0x{}", hex::encode(bytes))});
-        let number = |n: u64, ty: &str| serde_json::json!({"type": ty, "value": n.to_string()});
-        let args: Arguments = serde_json::from_str(
-            &serde_json::json!({
-                "DOMAIN": word(sha256::Hash::hash(RECEIPT_DOMAIN).as_byte_array()),
-                "GENESIS": word(self.genesis.as_byte_array()),
-                "FEE_ASSET": word(&self.fee_asset.into_inner().to_byte_array()),
-                "OWNER": word(&self.owner.serialize()),
-                "MATCHER": word(&self.matcher.serialize()),
-                "PROTECTED_TXID": word(self.protected_output.txid.as_byte_array()),
-                "PROTECTED_VOUT": number(self.protected_output.vout.into(), "u32"),
-                "EPOCH": number(self.epoch, "u64"),
-                "COLLATERAL": number(self.collateral, "u64"),
-                "ACTIVE_UNTIL": number(self.active_until.into(), "u32"),
-                "REFUND_HEIGHT": number(self.refund_height.into(), "u32"),
-            })
-            .to_string(),
-        )
-        .map_err(|e| e.to_string())?;
+        let args = Arguments::from(
+            [
+                (
+                    "DOMAIN",
+                    word(sha256::Hash::hash(RECEIPT_DOMAIN).as_byte_array()),
+                ),
+                ("GENESIS", word(self.genesis.as_byte_array())),
+                (
+                    "FEE_ASSET",
+                    word(&self.fee_asset.into_inner().to_byte_array()),
+                ),
+                ("OWNER", word(&self.owner.serialize())),
+                ("MATCHER", word(&self.matcher.serialize())),
+                (
+                    "PROTECTED_TXID",
+                    word(self.protected_output.txid.as_byte_array()),
+                ),
+                (
+                    "PROTECTED_VOUT",
+                    UIntValue::from(self.protected_output.vout).into(),
+                ),
+                ("EPOCH", UIntValue::from(self.epoch).into()),
+                ("COLLATERAL", UIntValue::from(self.collateral).into()),
+                ("ACTIVE_UNTIL", UIntValue::from(self.active_until).into()),
+                ("REFUND_HEIGHT", UIntValue::from(self.refund_height).into()),
+            ]
+            .into_iter()
+            .map(|(name, value)| (WitnessName::from_str_unchecked(name), value))
+            .collect::<std::collections::HashMap<_, _>>(),
+        );
         let program = CompiledProgram::new(
             CONTRACT,
             args,
@@ -219,15 +259,13 @@ impl Bond {
     pub fn satisfy(
         &self,
         env: &ElementsEnv<Arc<Transaction>>,
-        action: &str,
+        action: &Action,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let witness: WitnessValues = serde_json::from_str(
-            &serde_json::json!({
-                "ACTION": {"type": ACTION_TYPE, "value": action}
-            })
-            .to_string(),
-        )
-        .map_err(|e| e.to_string())?;
+        let witness = WitnessValues::from(
+            [(WitnessName::from_str_unchecked("ACTION"), action.clone())]
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        );
         let satisfied = self.program.satisfy_with_env(witness, Some(env))?;
         let redeem = satisfied.redeem();
         let mut machine = BitMachine::for_program(redeem).map_err(|e| e.to_string())?;
@@ -250,42 +288,80 @@ pub struct Authorization {
 }
 
 impl Authorization {
-    fn witness(&self) -> String {
-        format!(
-            "(0x{}, 0x{}, 0x{})",
-            hex::encode(self.spend_txid.as_byte_array()),
-            hex::encode(self.owner_signature),
-            hex::encode(self.matcher_signature)
-        )
+    fn witness(&self) -> Action {
+        Action::tuple([
+            word(self.spend_txid.as_byte_array()),
+            Action::byte_array(self.owner_signature),
+            Action::byte_array(self.matcher_signature),
+        ])
     }
 }
 
-pub fn penalty_action(first: &Authorization, second: &Authorization) -> String {
-    format!("Left(({}, {}))", first.witness(), second.witness())
-}
-
-pub fn cooperative_action(owner: &[u8; 64], matcher: &[u8; 64]) -> String {
-    format!(
-        "Right(Left((0x{}, 0x{})))",
-        hex::encode(owner),
-        hex::encode(matcher)
+pub fn penalty_action(first: &Authorization, second: &Authorization) -> Action {
+    Action::left(
+        Action::tuple([first.witness(), second.witness()]),
+        release_type(),
     )
 }
 
-pub fn unilateral_action(owner: &[u8; 64]) -> String {
-    format!("Right(Right(0x{}))", hex::encode(owner))
+pub fn cooperative_action(owner: &[u8; 64], matcher: &[u8; 64]) -> Action {
+    Action::right(
+        evidence_type(),
+        Action::left(
+            Action::tuple([Action::byte_array(*owner), Action::byte_array(*matcher)]),
+            signature_type(),
+        ),
+    )
 }
 
-/// Validate the certificate subject before requesting signatures. This is a
-/// necessary structural check, not full transaction/script/UTXO validation.
+pub fn unilateral_action(owner: &[u8; 64]) -> Action {
+    Action::right(
+        evidence_type(),
+        Action::right(
+            ResolvedType::tuple([signature_type(), signature_type()]),
+            Action::byte_array(*owner),
+        ),
+    )
+}
+
+/// Apply the prototype's subject restrictions, then ask the configured node to
+/// validate the exact serialized transaction. The existing elements-cli handles
+/// RPC authentication/transport. Supply a trusted executable and network/datadir
+/// arguments, never an untrusted command. No transaction is broadcast.
+/// Acceptance is a point-in-time mempool check, not a reservation or finality.
 pub fn check_authorized_transaction(
     protected: OutPoint,
     tx: &Transaction,
+    mut node_cli: Command,
 ) -> Result<elements::Txid, String> {
-    if protected.is_null() || tx.output.is_empty() {
-        return Err(
-            "authorization requires a non-null protected output and transaction outputs".into(),
-        );
+    check_authorization_subject(protected, tx)?;
+    let raw = hex::encode(elements::encode::serialize(tx));
+    let output = node_cli
+        .arg("testmempoolaccept")
+        .arg(serde_json::to_string(&[raw]).map_err(|e| e.to_string())?)
+        .arg("0") // No local fee ceiling; this RPC does not broadcast or pay fees.
+        .output()
+        .map_err(|e| format!("node validation unavailable: {e}"))?;
+    if !output.status.success() {
+        // Do not echo command arguments/stderr, which can contain credentials.
+        return Err("node validation RPC failed".into());
+    }
+    let results: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).map_err(|_| "invalid node validation response")?;
+    if results.len() != 1
+        || results[0]["allowed"].as_bool() != Some(true)
+        || results[0]["txid"].as_str() != Some(tx.txid().to_string().as_str())
+    {
+        return Err("node did not accept the authorization transaction".into());
+    }
+    Ok(tx.txid())
+}
+
+/// Application restrictions only. NOT a transaction-validity check; use
+/// check_authorized_transaction before requesting either signature.
+pub fn check_authorization_subject(protected: OutPoint, tx: &Transaction) -> Result<(), String> {
+    if protected.is_null() {
+        return Err("authorization requires a non-null protected output".into());
     }
     if tx
         .input
@@ -299,13 +375,5 @@ pub fn check_authorized_transaction(
     if tx.input.iter().any(|i| i.is_pegin || i.has_issuance()) {
         return Err("pegin and issuance are outside this authorization prototype".into());
     }
-    let mut outpoints = std::collections::HashSet::new();
-    if tx
-        .input
-        .iter()
-        .any(|i| i.previous_output.is_null() || !outpoints.insert(i.previous_output))
-    {
-        return Err("null or duplicate input outpoint".into());
-    }
-    Ok(tx.txid())
+    Ok(())
 }

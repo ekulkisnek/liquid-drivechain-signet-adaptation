@@ -3,10 +3,12 @@
 mod common;
 use common::*;
 use elements::{encode, hashes::Hash, Transaction};
-use elementsplus_preconf::{cooperative_action, elements, penalty_action, unilateral_action};
+use elementsplus_preconf::{
+    cooperative_action, elements, penalty_action, unilateral_action, Action,
+};
 use serde_json::{json, Value};
 
-fn fixture(name: &str, mut tx: Transaction, action: &str) -> Value {
+fn fixture(name: &str, mut tx: Transaction, action: &Action) -> Value {
     let env = env_for(bond(), tx.clone());
     let stack = bond().satisfy(&env, action).expect("valid fixture");
     tx.input[0].witness.script_witness = stack.clone();
