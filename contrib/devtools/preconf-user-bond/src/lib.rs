@@ -3,6 +3,10 @@
 //! Optional transaction validation delegates to a caller-configured node CLI.
 //! See PROTOCOL.md for the deliberately restricted, fixed-session trust model.
 
+pub mod operator;
+#[cfg(feature = "relay")]
+pub mod relay;
+
 use std::{process::Command, str::FromStr, sync::Arc};
 
 use elements::{
@@ -37,6 +41,68 @@ fn word(bytes: &[u8; 32]) -> Action {
 
 fn signature_type() -> ResolvedType {
     ResolvedType::array(ResolvedType::u8(), 64)
+}
+
+// Both bond protocols use the same single-leaf, NUMS-key spending machinery.
+fn bond_taproot(cmr: Cmr) -> Result<(Script, ControlBlock), String> {
+    let leaf = Script::from(cmr.as_ref().to_vec());
+    let info = TaprootBuilder::new()
+        .add_leaf_with_ver(0, leaf.clone(), simplicity::leaf_version())
+        .map_err(|e| e.to_string())?
+        .finalize(
+            &Secp256k1::verification_only(),
+            XOnlyPublicKey::from_str(NUMS).map_err(|e| e.to_string())?,
+        )
+        .map_err(|_| "cannot finalize single-leaf Taproot tree")?;
+    let control = info
+        .control_block(&(leaf, simplicity::leaf_version()))
+        .ok_or("missing single-leaf control block")?;
+    Ok((Script::new_v1_p2tr_tweaked(info.output_key()), control))
+}
+
+fn bond_environment(
+    tx: Transaction,
+    utxos: Vec<ElementsUtxo>,
+    genesis: BlockHash,
+    cmr: Cmr,
+    control: &ControlBlock,
+) -> Result<ElementsEnv<Arc<Transaction>>, String> {
+    if tx.input.is_empty() || utxos.len() != tx.input.len() {
+        return Err("one authenticated UTXO description per input is required".into());
+    }
+    Ok(ElementsEnv::new(
+        Arc::new(tx),
+        utxos,
+        0,
+        cmr,
+        control.clone(),
+        None,
+        genesis,
+    ))
+}
+
+fn satisfy_bond(
+    program: &CompiledProgram,
+    control: &ControlBlock,
+    env: &ElementsEnv<Arc<Transaction>>,
+    action: &Action,
+) -> Result<Vec<Vec<u8>>, String> {
+    let witness = WitnessValues::from(
+        [(WitnessName::from_str_unchecked("ACTION"), action.clone())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
+    let satisfied = program.satisfy_with_env(witness, Some(env))?;
+    let redeem = satisfied.redeem();
+    let mut machine = BitMachine::for_program(redeem).map_err(|e| e.to_string())?;
+    machine.exec(redeem, env).map_err(|e| e.to_string())?;
+    let (encoded, witness) = redeem.to_vec_with_witness();
+    Ok(vec![
+        witness,
+        encoded,
+        program.commit().cmr().as_ref().to_vec(),
+        control.serialize(),
+    ])
 }
 
 fn authorization_type() -> ResolvedType {
@@ -129,24 +195,12 @@ impl Config {
             Box::new(simplicityhl::ast::ElementsJetHinter),
         )?;
         let cmr = program.commit().cmr();
-        let leaf = Script::from(cmr.as_ref().to_vec());
-        let tree = TaprootBuilder::new()
-            .add_leaf_with_ver(0, leaf.clone(), simplicity::leaf_version())
-            .map_err(|e| e.to_string())?;
-        let info = tree
-            .finalize(
-                &Secp256k1::verification_only(),
-                XOnlyPublicKey::from_str(NUMS).map_err(|e| e.to_string())?,
-            )
-            .map_err(|_| "cannot finalize single-leaf Taproot tree")?;
-        let control = info
-            .control_block(&(leaf, simplicity::leaf_version()))
-            .ok_or("missing single-leaf control block")?;
+        let (script_pubkey, control) = bond_taproot(cmr)?;
         Ok(Bond {
             config: self.clone(),
             program,
             cmr,
-            script_pubkey: Script::new_v1_p2tr_tweaked(info.output_key()),
+            script_pubkey,
             control,
         })
     }
@@ -239,18 +293,7 @@ impl Bond {
         utxos: Vec<ElementsUtxo>,
         genesis: BlockHash,
     ) -> Result<ElementsEnv<Arc<Transaction>>, String> {
-        if tx.input.is_empty() || utxos.len() != tx.input.len() {
-            return Err("one authenticated UTXO description per input is required".into());
-        }
-        Ok(ElementsEnv::new(
-            Arc::new(tx),
-            utxos,
-            0,
-            self.cmr,
-            self.control.clone(),
-            None,
-            genesis,
-        ))
+        bond_environment(tx, utxos, genesis, self.cmr, &self.control)
     }
 
     /// Compile, prune and execute the actual Simplicity program. Return its
@@ -261,22 +304,7 @@ impl Bond {
         env: &ElementsEnv<Arc<Transaction>>,
         action: &Action,
     ) -> Result<Vec<Vec<u8>>, String> {
-        let witness = WitnessValues::from(
-            [(WitnessName::from_str_unchecked("ACTION"), action.clone())]
-                .into_iter()
-                .collect::<std::collections::HashMap<_, _>>(),
-        );
-        let satisfied = self.program.satisfy_with_env(witness, Some(env))?;
-        let redeem = satisfied.redeem();
-        let mut machine = BitMachine::for_program(redeem).map_err(|e| e.to_string())?;
-        machine.exec(redeem, env).map_err(|e| e.to_string())?;
-        let (program, witness) = redeem.to_vec_with_witness();
-        Ok(vec![
-            witness,
-            program,
-            self.cmr.as_ref().to_vec(),
-            self.control.serialize(),
-        ])
+        satisfy_bond(&self.program, &self.control, env, action)
     }
 }
 

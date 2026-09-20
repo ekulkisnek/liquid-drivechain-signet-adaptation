@@ -28,6 +28,10 @@ fn main() {
         );
         return;
     }
+    if r["operator"] == true {
+        println!("{}", operator_fixture(&r, protected));
+        return;
+    }
     let mut c = config();
     c.genesis = r["genesis"].as_str().unwrap().parse().unwrap();
     c.fee_asset = r["asset"].as_str().unwrap().parse().unwrap();
@@ -65,4 +69,43 @@ fn main() {
     };
     tx.input[0].witness.script_witness = b.satisfy(&env_for(&b, tx.clone()), &action).unwrap();
     println!("{}", json!({"hex": hex::encode(encode::serialize(&tx))}));
+}
+
+fn operator_fixture(r: &Value, protected: OutPoint) -> Value {
+    use common::operator::{config, env_for};
+    use elementsplus_preconf::operator::{penalty_action, refund_action, Receipt};
+    let mut c = config();
+    c.genesis = r["genesis"].as_str().unwrap().parse().unwrap();
+    c.fee_asset = r["asset"].as_str().unwrap().parse().unwrap();
+    c.protected_output = protected;
+    c.active_until = r["active_until"].as_u64().unwrap() as u32;
+    c.refund_height = c.active_until + 10;
+    let b = c.compile().unwrap();
+    if r["op"] == "script" {
+        return json!({"script":hex::encode(b.script_pubkey().as_bytes())});
+    }
+    let outpoint = r["bond"].as_str().unwrap().parse().unwrap();
+    let mut tx = b.penalty_transaction(outpoint).unwrap();
+    let action = if r["op"] == "penalty" {
+        let promise = |field: &str| {
+            let txid = r[field].as_str().unwrap().parse().unwrap();
+            Receipt {
+                bond: outpoint,
+                txid,
+                signature: sign(b.digest(outpoint, txid), 2),
+            }
+        };
+        penalty_action(&promise("txid_a"), &promise("txid_b")).unwrap()
+    } else {
+        assert_eq!(r["op"], "unilateral");
+        tx.lock_time = elements::LockTime::from_height(c.refund_height).unwrap();
+        let mut output = b.funding_output();
+        output.script_pubkey =
+            Script::from(hex::decode(r["destination"].as_str().unwrap()).unwrap());
+        output.value = elements::confidential::Value::Explicit(c.collateral - 500);
+        tx.output = vec![output, elements::TxOut::new_fee(500, c.fee_asset)];
+        refund_action(&sign(sighash(&env_for(&b, tx.clone())), 2))
+    };
+    tx.input[0].witness.script_witness = b.satisfy(&env_for(&b, tx.clone()), &action).unwrap();
+    json!({"hex":hex::encode(encode::serialize(&tx))})
 }

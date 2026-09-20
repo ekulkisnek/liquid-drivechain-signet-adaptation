@@ -21,6 +21,7 @@ class BondTest(BitcoinTestFramework):
 
     def add_options(self, parser):
         parser.add_argument("--fixture", required=True, help="Built regtest Rust example")
+        parser.add_argument("--operator", action="store_true", help="Exercise the separate preconfer-funded bond")
 
     def run_test(self):
         node = self.nodes[0]
@@ -29,7 +30,7 @@ class BondTest(BitcoinTestFramework):
         protected = wallet.get_utxo()
         a = wallet.create_self_transfer(utxo_to_spend=protected)
         b = wallet.create_self_transfer(utxo_to_spend=protected, fee_rate=Decimal("0.004"))
-        context = dict(chain="elementsregtest", genesis=node.getblockhash(0),
+        context = dict(chain="elementsregtest", operator=self.options.operator, genesis=node.getblockhash(0),
                        asset=node.getsidechaininfo()["pegged_asset"],
                        protected=f"{protected['txid']}:{protected['vout']}",
                        active_until=node.getblockcount() + 20,
@@ -47,14 +48,15 @@ class BondTest(BitcoinTestFramework):
         invalid.vout[0].nValue.setToAmount(10000000000000)
         assert "error" in fixture("validate", hex=invalid.serialize().hex())
         script = bytes.fromhex(fixture("script")["script"])
-        bonds = [wallet.send_to(from_node=node, scriptPubKey=script, amount=100000) for _ in range(3)]
+        paths = ("penalty", "unilateral") if self.options.operator else ("penalty", "unilateral", "cooperative")
+        bonds = [wallet.send_to(from_node=node, scriptPubKey=script, amount=100000) for _ in paths]
         self.generate(wallet, 1)
         raws = {}
-        for op, funding in zip(("penalty", "unilateral", "cooperative"), bonds):
+        for op, funding in zip(paths, bonds):
             raws[op] = fixture(op, bond=f"{funding['txid']}:{funding['sent_vout']}",
                                txid_a=a["txid"], txid_b=b["txid"],
                                destination=wallet.get_output_script().hex())["hex"]
-        for op in ("unilateral", "cooperative"):
+        for op in paths[1:]:
             early = node.testmempoolaccept([raws[op]], 0)[0]
             assert not early["allowed"]
             assert_equal(early["reject-reason"], "non-final")
@@ -67,11 +69,12 @@ class BondTest(BitcoinTestFramework):
         stack[-1] = bytes(control)
         assert not node.testmempoolaccept([malformed.serialize().hex()], 0)[0]["allowed"]
         penalty_id = node.sendrawtransaction(raws["penalty"], 0)
+        assert_equal(node.getmempoolentry(penalty_id)["fees"]["base"], Decimal("0.001"))
         mined = self.generate(wallet, 1)
         assert penalty_id in node.getblock(mined[0])["tx"]
         self.generate(wallet, context["active_until"] + 11 - node.getblockcount())
         recovered = []
-        for op in ("unilateral", "cooperative"):
+        for op in paths[1:]:
             assert node.testmempoolaccept([raws[op]], 0)[0]["allowed"]
             recovered.append(node.sendrawtransaction(raws[op], 0))
         mined = self.generate(wallet, 1)

@@ -1,5 +1,5 @@
 // Build and exercise the actual pinned fork interpreter without touching a node.
-// Usage: node scripts/check-fork.mjs /path/to/liquid-drivechain-signet-adaptation
+// Usage: node scripts/check-fork.mjs /path/to/node [vectors|operator_vectors]
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, realpathSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-if (process.argv.length !== 3) throw new Error('Pass a checkout of JK\'s node as the only argument');
+if (process.argv.length < 3 || process.argv.length > 4) throw new Error('Pass node checkout and optional fixture example');
+const example = process.argv[3] ?? 'vectors';
+assert.ok(['vectors', 'operator_vectors'].includes(example), 'unknown fixture example');
 const node = realpathSync(process.argv[2]);
 const expected = '4041a8ba5d9c0870dbe22c188bce28410c10348a';
 function run(command, args, options = {}) {
@@ -30,7 +32,7 @@ const executable = join(target, 'verify');
 run('cc', ['-std=c11','-O2','-DPRODUCTION', '-I',join(node,'src/simplicity/include'),
   join(root,'tests/fork_vm.c'), ...sources.map(s => join(node, 'src/simplicity', `${s}.c`)),
   '-o', executable]);
-const fixtures = JSON.parse(run('cargo', ['run', '--locked', '--quiet', '--example', 'vectors']));
+const fixtures = JSON.parse(run('cargo', ['run', '--locked', '--quiet', '--example', example]));
 
 const u32 = n => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
 const blob = h => {

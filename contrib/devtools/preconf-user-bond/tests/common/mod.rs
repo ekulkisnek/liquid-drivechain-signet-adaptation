@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub mod operator;
 // Public, deterministic TEST KEYS ONLY. Never fund these on any network.
 use elements::{
     confidential,

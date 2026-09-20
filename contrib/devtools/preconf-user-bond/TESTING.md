@@ -1,5 +1,76 @@
 # Test scope
 
+## Shared bond machinery follow-up (macOS ARM64, 2026-09-20)
+
+Both protocols now reuse the original bond's NUMS Taproot construction,
+execution-environment validation and Simplicity satisfaction/witness encoding.
+Contract source, signature domains and public APIs are unchanged. Canonical
+wire parsing remains separate to retain its strict encoding checks.
+
+- `cargo test --locked --all-features`: **39 passed**; default features:
+  **33 passed**, including both protocols' UTXO-description cardinality checks.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+  rustfmt and whitespace checks: passed with Rust 1.97.1.
+- `node --test client/*.test.mjs`: **10 passed**, including real relay processes.
+- Pinned-fork interpreter: **12 operator + 15 original checks passed**;
+  both pinned CMRs and execution budgets remain unchanged.
+- No full-node regtest rerun or live-network transaction in this follow-up.
+  Repository-wide node CI failures are not resolved by this tools-only change.
+
+## Operator-bond/realtime follow-up (Linux, 2026-09-20)
+
+- `cargo test --locked --all-features`: **38 passed** (23 existing + 9 operator
+  covenant/wire tests + 6 relay/store/live-WebSocket tests).
+- Clippy with `--all-targets --all-features -- -D warnings`, default-feature
+  Clippy, rustfmt and `git diff --check`: passed.
+- `cargo audit --json`: zero known vulnerabilities or informational warnings in
+  191 locked dependencies, RustSec DB `d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16`
+  (updated September 19). This is a dependency advisory scan, not a security audit.
+- `node --test client/*.test.mjs`: **10 passed**. Nine monitor state-machine
+  cases plus two actual relay subprocesses using browser-compatible WebSocket:
+  live fanout, relay shutdown, conflict while disconnected, restart on the same
+  journal/port, resumed replay, and retained cross-relay evidence.
+- Native pinned-fork interpreter: **12 operator checks + 15 original checks**
+  passed. No verifier stubs; witness-size-based budget enforced.
+- Operator fixture CMR:
+  `b164ef4f9ccce13340a323c40daa12a2b97ed13f1403b0f3f954abb458c11040`.
+  Penalty: 936 program bytes, 193 witness bytes, 1,302 serialized transaction
+  bytes, accepted within the **1,251 WU execution budget**. Synthetic, not live.
+- Funded full-node `scripts/check-node.py --operator`: passed against existing
+  functional-test binaries from clean node source `4041a8ba5d9c`. Confirmed bond
+  UTXOs, both principal proposals validated, premature refund rejected, penalty
+  accepted/mined with exactly 0.001 native asset as fee, corrupt control block
+  rejected, preconfer refund accepted/mined after expiry, collateral consumed,
+  principal-spend invalidation across restart and stopped-node fail-closed checks.
+- Original funded user-bond functional test rerun without `--operator`: passed.
+  These use fresh isolated regtest datadirs, not the live node or real funds.
+
+Reproduce the follow-up from this crate:
+
+```sh
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo build --locked --features relay --bin preconf-relay \
+  --example operator_vectors --example regtest
+node --test client/*.test.mjs
+node scripts/check-fork.mjs ../../.. operator_vectors
+node scripts/check-fork.mjs ../../..
+```
+
+Use the full-node command below with an unused tmpdir and add `--operator` for
+the new contract. Point `BITCOIND`/`BITCOINCLI` at the dedicated functional-test
+binaries if the generated config otherwise selects production binaries.
+
+The JavaScript tests use explicit fixture-whitelist verifier callbacks for
+transport/state tests. **That is not browser cryptographic verification.** Real
+BIP340 verification is exercised in the Rust verifier, covenant/interpreter and
+node tests. A real wallet must wire its crypto implementation into the required
+callback before using the reference monitor. No production extension integration,
+live signing service, on-chain relay admission, TLS proxy deployment, economic
+safety, adversarial reorg/partition protocol or independent audit is claimed.
+
 ## Recorded local run
 
 - `cargo test --locked`: **23 passed** on macOS (22 covenant tests plus one

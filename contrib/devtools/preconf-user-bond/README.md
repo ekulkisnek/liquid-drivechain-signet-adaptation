@@ -12,6 +12,11 @@ test broadcasts only to its disposable regtest node. All examples use public
 deterministic test keys; `vectors` uses an invented genesis and asset.
 **Do not fund the example addresses.**
 
+The separate [operator-bond and realtime relay follow-up](OPERATOR-RELAY.md)
+adds **preconfer-funded** collateral, a persistent WebSocket receipt pool/peer
+relay, and a browser monitoring reference client. It does not reinterpret this
+original user-bond contract or change the node's consensus/P2P behavior.
+
 ## What is implemented
 
 - A readable [SimplicityHL covenant](contracts/user_bond.simf), compiled to actual
