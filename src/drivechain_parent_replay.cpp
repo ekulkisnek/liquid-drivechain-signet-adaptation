@@ -11,6 +11,7 @@
 
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace {
@@ -20,6 +21,18 @@ static constexpr uint8_t DB_REPLAY_TIP{'T'};
 static constexpr uint8_t DB_REPLAY_DEPOSIT{'d'};
 static constexpr uint8_t DB_REPLAY_BMM_EDGE{'e'};
 static constexpr uint8_t DB_REPLAY_SUCCESSFUL_WITHDRAWAL{'w'};
+static constexpr uint8_t DB_REPLAY_WITHDRAWAL_OCCURRENCE{'W'};
+
+uint32_t StoreSchemaVersion(const DrivechainWithdrawalHistoryRule rule)
+{
+    switch (rule) {
+    case DrivechainWithdrawalHistoryRule::UNIQUE_M6ID:
+        return DrivechainParentReplayStore::SCHEMA_VERSION;
+    case DrivechainWithdrawalHistoryRule::ALLOW_REPROPOSAL:
+        return DrivechainParentReplayStore::REPROPOSAL_SCHEMA_VERSION;
+    }
+    throw std::invalid_argument("unknown parent replay withdrawal history rule");
+}
 
 struct DrivechainReplayStoreIdentity {
     uint32_t schema_version{0};
@@ -160,6 +173,12 @@ auto SuccessfulWithdrawalKey(const uint8_t sidechain_slot,
         std::make_pair(sidechain_slot, m6id));
 }
 
+auto WithdrawalOccurrenceKey(const uint8_t slot, const uint256& m6id, const uint32_t height)
+{
+    return std::make_pair(DB_REPLAY_WITHDRAWAL_OCCURRENCE,
+        std::make_pair(std::make_pair(slot, m6id), height));
+}
+
 template <typename Key, typename Value>
 DrivechainReplayStoreReadStatus ReadRecord(const CDBWrapper& db,
                                            const Key& key,
@@ -178,9 +197,11 @@ DrivechainReplayStoreReadStatus ReadRecord(const CDBWrapper& db,
 } // namespace
 
 DrivechainParentReplayStore::DrivechainParentReplayStore(
-    fs::path path, const size_t cache_bytes, const bool wipe)
+    fs::path path, const size_t cache_bytes, const bool wipe,
+    const DrivechainWithdrawalHistoryRule history_rule)
     : m_path(std::move(path)),
       m_cache_bytes(cache_bytes),
+      m_schema_version(StoreSchemaVersion(history_rule)),
       m_db(std::make_unique<CDBWrapper>(DBParams{
           .path = m_path, .cache_bytes = m_cache_bytes, .memory_only = false,
           .wipe_data = wipe, .obfuscate = false}))
@@ -213,7 +234,7 @@ DrivechainReplayStoreLoadStatus DrivechainParentReplayStore::Load(
         if (identity_status == DrivechainReplayStoreReadStatus::CORRUPT) {
             return DrivechainReplayStoreLoadStatus::CORRUPT;
         }
-        if (stored_identity.schema_version != SCHEMA_VERSION ||
+        if (stored_identity.schema_version != m_schema_version ||
             stored_identity.identity != identity) {
             SetStoreError(error, "persistent parent replay schema or immutable network identity does not match");
             return DrivechainReplayStoreLoadStatus::IDENTITY_MISMATCH;
@@ -259,7 +280,7 @@ bool DrivechainParentReplayStore::Reset(
             .wipe_data = true, .obfuscate = false});
         CDBBatch batch(*m_db);
         batch.Write(DB_REPLAY_IDENTITY,
-                    DrivechainReplayStoreIdentity{SCHEMA_VERSION, identity});
+                    DrivechainReplayStoreIdentity{m_schema_version, identity});
         batch.Write(DB_REPLAY_TIP, seed);
         if (!m_db->WriteBatch(batch, /*fSync=*/true)) {
             return SetStoreError(error, "failed to atomically seed persistent parent replay");
@@ -291,6 +312,12 @@ bool DrivechainParentReplayStore::Append(
             return SetStoreError(error, "refusing a non-contiguous persistent parent replay append");
         }
 
+        DrivechainReplayStoreIdentity stored_identity;
+        if (ReadRecord(*m_db, DB_REPLAY_IDENTITY, stored_identity, "identity", error) !=
+                DrivechainReplayStoreReadStatus::FOUND ||
+            stored_identity.schema_version != m_schema_version) {
+            return SetStoreError(error, "persistent parent replay append uses the wrong schema");
+        }
         DrivechainParentReplayTip stored_tip;
         const auto tip_status = ReadRecord(
             *m_db, DB_REPLAY_TIP, stored_tip, "tip", error);
@@ -328,8 +355,11 @@ bool DrivechainParentReplayStore::Append(
                 withdrawal.block_height != next.height ||
                 withdrawal.block_hash != next.hash ||
                 !block_withdrawals.insert(identity).second ||
-                m_db->Exists(SuccessfulWithdrawalKey(
-                    withdrawal.sidechain_slot, withdrawal.m6id))) {
+                (m_schema_version == SCHEMA_VERSION &&
+                 m_db->Exists(SuccessfulWithdrawalKey(
+                    withdrawal.sidechain_slot, withdrawal.m6id))) ||
+                m_db->Exists(WithdrawalOccurrenceKey(withdrawal.sidechain_slot,
+                    withdrawal.m6id, withdrawal.block_height))) {
                 return SetStoreError(
                     error,
                     "persistent parent replay append contains a duplicate or malformed successful withdrawal");
@@ -344,7 +374,7 @@ bool DrivechainParentReplayStore::Append(
                     error,
                     "persistent parent replay append contains a duplicate M3 proposal identity");
             }
-            if (m_db->Exists(SuccessfulWithdrawalKey(
+            if (m_schema_version == SCHEMA_VERSION && m_db->Exists(SuccessfulWithdrawalKey(
                     proposal.sidechain_slot, proposal.m6id))) {
                 return SetStoreError(
                     error,
@@ -360,10 +390,12 @@ bool DrivechainParentReplayStore::Append(
             batch.Write(std::make_pair(DB_REPLAY_BMM_EDGE, edge->first), edge->second);
         }
         for (const auto& withdrawal : successful_withdrawals) {
-            batch.Write(
-                SuccessfulWithdrawalKey(
-                    withdrawal.sidechain_slot, withdrawal.m6id),
-                withdrawal);
+            const auto key = SuccessfulWithdrawalKey(withdrawal.sidechain_slot, withdrawal.m6id);
+            if (!m_db->Exists(key)) batch.Write(key, withdrawal);
+            if (m_schema_version == REPROPOSAL_SCHEMA_VERSION) {
+                batch.Write(WithdrawalOccurrenceKey(withdrawal.sidechain_slot,
+                    withdrawal.m6id, withdrawal.block_height), withdrawal);
+            }
         }
         batch.Write(DB_REPLAY_TIP, next);
         if (!m_db->WriteBatch(batch, /*fSync=*/true)) {
@@ -457,6 +489,33 @@ DrivechainParentReplayStore::ReadSuccessfulWithdrawal(
         SetStoreError(error, strprintf(
                                  "persistent parent replay successful-withdrawal read failed: %s",
                                  e.what()));
+        return DrivechainReplayStoreReadStatus::CORRUPT;
+    }
+}
+
+DrivechainReplayStoreReadStatus
+DrivechainParentReplayStore::ReadSuccessfulWithdrawalAtHeight(
+    const uint8_t sidechain_slot, const uint256& m6id, const uint32_t height,
+    DrivechainSuccessfulWithdrawal& withdrawal, std::string* error) const
+{
+    if (!m_db || m_schema_version != REPROPOSAL_SCHEMA_VERSION) {
+        SetStoreError(error, "withdrawal occurrence lookup requires the re-proposal replay schema");
+        return DrivechainReplayStoreReadStatus::CORRUPT;
+    }
+    try {
+        const auto status = ReadRecord(*m_db,
+            WithdrawalOccurrenceKey(sidechain_slot, m6id, height), withdrawal,
+            "withdrawal occurrence", error);
+        if (status == DrivechainReplayStoreReadStatus::FOUND &&
+            (!IsSaneSuccessfulWithdrawal(withdrawal) ||
+             withdrawal.sidechain_slot != sidechain_slot || withdrawal.m6id != m6id ||
+             withdrawal.block_height != height)) {
+            SetStoreError(error, "persistent parent replay withdrawal occurrence is internally inconsistent");
+            return DrivechainReplayStoreReadStatus::CORRUPT;
+        }
+        return status;
+    } catch (const std::exception& e) {
+        SetStoreError(error, strprintf("withdrawal occurrence read failed: %s", e.what()));
         return DrivechainReplayStoreReadStatus::CORRUPT;
     }
 }

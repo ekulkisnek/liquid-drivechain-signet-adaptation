@@ -6,7 +6,9 @@ from pathlib import Path
 
 from elements_identity_refreeze import (
     Header, IDENTITY_HEADER, ALPHA_CHECKPOINT, assert_current_v7,
-    calculate_v11, calculate_alphanet_v11,
+    calculate_v11, calculate_alphanet_v11, calculate_betanet_v11,
+    betanet_bootstrap_commitment, hash256, sha256, BETANET_LOCAL_RULE_DOMAIN,
+    indexer_bindings,
 )
 
 CURRENT_CONTROLLER_PROGRAM_ID = "4e44d18d512d561128dae53d10bee2b36bd5390d1e4c4b72688464ea544943ec"
@@ -15,12 +17,232 @@ CURRENT_VERIFIER_ID = "6b0292570fa120ae885743a391eba18a1e530455284648cfde30dc28b
 CURRENT_PROFILE_ID = "6fd5a5e55769320cc1c6a497644d0bc7a642eed8442ab1703af304cfac253d25"
 HISTORICAL_CONTROLLER_PROGRAM_ID = "4f0511103dab14b61dd5b1403d077ba10d28a89a06dbb54d43e9683542c1df08"
 HISTORICAL_BCC6_VERIFIER_ID = "bcc6da9b30af2591d948533493291bd5543da448a3270ba99b1de0ade64e1711"
+ALPHA_IDENTITY_HEADER = Path(IDENTITY_HEADER).with_name("elements_drivechain_identity.alphanet.v2.h")
+
+
+def replace_field(header: Header, name: str, value) -> None:
+    pattern = rf"(inline constexpr [^;{{}}]+\s+{re.escape(name)}(?:\[\])?\s*\{{)[^{{}};]*(\}};)"
+    encoded = f'"{value}"' if isinstance(value, str) else str(value)
+    header.text, count = re.subn(pattern, lambda m: m[1] + encoded + m[2], header.text, count=1)
+    if count != 1:
+        raise AssertionError(f"fixture field not found: {name}")
+
+
+class BetanetIdentityCandidateTests(unittest.TestCase):
+    def setUp(self):
+        # Synthetic boundary values, never a deployable parent checkpoint.
+        self.header = Header(IDENTITY_HEADER)
+        self.header.text = self.header.text.replace(
+            "BETANET_FREEBANK_TEST_PROFILE{true}", "BETANET_FREEBANK_TEST_PROFILE{false}")
+        for name, value in {
+            "SIDECHAIN_SLOT": 130,
+            "P2P_MAGIC_DOMAIN": "ecash-elements-drivechain-betanet-p2p-v1",
+            "DATA_DIR": "elements-betanet-v1",
+            "PARENT_CHECKPOINT_HEIGHT": 967679,
+            "PARENT_CHECKPOINT_HASH": "11" * 32,
+            "PARENT_CHECKPOINT_CHAINWORK": "22" * 32,
+            "PARENT_REPLAY_VERSION": 5,
+            "BIP300301_LOCAL_RULE_DOMAIN": BETANET_LOCAL_RULE_DOMAIN,
+            "BIP300301_LOCAL_RULE_ID": sha256(BETANET_LOCAL_RULE_DOMAIN.encode("ascii")).hex(),
+            "UNUSED_PROPOSAL_MAX_AGE": 2016,
+            "UNUSED_ACTIVATION_THRESHOLD": 1008,
+            "USED_PROPOSAL_MAX_AGE": 26300,
+            "USED_ACTIVATION_THRESHOLD": 13150,
+            "WITHDRAWAL_BUNDLE_MAX_AGE": 26300,
+            "WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD": 13150,
+        }.items():
+            replace_field(self.header, name, value)
+        self.rebind_bootstrap()
+
+    def rebind_bootstrap(self):
+        replace_field(self.header, "PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT",
+                      betanet_bootstrap_commitment(self.header))
+
+    def test_candidate_is_distinct_and_deterministic(self):
+        result = calculate_betanet_v11(self.header)
+        self.assertEqual(result, calculate_betanet_v11(self.header))
+        old = calculate_alphanet_v11(Header(ALPHA_IDENTITY_HEADER))
+        for field in ("protocol_manifest_hash", "proposal_hash", "identity_commitment",
+                      "pegged_asset", "genesis_hash", "p2p_message_start", "data_dir"):
+            with self.subTest(field=field):
+                self.assertNotEqual(getattr(result, field), getattr(old, field))
+        self.assertEqual(result.parent_replay_version, 5)
+        self.assertEqual(result.used_slot_m2_votes_required, 13151)
+        self.assertTrue(result.parent_activation_required)
+        self.assertFalse(result.future_parent_milestones_committed)
+        self.assertIn(b"sequential M6", bytes.fromhex(result.proposal_description_hex))
+        self.assertIn(b"slot 130", bytes.fromhex(result.proposal_description_hex))
+        self.assertEqual(result.p2p_message_start,
+                         hash256(result.p2p_magic_domain.encode())[:4].hex())
+
+    def test_alpha_is_not_a_beta_candidate(self):
+        with self.assertRaises(ValueError):
+            calculate_betanet_v11(Header(ALPHA_IDENTITY_HEADER))
+        with self.assertRaises(ValueError):
+            calculate_alphanet_v11(self.header)
+
+    def enable_freebank_test(self):
+        self.header.text = self.header.text.replace(
+            "BETANET_FREEBANK_TEST_PROFILE{false}", "BETANET_FREEBANK_TEST_PROFILE{true}")
+
+    def test_freebank_profile_preserves_parent_but_changes_child_identity(self):
+        original = calculate_betanet_v11(self.header)
+        self.enable_freebank_test()
+        result = calculate_betanet_v11(self.header)
+        self.assertEqual(result.proposal_hash,
+                         "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd")
+        self.assertEqual(result.mode, "candidate-v11-betanet-freebank-authorized-test")
+        self.assertEqual(bytes.fromhex(result.proposal_description_hex)[2:10], b"FreeBank")
+        self.assertEqual(result.protocol_manifest_hash, original.protocol_manifest_hash)
+        for field in ("identity_commitment", "genesis_hash", "pegged_asset"):
+            self.assertNotEqual(getattr(result, field), getattr(original, field))
+        self.assertTrue(result.parent_activation_required)
+        # The parent proposal stays fixed, but altered child rules cannot retain
+        # the same genesis/asset merely by sharing that proposal.
+        replace_field(self.header, "PEGIN_MIN_DEPTH", self.header.integer("PEGIN_MIN_DEPTH") + 1)
+        changed = calculate_betanet_v11(self.header)
+        self.assertEqual(changed.proposal_hash, result.proposal_hash)
+        self.assertNotEqual(changed.identity_commitment, result.identity_commitment)
+        self.assertNotEqual(changed.genesis_hash, result.genesis_hash)
+
+    def test_freebank_profile_rejects_changed_parent_proposal(self):
+        self.enable_freebank_test()
+        original = self.header.text
+        for name, value in (("BETANET_FREEBANK_PROPOSAL_HEX", "00"),
+                            ("BETANET_FREEBANK_PROPOSAL_HASH", "11" * 32)):
+            self.header.text = original
+            replace_field(self.header, name, value)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "proposal hash mismatch"):
+                calculate_betanet_v11(self.header)
+
+    def test_freebank_profile_rejects_historical_network(self):
+        self.header = Header(ALPHA_IDENTITY_HEADER)
+        self.header.text += "\ninline constexpr bool BETANET_FREEBANK_TEST_PROFILE{true};\n"
+        with self.assertRaisesRegex(ValueError, "requires Betanet"):
+            calculate_alphanet_v11(self.header)
+
+    def test_mixed_parameters_fail_closed(self):
+        original = self.header.text
+        for name, value in {
+            "SIDECHAIN_SLOT": 24, "PARENT_REPLAY_VERSION": 4,
+            "BIP300301_LOCAL_RULE_DOMAIN": "ELEMENTS_SLOT24_SINGLE_M6_PER_PARENT_BLOCK_V1",
+            "BIP300301_LOCAL_RULE_ID": "00" * 32,
+            "PARENT_CHECKPOINT_HEIGHT": 967680,
+            "UNUSED_PROPOSAL_MAX_AGE": 36, "UNUSED_ACTIVATION_THRESHOLD": 30,
+            "USED_PROPOSAL_MAX_AGE": 144, "USED_ACTIVATION_THRESHOLD": 72,
+            "WITHDRAWAL_BUNDLE_MAX_AGE": 144, "WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD": 72,
+            "P2P_MAGIC_DOMAIN": "ecash-elements-drivechain-p2p-v11",
+            "DATA_DIR": "elements-v11", "PARENT_GENESIS": "00" * 32,
+            "PARENT_CHECKPOINT_HASH": ALPHA_CHECKPOINT["PARENT_CHECKPOINT_HASH"],
+            "PARENT_CHECKPOINT_CHAINWORK": "00" * 32,
+            "PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT": "00" * 32,
+            "PARENT_CHECKPOINT_CTIP_TXID": "33" * 32,
+            "PARENT_CHECKPOINT_CTIP_VOUT": 0, "PARENT_CHECKPOINT_CTIP_VALUE": 1,
+            "HISTORICAL_ACTIVATION_HEIGHT": 1,
+        }.items():
+            with self.subTest(name=name):
+                self.header.text = original
+                replace_field(self.header, name, value)
+                with self.assertRaises(ValueError):
+                    calculate_betanet_v11(self.header)
+
+    def test_checkpoint_changes_require_rebinding_and_change_identity(self):
+        old = calculate_betanet_v11(self.header)
+        replace_field(self.header, "PARENT_CHECKPOINT_HASH", "44" * 32)
+        with self.assertRaisesRegex(ValueError, "bootstrap commitment mismatch"):
+            calculate_betanet_v11(self.header)
+        self.rebind_bootstrap()
+        result = calculate_betanet_v11(self.header)
+        self.assertNotEqual(old.genesis_hash, result.genesis_hash)
+        self.assertNotEqual(old.pegged_asset, result.pegged_asset)
+
+    def test_candidate_does_not_pass_frozen_identity_audit(self):
+        result = calculate_betanet_v11(self.header)
+        with self.assertRaisesRegex(ValueError, "independent identity audit failed"):
+            assert_current_v7(self.header, result)
+
+    def test_indexer_export_rejects_alpha_and_unfrozen_beta(self):
+        for header in (Header(ALPHA_IDENTITY_HEADER), self.header):
+            with self.assertRaises(ValueError):
+                indexer_bindings(header)
+
+    def test_indexer_export_exact_bindings_and_mutation_rejection(self):
+        # Freeze only this in-memory synthetic fixture, never the source header.
+        result = calculate_betanet_v11(self.header)
+        for name in ("protocol_manifest_hash", "proposal_description_hex", "proposal_hash",
+                     "identity_commitment", "pegged_asset", "genesis_merkle_root", "genesis_hash"):
+            replace_field(self.header, name.upper(), getattr(result, name))
+        magic = ", ".join(f"0x{value:02x}" for value in bytes.fromhex(result.p2p_message_start))
+        self.header.text, count = re.subn(
+            r"(P2P_MESSAGE_START\{\{)[^}]+(\}\})",
+            lambda match: match[1] + magic + match[2], self.header.text, count=1)
+        self.assertEqual(count, 1)
+        bindings = indexer_bindings(self.header)
+        self.assertEqual(bindings["network"], "betanet")
+        self.assertEqual(bindings["genesis_hash"], result.genesis_hash)
+        self.assertEqual(bindings["native_asset"], result.pegged_asset)
+        self.assertEqual(bindings["data_dir"], "elements-betanet-v1")
+        self.assertEqual(bindings["p2p_magic_u32_le"].to_bytes(4, "little").hex(),
+                         result.p2p_message_start)
+        self.assertEqual(bindings["bech32_hrp"], self.header.string("BECH32_HRP"))
+        self.assertEqual(bindings["blech32_hrp"], self.header.string("BLECH32_HRP"))
+        for name in ("rpc_port", "p2p_port", "pubkey_address_prefix",
+                     "script_address_prefix", "blinded_address_prefix"):
+            with self.subTest(binding=name):
+                self.assertEqual(bindings[name], self.header.integer(name.upper()))
+        original = self.header.text
+        for name in ("GENESIS_HASH", "PEGGED_ASSET", "IDENTITY_COMMITMENT"):
+            with self.subTest(name=name):
+                self.header.text = original
+                replace_field(self.header, name, "00" * 32)
+                with self.assertRaises(ValueError):
+                    indexer_bindings(self.header)
+        for name in ("PUBKEY_ADDRESS_PREFIX", "SCRIPT_ADDRESS_PREFIX",
+                     "BLINDED_ADDRESS_PREFIX", "BECH32_HRP", "BLECH32_HRP"):
+            with self.subTest(address_mutation=name):
+                self.header.text = original
+                value = (self.header.string(name) + "changed" if name.endswith("HRP")
+                         else self.header.integer(name) + 1)
+                replace_field(self.header, name, value)
+                with self.assertRaises(ValueError):
+                    indexer_bindings(self.header)
+
+
+class FrozenBetanetIdentityTests(unittest.TestCase):
+    def test_current_header_reproduces_frozen_identity(self):
+        header = Header(IDENTITY_HEADER)
+        result = calculate_betanet_v11(header)
+        assert_current_v7(header, result)
+        self.assertTrue(header.boolean("BETANET_FREEBANK_TEST_PROFILE"))
+        self.assertEqual(result.mode, "candidate-v11-betanet-freebank-authorized-test")
+        self.assertEqual(result.genesis_hash,
+                         "91e50b1b7e2ddc1b9fc49d9067c8b309ac83045685673bb43f1bad6fac6f6011")
+        self.assertEqual(result.proposal_hash,
+                         "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd")
+        self.assertEqual(header.string("PARENT_CHECKPOINT_HASH"),
+                         "00000000000000000001b58cb69869f6067f0ecb3f2fe0f2263e62ba1ccb0c41")
+        self.assertEqual(header.string("PARENT_CHECKPOINT_CHAINWORK"),
+                         "000000000000000000000000000000000000000148a384d49682843d3c74a5a0")
+        bindings = indexer_bindings(header)
+        self.assertEqual(bindings["sidechain_slot"], 130)
+        self.assertEqual(bindings["genesis_hash"], result.genesis_hash)
+        self.assertEqual(bindings["native_asset"], result.pegged_asset)
+
+    def test_current_header_rejects_unfrozen_changes(self):
+        for name, value in (("MAINCHAIN_RPC_PORT", 18302),
+                            ("BIP300301_ENFORCER_REVISION", "00" * 20),
+                            ("PEGIN_MIN_DEPTH", 1)):
+            with self.subTest(field=name):
+                header = Header(IDENTITY_HEADER)
+                replace_field(header, name, value)
+                with self.assertRaises(ValueError):
+                    indexer_bindings(header)
 
 
 class ElementsIdentityRefreezeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.header_path = Path(IDENTITY_HEADER)
+        cls.header_path = ALPHA_IDENTITY_HEADER
         cls.header = Header(cls.header_path)
         cls.header_text = cls.header_path.read_text(encoding="utf-8")
 

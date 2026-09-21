@@ -26,15 +26,24 @@
 namespace ElementsDrivechainIdentity {
 
 inline constexpr char NETWORK_ID[]{"elements"};
-inline constexpr uint8_t SIDECHAIN_SLOT{24};
+inline constexpr uint8_t SIDECHAIN_SLOT{130};
 
-inline constexpr char P2P_MAGIC_DOMAIN[]{"ecash-elements-drivechain-p2p-v11"};
-inline constexpr std::array<uint8_t, 4> P2P_MESSAGE_START{{0xdf, 0x91, 0xd0, 0x3e}};
+// Explicit operator-authorized Betanet testing on the existing FreeBank slot.
+// Enabling this requires a new frozen child identity/genesis, not a runtime
+// bypass. The exact parent proposal remains authenticated by normal replay.
+inline constexpr bool BETANET_FREEBANK_TEST_PROFILE{true};
+inline constexpr char BETANET_FREEBANK_PROPOSAL_HEX[]{
+    "00084672656542616e6b4372656469742d6372656174696f6e206472697665636861696e202853636f747469736820667265652d62616e6b696e67206c696e6561676529a9e2db51dd8c29f91cf6cc7abba22ebaac94b94755d0faaa212ecf1f9b9d434c23f524e309054966d5f93eb85b656bc7c1cbfae8"};
+inline constexpr char BETANET_FREEBANK_PROPOSAL_HASH[]{
+    "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd"};
+
+inline constexpr char P2P_MAGIC_DOMAIN[]{"ecash-elements-drivechain-betanet-p2p-v1"};
+inline constexpr std::array<uint8_t, 4> P2P_MESSAGE_START{{0x60, 0xb4, 0xef, 0xf4}};
 inline constexpr uint16_t P2P_PORT{7066};
 inline constexpr uint16_t RPC_PORT{7065};
-inline constexpr uint16_t MAINCHAIN_RPC_PORT{18302};
+inline constexpr uint16_t MAINCHAIN_RPC_PORT{28532};
 inline constexpr uint16_t ONION_TARGET_PORT{37066};
-inline constexpr char DATA_DIR[]{"elements-v11"};
+inline constexpr char DATA_DIR[]{"elements-betanet-v1"};
 
 // Canonical child coinbase commitment: OP_RETURN || PUSHBYTES_37 ||
 // "ELMTP" || parent_hash_internal_bytes.
@@ -68,14 +77,14 @@ inline constexpr char PARENT_SIGNET_CHALLENGE[]{
 // Base LayerTwo-Labs/bip300301_enforcer revision whose parent-consensus
 // parsing and state transitions are mirrored by the authenticated replay.
 inline constexpr char BIP300301_ENFORCER_REVISION[]{
-    "86543d13b32865ae629dbc8a373824e2c5aabb51"};
-// Local fail-closed compatibility rule mirrored in the accompanying enforcer:
-// one successful configured-slot M6/CTIP decrease per authenticated parent block.
+    "0e27251ef351a522c72ab9ef079f75e06075390f"};
+// Betanet compatibility rules mirrored in the accompanying enforcer:
+// sequential authenticated M6/CTIP transitions and bundle reproposal.
 // BIP300301_LOCAL_RULE_ID is raw SHA256 of this exact ASCII domain (no NUL).
 inline constexpr char BIP300301_LOCAL_RULE_DOMAIN[]{
-    "ELEMENTS_SLOT24_SINGLE_M6_PER_PARENT_BLOCK_V1"};
+    "ELEMENTS_SLOT130_SEQUENTIAL_M6_REPROPOSAL_V1"};
 inline constexpr char BIP300301_LOCAL_RULE_ID[]{
-    "8975c697c87326520c1c257efaa5995bb8a222f7ec75975bab5de3d98e28f96c"};
+    "028da54356617f26a10daae0fad1715c78322e1a53697d83526b196f7c9e8d94"};
 inline constexpr uint32_t PEGIN_MIN_DEPTH{100};
 
 inline constexpr char GENESIS_STYLE[]{"elements"};
@@ -102,11 +111,11 @@ inline constexpr uint32_t HISTORICAL_ACTIVATION_HEIGHT{0};
 inline constexpr char HISTORICAL_ACTIVATION_BLOCK_HASH[]{
     "0000000000000000000000000000000000000000000000000000000000000000"};
 
-inline constexpr uint32_t PARENT_CHECKPOINT_HEIGHT{995347};
+inline constexpr uint32_t PARENT_CHECKPOINT_HEIGHT{967679};
 inline constexpr char PARENT_CHECKPOINT_HASH[]{
-    "000000000000000002838070eb876cd37738a069528efc82d946fbd25e763152"};
+    "00000000000000000001b58cb69869f6067f0ecb3f2fe0f2263e62ba1ccb0c41"};
 inline constexpr char PARENT_CHECKPOINT_CHAINWORK[]{
-    "0000000000000000000000000000000000000001418d991091e5b78fab4ab500"};
+    "000000000000000000000000000000000000000148a384d49682843d3c74a5a0"};
 inline constexpr char PARENT_CHECKPOINT_CTIP_TXID[]{
     "0000000000000000000000000000000000000000000000000000000000000000"};
 inline constexpr uint32_t PARENT_CHECKPOINT_CTIP_VOUT{4294967295};
@@ -115,15 +124,15 @@ inline constexpr int64_t PARENT_CHECKPOINT_CTIP_VALUE{0};
 // means the legacy genesis-derived bootstrap. A nonzero value is inseparable
 // from the child identity and replay-store identity.
 inline constexpr char PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT[]{
-    "aec8d4df22e27179419118f43b12c9e5a900fa74fdb9ae1683a2c382e6c913b7"};
+    "d03b3b5cb1d1afdb48645d258335fa8407a8ff5d71459568e4ddf419f75b6f5b"};
 
-inline constexpr uint16_t UNUSED_PROPOSAL_MAX_AGE{36};
-inline constexpr uint16_t UNUSED_ACTIVATION_THRESHOLD{30};
-inline constexpr uint16_t USED_PROPOSAL_MAX_AGE{144};
-inline constexpr uint16_t USED_ACTIVATION_THRESHOLD{72};
-inline constexpr uint16_t WITHDRAWAL_BUNDLE_MAX_AGE{144};
-inline constexpr uint16_t WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD{72};
-inline constexpr uint32_t PARENT_REPLAY_VERSION{4};
+inline constexpr uint16_t UNUSED_PROPOSAL_MAX_AGE{2016};
+inline constexpr uint16_t UNUSED_ACTIVATION_THRESHOLD{1008};
+inline constexpr uint16_t USED_PROPOSAL_MAX_AGE{26300};
+inline constexpr uint16_t USED_ACTIVATION_THRESHOLD{13150};
+inline constexpr uint16_t WITHDRAWAL_BUNDLE_MAX_AGE{26300};
+inline constexpr uint16_t WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD{13150};
+inline constexpr uint32_t PARENT_REPLAY_VERSION{5};
 inline constexpr uint32_t ANNEX_FEATURE_VERSION{2};
 inline constexpr uint32_t WITHDRAWAL_ACCUMULATOR_VERSION{1};
 // The BIP301 critical hash is an opaque 32-byte value to the parent enforcer.
@@ -303,19 +312,19 @@ inline constexpr std::array<uint8_t, 32> WITHDRAWAL_LEAF_DOMAIN{{
 // Filled from the reproducible CElementsDrivechainParams construction. These
 // strings are compared by the release-mode startup identity gate.
 inline constexpr char PROTOCOL_MANIFEST_HASH[]{
-    "fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6"};
+    "665fcf89067c9804a91ec8c71fb1e4769fdb9013c94c279c487d13f16842ccee"};
 inline constexpr char PROPOSAL_DESCRIPTION_HEX[]{
-    "0008456c656d656e7473456c656d656e7473204472697665636861696e207631313b20706172616d65746572697a656420636f6e74726f6c6c65722070726f66696c653b207265706c61792076343b20616e6e65782076323b206f6e65204d362070657220706172656e7420626c6f636b3b207769746864726177616c20616363756d756c61746f722076313b2042495033303120636865636b706f696e742076313b2053696d706c6963697479206163746976653b20736c6f74203234e6092dd9fb9b1510a02ac535bbdde72f8b06716131c289337a0e0e592258d5fb28406cdece9df4823d01a88eca6b5793560fea88"};
+    "00084672656542616e6b4372656469742d6372656174696f6e206472697665636861696e202853636f747469736820667265652d62616e6b696e67206c696e6561676529a9e2db51dd8c29f91cf6cc7abba22ebaac94b94755d0faaa212ecf1f9b9d434c23f524e309054966d5f93eb85b656bc7c1cbfae8"};
 inline constexpr char PROPOSAL_HASH[]{
-    "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"};
+    "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd"};
 inline constexpr char IDENTITY_COMMITMENT[]{
-    "589c3dfd784f637680382836bdc38b3af1cf67ecc5390488a56d4b80d58516ab"};
+    "d1116d09d6a1b43d0a542f7e02d820a715418ca2f6bdd2e1afb4b65e8e8de6ee"};
 inline constexpr char GENESIS_HASH[]{
-    "672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd"};
+    "91e50b1b7e2ddc1b9fc49d9067c8b309ac83045685673bb43f1bad6fac6f6011"};
 inline constexpr char GENESIS_MERKLE_ROOT[]{
-    "0fc01d7c98bda1c73fef20538e2832f0d870cd2da51bfb42d9f9eddded8c2a44"};
+    "6c41bf9e406b8ba231977e7bf94eb835dfeae534868f6ed1554c7a107986149c"};
 inline constexpr char PEGGED_ASSET[]{
-    "62dce3bd80dc4b0503e7ccbb3fcfa4d7adfd64b4e0cc78fa5e1754b88f1d2da4"};
+    "21bee57a5dc06b81587c05fe472f59fb3717c485965dfe8a9cd4a760873b2b64"};
 
 } // namespace ElementsDrivechainIdentity
 

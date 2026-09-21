@@ -52,8 +52,10 @@ class DrivechainParentReplayStore final
 {
 public:
     static constexpr uint32_t SCHEMA_VERSION{4};
+    static constexpr uint32_t REPROPOSAL_SCHEMA_VERSION{5};
 
-    DrivechainParentReplayStore(fs::path path, size_t cache_bytes, bool wipe);
+    DrivechainParentReplayStore(fs::path path, size_t cache_bytes, bool wipe,
+        DrivechainWithdrawalHistoryRule history_rule = DrivechainWithdrawalHistoryRule::UNIQUE_M6ID);
     ~DrivechainParentReplayStore();
 
     DrivechainParentReplayStore(const DrivechainParentReplayStore&) = delete;
@@ -108,15 +110,24 @@ public:
         DrivechainReplayedBmmEdge& edge,
         std::string* error) const;
 
+    /** Return the first payment; later re-proposals never replace this record. */
     DrivechainReplayStoreReadStatus ReadSuccessfulWithdrawal(
         uint8_t sidechain_slot,
         const uint256& m6id,
         DrivechainSuccessfulWithdrawal& withdrawal,
         std::string* error) const;
 
+    DrivechainReplayStoreReadStatus ReadSuccessfulWithdrawalAtHeight(
+        uint8_t sidechain_slot,
+        const uint256& m6id,
+        uint32_t height,
+        DrivechainSuccessfulWithdrawal& withdrawal,
+        std::string* error) const;
+
 private:
     fs::path m_path;
     size_t m_cache_bytes;
+    uint32_t m_schema_version;
     std::unique_ptr<CDBWrapper> m_db;
 };
 

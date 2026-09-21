@@ -10,6 +10,8 @@
 #include <chainparamsbase.h>
 #include <consensus/merkle.h>
 #include <drivechain_parent_replay.h>
+#include <drivechain_parent_recovery.h>
+#include <drivechain_treasury.h>
 #include <elements_drivechain_identity.h>
 #include <hash.h>
 #include <primitives/block.h>
@@ -39,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <vector>
 
 namespace Bitcoin = Sidechain::Bitcoin;
@@ -752,10 +755,19 @@ bool ReadAuthenticatedRawMainchainBlock(const uint256& hash,
                                         Bitcoin::CBlock& block,
                                         std::string* error)
 {
-    UniValue params(UniValue::VARR);
-    params.push_back(hash.GetHex());
-    params.push_back(0);
-    const UniValue raw = CallMainChainRPCChecked("getblock", params);
+    // Bound recovery RPCs as well as polling; preserve any tighter outer budget.
+    struct RecoveryDeadline {
+        std::optional<std::chrono::steady_clock::time_point> previous{g_drivechain_anchor_warm_deadline};
+        RecoveryDeadline() {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+            if (!previous || limit < *previous) g_drivechain_anchor_warm_deadline = limit;
+        }
+        ~RecoveryDeadline() { g_drivechain_anchor_warm_deadline = previous; }
+    } recovery_deadline;
+    const UniValue raw = drivechain::FetchParentBlockBody(
+        hash.GetHex(), !DrivechainParentBudgetActive(), CallMainChainRPC,
+        CheckDrivechainParentDeadline,
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds{250}); });
     if (!raw.isStr() || !IsHex(raw.get_str())) return SetError(error, "getblock returned non-hex raw block data");
     CheckDrivechainParentDeadline();
     try {
@@ -817,10 +829,7 @@ bool ReadVerifiedMainchainBlock(const uint256& hash, const int min_confirmations
 
 bool IsDrivechainTreasuryScript(const CScript& script, const int sidechain_slot)
 {
-    const std::vector<unsigned char> expected{
-        static_cast<unsigned char>(OP_NOP5), 0x01,
-        static_cast<unsigned char>(sidechain_slot), static_cast<unsigned char>(OP_TRUE)};
-    return std::vector<unsigned char>(script.begin(), script.end()) == expected;
+    return drivechain::IsTreasuryScript(script, drivechain::FROZEN_PARENT_RULES.treasury_opcode, sidechain_slot);
 }
 
 bool IsExactOpReturnAddress(const Bitcoin::CTxOut& output, const std::vector<unsigned char>& address)
@@ -1259,14 +1268,10 @@ std::vector<uint8_t> ActiveDrivechainSlots(const DrivechainParentReplayState& st
     return active;
 }
 
-bool ExtractDrivechainTreasurySlot(const CScript& script, uint8_t& slot)
+bool ExtractDrivechainTreasurySlot(const CScript& script, uint8_t& slot,
+                                 drivechain::TreasuryOpcode treasury_opcode)
 {
-    if (script.size() != 4 || script[0] != OP_NOP5 || script[1] != 0x01 ||
-        script[3] != OP_TRUE) {
-        return false;
-    }
-    slot = script[2];
-    return true;
+    return drivechain::ExtractTreasurySlot(script, treasury_opcode, slot);
 }
 
 bool ApplyM4Upvote(std::vector<DrivechainPendingWithdrawal>& pending,
@@ -1310,14 +1315,15 @@ bool ComputeDrivechainM6Id(const Bitcoin::CTransaction& transaction,
                            const CAmount previous_treasury_value,
                            uint256& m6id,
                            uint8_t* sidechain_slot,
-                           std::string* error)
+                           std::string* error,
+                           drivechain::TreasuryOpcode treasury_opcode)
 {
     m6id.SetNull();
     if (transaction.vout.empty()) {
         return SetError(error, "BIP300 M6 has no replacement treasury output");
     }
     uint8_t parsed_slot{0};
-    if (!ExtractDrivechainTreasurySlot(transaction.vout[0].scriptPubKey, parsed_slot)) {
+    if (!ExtractDrivechainTreasurySlot(transaction.vout[0].scriptPubKey, parsed_slot, treasury_opcode)) {
         return SetError(error, "BIP300 M6 replacement treasury output is not vout 0");
     }
     if (transaction.vin.size() != 1) {
@@ -1370,12 +1376,20 @@ bool ApplyDrivechainParentBlockState(
     std::vector<DrivechainMintableDeposit>* deposits,
     std::string* error,
     std::vector<DrivechainSuccessfulWithdrawal>* successful_withdrawals,
-    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals)
+    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals,
+    drivechain::TreasuryOpcode treasury_opcode,
+    DrivechainM6ReplayRule m6_rule)
 {
     CheckDrivechainParentDeadline();
     if (deposits) deposits->clear();
     if (successful_withdrawals) successful_withdrawals->clear();
     if (withdrawal_proposals) withdrawal_proposals->clear();
+    if ((treasury_opcode != drivechain::TreasuryOpcode::NOP5 &&
+         treasury_opcode != drivechain::TreasuryOpcode::NOP8) ||
+        (m6_rule != DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6 &&
+         m6_rule != DrivechainM6ReplayRule::SEQUENTIAL_M6)) {
+        return SetError(error, "unsupported parent-state replay rules");
+    }
     std::vector<DrivechainSuccessfulWithdrawal> derived_withdrawals;
     std::vector<DrivechainWithdrawalProposalIdentity> derived_proposals;
     const uint8_t configured_slot = static_cast<uint8_t>(sidechain_slot);
@@ -1730,7 +1744,7 @@ bool ApplyDrivechainParentBlockState(
         for (uint32_t output_index = 0; output_index < transaction.vout.size(); ++output_index) {
             if ((output_index & 0xffU) == 0) CheckDrivechainParentDeadline();
             uint8_t slot{0};
-            if (!ExtractDrivechainTreasurySlot(transaction.vout[output_index].scriptPubKey, slot) ||
+            if (!ExtractDrivechainTreasurySlot(transaction.vout[output_index].scriptPubKey, slot, treasury_opcode) ||
                 active_set.count(slot) == 0) {
                 continue;
             }
@@ -1785,7 +1799,7 @@ bool ApplyDrivechainParentBlockState(
             uint256 m6id;
             uint8_t m6_slot{0};
             if (!ComputeDrivechainM6Id(transaction, change.old_value,
-                                       m6id, &m6_slot, error)) {
+                                       m6id, &m6_slot, error, treasury_opcode)) {
                 return false;
             }
             if (m6_slot != change.slot) {
@@ -1805,7 +1819,8 @@ bool ApplyDrivechainParentBlockState(
                     m6id.GetHex(), approved->votes,
                     withdrawal_bundle_inclusion_threshold));
             }
-            if (change.slot == configured_slot && configured_slot_m6_applied) {
+            if (m6_rule == DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6 &&
+                change.slot == configured_slot && configured_slot_m6_applied) {
                 return SetError(error, strprintf(
                     "parent block contains multiple successful M6 withdrawals for configured slot %u",
                     configured_slot));
@@ -2418,7 +2433,8 @@ bool InitializeDrivechainParentReplayCache(DrivechainParentReplayCache& cache,
             std::make_unique<DrivechainParentReplayStore>(
                 gArgs.GetDataDirNet() / "parent-replay",
                 DRIVECHAIN_PARENT_REPLAY_DB_CACHE_BYTES,
-                /*wipe=*/gArgs.GetBoolArg("-reindex", false));
+                /*wipe=*/gArgs.GetBoolArg("-reindex", false),
+                drivechain::FROZEN_PARENT_RULES.history);
     }
     const uint256 store_identity =
         DrivechainParentReplayStoreIdentity(consensus);
@@ -2462,7 +2478,7 @@ bool InitializeDrivechainParentReplayCache(DrivechainParentReplayCache& cache,
             ElementsDrivechainIdentity::PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT);
         HashWriter bootstrap_writer;
         bootstrap_writer
-            << std::string{"ELEMENTS_ALPHANET_PARENT_REPLAY_BOOTSTRAP_V1"}
+            << std::string{drivechain::FROZEN_PARENT_RULES.bootstrap_domain}
             << consensus.drivechain_parent_state_height
             << consensus.drivechain_parent_state_hash
             << consensus.drivechain_parent_state_chainwork
@@ -2537,7 +2553,9 @@ bool InitializeDrivechainParentReplayCache(DrivechainParentReplayCache& cache,
             cache.used_proposal_max_age, cache.used_activation_threshold,
             cache.withdrawal_bundle_max_age,
             cache.withdrawal_bundle_inclusion_threshold,
-            genesis_state, nullptr, error)) {
+            genesis_state, nullptr, error, nullptr, nullptr,
+            drivechain::FROZEN_PARENT_RULES.treasury_opcode,
+            drivechain::FROZEN_PARENT_RULES.m6)) {
         cache = {};
         return false;
     }
@@ -2694,7 +2712,9 @@ bool EnsurePinnedDrivechainParentStateThroughLocked(const uint32_t target_height
                     consensus.drivechain_withdrawal_bundle_max_age,
                     consensus.drivechain_withdrawal_bundle_inclusion_threshold,
                     next_state, &deposits, error, &successful_withdrawals,
-                    &withdrawal_proposals)) {
+                    &withdrawal_proposals,
+                    drivechain::FROZEN_PARENT_RULES.treasury_opcode,
+                    drivechain::FROZEN_PARENT_RULES.m6)) {
                 // The raw active parent block is authenticated, so a pure
                 // state-transition rejection is a deterministic global halt
                 // (including replacement of the required Elements proposal).

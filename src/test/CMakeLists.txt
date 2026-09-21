@@ -44,6 +44,7 @@ add_executable(test_elements
   dynafed_tests.cpp
   drivechain_bmm_tests.cpp
   drivechain_peg_tests.cpp
+  drivechain_treasury_tests.cpp
   drivechain_withdrawal_tests.cpp
   ecx_exchange_state_tests.cpp
   ecx_simplicity_test_shim.c

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <drivechain_peg.h>
+#include <drivechain_parent_rules.h>
 
 #include <chainparams.h>
 #include <coins.h>
@@ -50,16 +51,7 @@ bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
 
 bool IsSlot24CtipScript(const CScript& script)
 {
-    CScript::const_iterator cursor = script.begin();
-    opcodetype opcode;
-    std::vector<unsigned char> data;
-    if (!script.GetOp(cursor, opcode, data) || opcode != OP_NOP5) return false;
-    if (!script.GetOp(cursor, opcode, data) || opcode > OP_PUSHDATA4 ||
-        data.size() != 1 || data[0] != DRIVECHAIN_SIDECHAIN_SLOT) {
-        return false;
-    }
-    if (!script.GetOp(cursor, opcode, data) || opcode != OP_1) return false;
-    return cursor == script.end();
+    return IsTreasuryScript(script, FROZEN_PARENT_RULES.treasury_opcode, DRIVECHAIN_SIDECHAIN_SLOT);
 }
 
 bool ExtractDepositDestination(

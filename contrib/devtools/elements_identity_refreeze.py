@@ -866,15 +866,69 @@ def calculate_alphanet_v11(header: Header, bootstrap: Header | None = None) -> I
     return _calculate_v11(header, alphanet=True)
 
 
-def _calculate_v11(header: Header, *, alphanet: bool) -> IdentityResult:
+BETANET_FORK_HEIGHT = 967680
+BETANET_BOOTSTRAP_DOMAIN = "ELEMENTS_BETANET_PARENT_REPLAY_BOOTSTRAP_V1"
+BETANET_LOCAL_RULE_DOMAIN = "ELEMENTS_SLOT130_SEQUENTIAL_M6_REPROPOSAL_V1"
+
+
+def betanet_bootstrap_commitment(header: Header) -> str:
+    """Empty BIP300 state immediately before activation; not an RPC attestation."""
+    writer = HashWriter().string(BETANET_BOOTSTRAP_DOMAIN)
+    writer.u32(header.integer("PARENT_CHECKPOINT_HEIGHT"))
+    writer.uint256(header.string("PARENT_CHECKPOINT_HASH"))
+    writer.uint256(header.string("PARENT_CHECKPOINT_CHAINWORK"))
+    writer.u32(0)
+    return display_hash(writer.digest())
+
+
+def calculate_betanet_v11(header: Header) -> IdentityResult:
+    """Candidate only: the checkpoint must separately pass authenticated replay."""
+    expected = {
+        "SIDECHAIN_SLOT": 130,
+        "PARENT_CHECKPOINT_HEIGHT": BETANET_FORK_HEIGHT - 1,
+        "PARENT_REPLAY_VERSION": 5,
+        "UNUSED_PROPOSAL_MAX_AGE": 2016,
+        "UNUSED_ACTIVATION_THRESHOLD": 1008,
+        "USED_PROPOSAL_MAX_AGE": 26300,
+        "USED_ACTIVATION_THRESHOLD": 13150,
+        "WITHDRAWAL_BUNDLE_MAX_AGE": 26300,
+        "WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD": 13150,
+    }
+    for name, value in expected.items():
+        if header.integer(name) != value:
+            raise ValueError(f"refusing Betanet: wrong {name}")
+    if (header.string("BIP300301_LOCAL_RULE_DOMAIN") != BETANET_LOCAL_RULE_DOMAIN
+            or header.string("BIP300301_LOCAL_RULE_ID") != sha256(
+                BETANET_LOCAL_RULE_DOMAIN.encode("ascii")).hex()):
+        raise ValueError("refusing Betanet: local replay rule commitment mismatch")
+    if header.string("PARENT_GENESIS") != ALPHA_CHECKPOINT["PARENT_GENESIS"]:
+        raise ValueError("refusing Betanet: wrong parent genesis")
+    if header.string("PARENT_CHECKPOINT_HASH") in (
+        "00" * 32, header.string("PARENT_GENESIS"), ALPHA_CHECKPOINT["PARENT_CHECKPOINT_HASH"]
+    ):
+        raise ValueError("refusing Betanet: absent or historical checkpoint")
+    if header.string("PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT") != betanet_bootstrap_commitment(header):
+        raise ValueError("refusing Betanet: empty bootstrap commitment mismatch")
+    return _calculate_v11(header, alphanet=False, betanet=True)
+
+
+def _calculate_v11(header: Header, *, alphanet: bool, betanet: bool = False) -> IdentityResult:
+    if alphanet and betanet:
+        raise ValueError("network identity modes are mutually exclusive")
+    freebank_test = ("BETANET_FREEBANK_TEST_PROFILE" in header.text
+                     and header.boolean("BETANET_FREEBANK_TEST_PROFILE"))
+    if freebank_test and not betanet:
+        raise ValueError("FreeBank test profile requires Betanet")
     profile_id = header.array("PARAMETERIZED_CONTROLLER_PROFILE_ID")
     if profile_id.hex() != "6fd5a5e55769320cc1c6a497644d0bc7a642eed8442ab1703af304cfac253d25":
         raise ValueError("refusing V11: corrected parameterized profile is absent")
     if profile_id == bytes(32):
         raise ValueError("refusing V11: zero parameterized profile")
-    if header.string("P2P_MAGIC_DOMAIN") != "ecash-elements-drivechain-p2p-v11":
+    p2p_domain = "ecash-elements-drivechain-betanet-p2p-v1" if betanet else "ecash-elements-drivechain-p2p-v11"
+    data_dir = "elements-betanet-v1" if betanet else "elements-v11"
+    if header.string("P2P_MAGIC_DOMAIN") != p2p_domain:
         raise ValueError("refusing V11: incompatible P2P namespace is absent")
-    if header.string("DATA_DIR") != "elements-v11":
+    if header.string("DATA_DIR") != data_dir:
         raise ValueError("refusing V11: incompatible data directory is absent")
     zero_hash = "00" * 32
     preactivation_checkpoint_is_canonical = (
@@ -884,8 +938,8 @@ def _calculate_v11(header: Header, *, alphanet: bool) -> IdentityResult:
         and header.string("HISTORICAL_PROPOSAL_BLOCK_HASH") == zero_hash
         and header.integer("HISTORICAL_ACTIVATION_HEIGHT") == 0
         and header.string("HISTORICAL_ACTIVATION_BLOCK_HASH") == zero_hash
-        and (alphanet or header.integer("PARENT_CHECKPOINT_HEIGHT") == 0)
-        and (alphanet or header.string("PARENT_CHECKPOINT_HASH") == header.string("PARENT_GENESIS"))
+        and (alphanet or betanet or header.integer("PARENT_CHECKPOINT_HEIGHT") == 0)
+        and (alphanet or betanet or header.string("PARENT_CHECKPOINT_HASH") == header.string("PARENT_GENESIS"))
         and header.string("PARENT_CHECKPOINT_CHAINWORK") != zero_hash
         and header.string("PARENT_CHECKPOINT_CTIP_TXID") == zero_hash
         and header.integer("PARENT_CHECKPOINT_CTIP_VOUT") == 0xFFFFFFFF
@@ -905,23 +959,35 @@ def _calculate_v11(header: Header, *, alphanet: bool) -> IdentityResult:
     add_withdrawal_fields(manifest, header)
     add_deployment_fields(manifest, header)
     add_parent_identity_fields(manifest, header)
-    add_historical_parent_fields(manifest, header, include_bootstrap=alphanet)
+    add_historical_parent_fields(manifest, header, include_bootstrap=alphanet or betanet)
     add_replay_fields(manifest, header)
     manifest_digest = manifest.digest()
     description, proposal_digest = proposal(
         manifest_digest,
         source_domain="ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V11",
-        text=("Elements Drivechain v11; parameterized controller profile; replay v4; "
+        text=("Elements Drivechain Betanet v1; parameterized controller profile; replay v5; "
+              "annex v2; sequential M6; withdrawal accumulator v1; "
+              "BIP301 checkpoint v1; Simplicity active; slot 130") if betanet else
+             ("Elements Drivechain v11; parameterized controller profile; replay v4; "
               "annex v2; one M6 per parent block; withdrawal accumulator v1; "
               "BIP301 checkpoint v1; Simplicity active; slot 24"),
     )
+    if freebank_test:
+        description = bytes.fromhex(header.string("BETANET_FREEBANK_PROPOSAL_HEX"))
+        proposal_digest = hash256(description)
+        expected = "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd"
+        if (display_hash(proposal_digest) != expected
+                or header.string("BETANET_FREEBANK_PROPOSAL_HASH") != expected):
+            raise ValueError("FreeBank test proposal hash mismatch")
     identity_digest = identity_commitment_v11(
-        header, manifest_digest, description, proposal_digest, include_bootstrap=alphanet
+        header, manifest_digest, description, proposal_digest, include_bootstrap=alphanet or betanet
     )
     pegged = derive_pegged_asset(identity_digest, header.string("PARENT_GENESIS"))
     merkle, genesis_digest = genesis(identity_digest, header)
     return IdentityResult(
-        mode="candidate-v11-alphanet-preactivation-parent" if alphanet else "candidate-v11-parameterized-controller",
+        mode="candidate-v11-betanet-freebank-authorized-test" if freebank_test else
+             "candidate-v11-betanet-preactivation-parent" if betanet else
+             "candidate-v11-alphanet-preactivation-parent" if alphanet else "candidate-v11-parameterized-controller",
         protocol_manifest_hash=display_hash(manifest_digest),
         proposal_description_hex=description.hex(),
         proposal_hash=display_hash(proposal_digest),
@@ -971,11 +1037,38 @@ def assert_current_v7(header: Header, result: IdentityResult) -> None:
         )
 
 
+def indexer_bindings(header: Header) -> dict:
+    """Export audited Beta bindings, not evidence of activation or live readiness."""
+    result = calculate_betanet_v11(header)
+    assert_current_v7(header, result)
+    return {
+        "schema": "elements-indexer-bindings-v1",
+        "network": "betanet",
+        "identity_commitment": result.identity_commitment,
+        "genesis_hash": result.genesis_hash,
+        "native_asset": result.pegged_asset,
+        "p2p_message_start": result.p2p_message_start,
+        "p2p_magic_u32_le": int.from_bytes(bytes.fromhex(result.p2p_message_start), "little"),
+        "data_dir": result.data_dir,
+        "rpc_port": header.integer("RPC_PORT"),
+        "p2p_port": header.integer("P2P_PORT"),
+        "pubkey_address_prefix": header.integer("PUBKEY_ADDRESS_PREFIX"),
+        "script_address_prefix": header.integer("SCRIPT_ADDRESS_PREFIX"),
+        "blinded_address_prefix": header.integer("BLINDED_ADDRESS_PREFIX"),
+        "bech32_hrp": header.string("BECH32_HRP"),
+        "blech32_hrp": header.string("BLECH32_HRP"),
+        "sidechain_slot": header.integer("SIDECHAIN_SLOT"),
+        "parent_checkpoint_height": header.integer("PARENT_CHECKPOINT_HEIGHT"),
+        "parent_checkpoint_hash": header.string("PARENT_CHECKPOINT_HASH"),
+        "parent_replay_version": result.parent_replay_version,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("v7", "v11", "v11-alphanet"), default="v11-alphanet",
-        help="explicit identity derivation mode (default: live Alpha)",
+        "--mode", choices=("v7", "v11", "v11-alphanet", "v11-betanet"), default="v11-betanet",
+        help="explicit identity derivation mode (default: Betanet)",
     )
     parser.add_argument(
         "--header",
@@ -988,19 +1081,28 @@ def main() -> int:
         action="store_true",
         help="print the independently calculated candidate without comparing derived header fields",
     )
+    parser.add_argument(
+        "--indexer-bindings", action="store_true",
+        help="export audited Betanet consumer bindings (requires --mode v11-betanet; no --candidate)",
+    )
     args = parser.parse_args()
+    if args.indexer_bindings and (args.candidate or args.mode != "v11-betanet"):
+        parser.error("--indexer-bindings requires --mode v11-betanet and forbids --candidate")
 
     try:
         header = Header(args.header)
-        calculate = {"v7": calculate_v7, "v11": calculate_v11, "v11-alphanet": calculate_alphanet_v11}[args.mode]
+        calculate = {"v7": calculate_v7, "v11": calculate_v11,
+                     "v11-alphanet": calculate_alphanet_v11,
+                     "v11-betanet": calculate_betanet_v11}[args.mode]
         result = calculate(header)
         if not args.candidate:
             assert_current_v7(header, result)
+        output = indexer_bindings(header) if args.indexer_bindings else asdict(result)
     except (OSError, ValueError, struct.error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    print(json.dumps(asdict(result), indent=2, sort_keys=True))
+    print(json.dumps(output, indent=2, sort_keys=True))
     return 0
 
 

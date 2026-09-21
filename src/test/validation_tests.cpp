@@ -11,6 +11,7 @@
 #include <crypto/sha256.h>
 #include <drivechain_bmm.h>
 #include <drivechain_parent_replay.h>
+#include <drivechain_parent_recovery.h>
 #include <dbwrapper.h>
 #include <elements_drivechain_identity.h>
 #include <init.h>
@@ -59,6 +60,82 @@
 namespace Bitcoin = Sidechain::Bitcoin;
 
 BOOST_FIXTURE_TEST_SUITE(validation_tests, TestingSetup)
+
+BOOST_AUTO_TEST_CASE(parent_pruned_body_recovery_preserves_active_chain_and_errors)
+{
+    auto json = [](const std::string& value) {
+        UniValue result;
+        if (!result.read(value)) throw std::runtime_error("invalid test JSON");
+        return result;
+    };
+    const auto pruned = json(R"json({"error":{"code":-1,"message":"Block not available (pruned data)"},"result":null})json");
+    const auto missing = json(R"({"error":{"code":-5,"message":"Block not found"},"result":null})");
+    const auto body = json(R"({"error":null,"result":"00"})");
+    const auto header = json(R"({"error":null,"result":{"hash":"requested","height":12,"confirmations":1}})");
+    const auto active = json(R"({"error":null,"result":"requested"})");
+    const auto peers = json(R"({"error":null,"result":[{"id":2,"servicesnames":["NETWORK_LIMITED"]},{"id":3,"servicesnames":["NETWORK"]}]})");
+    const auto queued = json(R"({"error":null,"result":{}})");
+    using Step = std::pair<std::string, UniValue>;
+    const std::vector<Step> recovery{
+        {"getblock", pruned}, {"getblockheader", header}, {"getblockhash", active},
+        {"getpeerinfo", peers}, {"getblockfrompeer", queued}, {"getblock", pruned},
+        {"getblock", body}, {"getblockheader", header}, {"getblockhash", active}};
+    auto run = [&](std::vector<Step> steps, bool allow, bool succeeds, int waits_expected) {
+        size_t index{0};
+        int waits{0};
+        auto rpc = [&](const std::string& method, const UniValue& params) {
+            if (index >= steps.size()) throw std::runtime_error("unexpected extra RPC");
+            BOOST_CHECK_EQUAL(method, steps[index].first);
+            if (method == "getblock") BOOST_CHECK_EQUAL(params.write(), "[\"requested\",0]");
+            if (method == "getblockfrompeer") BOOST_CHECK_EQUAL(params.write(), "[\"requested\",3]");
+            return steps[index++].second;
+        };
+        auto fetch = [&] { return drivechain::FetchParentBlockBody(
+            "requested", allow, rpc, [] {}, [&] { ++waits; }); };
+        if (succeeds) {
+            BOOST_CHECK_EQUAL(fetch().get_str(), "00");
+        } else {
+            BOOST_CHECK_THROW(fetch(), std::runtime_error);
+        }
+        BOOST_CHECK_EQUAL(index, steps.size());
+        BOOST_CHECK_EQUAL(waits, waits_expected);
+    };
+    run({{"getblock", body}}, false, true, 0);
+    run({{"getblock", missing}}, true, false, 0);
+    run({{"getblock", pruned}}, false, false, 0);
+    run(recovery, true, true, 1);
+    auto no_peer = std::vector<Step>(recovery.begin(), recovery.begin() + 4);
+    no_peer.back().second = json(R"({"error":null,"result":[{"id":2,"servicesnames":["NETWORK_LIMITED"]}]})");
+    run(no_peer, true, false, 0);
+    auto reorg = recovery;
+    reorg.back().second = json(R"({"error":null,"result":"other"})");
+    run(reorg, true, false, 1);
+    auto failed = std::vector<Step>(recovery.begin(), recovery.begin() + 6);
+    failed.back().second = missing;
+    run(failed, true, false, 0);
+    for (const auto& invalid_header : {
+             R"({"hash":"other","height":12,"confirmations":1})",
+             R"({"hash":"requested","height":12,"confirmations":0})",
+             R"({"hash":"requested","height":-1,"confirmations":1})",
+             R"({"hash":"requested","height":"12","confirmations":1})"}) {
+        auto invalid = std::vector<Step>(recovery.begin(), recovery.begin() + 2);
+        invalid.back().second = json(std::string{"{\"error\":null,\"result\":"} + invalid_header + "}");
+        run(invalid, true, false, 0);
+    }
+    int requests{0};
+    int checks{0};
+    auto cancelled_rpc = [&](const std::string&, const UniValue&) {
+        ++requests;
+        return pruned;
+    };
+    BOOST_CHECK_THROW(drivechain::FetchParentBlockBody(
+        "requested", true, cancelled_rpc,
+        [&] { if (++checks == 2) throw std::runtime_error("cancelled"); },
+        [] {}), std::runtime_error);
+    BOOST_CHECK_EQUAL(requests, 1);
+    BOOST_CHECK(!drivechain::IsPrunedBlockReply(missing));
+    BOOST_CHECK(drivechain::IsPrunedBlockReply(pruned));
+}
 
 BOOST_AUTO_TEST_CASE(inspect_preserved_alpha_replay_copy)
 {
@@ -1052,6 +1129,29 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_bid_selection)
         util::ToString(MAX_MONEY + 1), parsed, &error));
 }
 
+BOOST_AUTO_TEST_CASE(drivechain_bmm_replacement_bid)
+{
+    const std::string prefix = "insufficient fee, rejecting replacement txid, not enough additional fees to relay; ";
+    CAmount bid{42};
+    BOOST_CHECK(ComputeDrivechainBmmReplacementBid(prefix + "0.00 < 0.00000019\", data: None", 1000, 2000, bid));
+    BOOST_CHECK_EQUAL(bid, 1019);
+    BOOST_CHECK(ComputeDrivechainBmmReplacementBid(prefix + "-0.00000019 < 0.00000019", 1000, 2000, bid));
+    BOOST_CHECK_EQUAL(bid, 1038);
+    BOOST_CHECK(ComputeDrivechainBmmReplacementBid(prefix + "0.00000010 < 0.00000019", 1000, 2000, bid));
+    BOOST_CHECK_EQUAL(bid, 1009);
+    BOOST_CHECK(ComputeDrivechainBmmReplacementBid("insufficient fee, rejecting replacement txid, less fees than conflicting txs; 0.00001000 < 0.00001019", 1000, 2000, bid));
+    BOOST_CHECK_EQUAL(bid, 1019);
+    BOOST_CHECK(ComputeDrivechainBmmReplacementBid(prefix + "0.00 < 0.00000019", bid, 2000, bid));
+    BOOST_CHECK_EQUAL(bid, 1038);
+    for (const auto& text : {"0.00 < 0.00000019garbage", "0.00 < -1", "NaN < 0.00000019", "0.00 < 0.000000001", "0.00 < 21000001", "0.00 < 0.00"}) {
+        BOOST_CHECK(!ComputeDrivechainBmmReplacementBid(prefix + text, 1000, 2000, bid));
+    }
+    BOOST_CHECK(!ComputeDrivechainBmmReplacementBid("timeout", 1000, 2000, bid));
+    BOOST_CHECK(!ComputeDrivechainBmmReplacementBid(prefix + "0.00 < 0.00000019", 1000, 1000, bid));
+    BOOST_CHECK(!ComputeDrivechainBmmReplacementBid(prefix + "0.00 < 0.00001001", 1000, 2000, bid));
+    BOOST_CHECK(!ComputeDrivechainBmmReplacementBid(prefix + "0.00 < 0.00000019", MAX_MONEY - 1, MAX_MONEY, bid));
+}
+
 BOOST_AUTO_TEST_CASE(elements_production_identity_gate)
 {
     ArgsManager args;
@@ -1312,16 +1412,16 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     const auto base_params = CreateBaseChainParams(CBaseChainParams::ELEMENTS);
 
     BOOST_CHECK_EQUAL(params->NetworkIDString(), "elements");
-    BOOST_CHECK_EQUAL(base_params->DataDir(), "elements-v11");
+    BOOST_CHECK_EQUAL(base_params->DataDir(), "elements-betanet-v1");
     BOOST_CHECK_EQUAL(base_params->RPCPort(), 7065);
-    BOOST_CHECK_EQUAL(base_params->MainchainRPCPort(), 18302);
+    BOOST_CHECK_EQUAL(base_params->MainchainRPCPort(), 28532);
     BOOST_CHECK_EQUAL(base_params->OnionServiceTargetPort(), 37066);
     BOOST_CHECK_EQUAL(params->GetDefaultPort(), 7066);
 
     BOOST_CHECK(consensus.elements_mode);
     BOOST_CHECK(consensus.has_parent_chain);
     BOOST_REQUIRE(consensus.drivechain_slot.has_value());
-    BOOST_CHECK_EQUAL(*consensus.drivechain_slot, 24);
+    BOOST_CHECK_EQUAL(*consensus.drivechain_slot, 130);
     BOOST_CHECK(consensus.enable_usdd_sp1_annex);
     BOOST_CHECK_EQUAL(
         params->ParentGenesisBlockHash(),
@@ -1336,27 +1436,27 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK(consensus.signblockscript == CScript() << OP_TRUE);
     BOOST_CHECK_EQUAL(
         params->HashGenesisBlock(),
-        uint256S("672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd"));
+        uint256S("91e50b1b7e2ddc1b9fc49d9067c8b309ac83045685673bb43f1bad6fac6f6011"));
     BOOST_CHECK_EQUAL(
         params->GenesisBlock().hashMerkleRoot,
-        uint256S("0fc01d7c98bda1c73fef20538e2832f0d870cd2da51bfb42d9f9eddded8c2a44"));
+        uint256S("6c41bf9e406b8ba231977e7bf94eb835dfeae534868f6ed1554c7a107986149c"));
     BOOST_CHECK_EQUAL(
         consensus.pegged_asset.GetHex(),
-        "62dce3bd80dc4b0503e7ccbb3fcfa4d7adfd64b4e0cc78fa5e1754b88f1d2da4");
+        "21bee57a5dc06b81587c05fe472f59fb3717c485965dfe8a9cd4a760873b2b64");
     BOOST_CHECK_EQUAL(params->GenesisBlock().nTime, 1784334600U);
     BOOST_CHECK(params->HashGenesisBlock() != params->ParentGenesisBlockHash());
     BOOST_CHECK(consensus.subsidy_asset == consensus.pegged_asset);
 
     BOOST_CHECK_EQUAL(
         consensus.drivechain_protocol_manifest_hash,
-        uint256S("fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6"));
+        uint256S("665fcf89067c9804a91ec8c71fb1e4769fdb9013c94c279c487d13f16842ccee"));
     BOOST_CHECK_EQUAL(
         HexStr(consensus.drivechain_proposal_description),
-        ElementsDrivechainIdentity::PROPOSAL_DESCRIPTION_HEX);
+        ElementsDrivechainIdentity::BETANET_FREEBANK_PROPOSAL_HEX);
     BOOST_REQUIRE(consensus.drivechain_proposal_hash.has_value());
     BOOST_CHECK_EQUAL(
         *consensus.drivechain_proposal_hash,
-        uint256S("866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"));
+        uint256S("80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd"));
     BOOST_REQUIRE(consensus.drivechain_parent_state_active_proposal_hash.has_value());
     BOOST_CHECK_EQUAL(
         *consensus.drivechain_parent_state_active_proposal_hash,
@@ -1369,25 +1469,25 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK_EQUAL(
         consensus.drivechain_parent_state_activation_block_hash,
         uint256S("0000000000000000000000000000000000000000000000000000000000000000"));
-    BOOST_CHECK_EQUAL(consensus.drivechain_parent_state_height, 995347U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_parent_state_height, 967679U);
     BOOST_CHECK_EQUAL(
         consensus.drivechain_parent_state_hash,
-        uint256S("000000000000000002838070eb876cd37738a069528efc82d946fbd25e763152"));
+        uint256S("00000000000000000001b58cb69869f6067f0ecb3f2fe0f2263e62ba1ccb0c41"));
     BOOST_CHECK_EQUAL(
         consensus.drivechain_parent_state_chainwork,
-        uint256S("0000000000000000000000000000000000000001418d991091e5b78fab4ab500"));
+        uint256S("000000000000000000000000000000000000000148a384d49682843d3c74a5a0"));
     BOOST_CHECK_EQUAL(
         consensus.drivechain_parent_state_ctip_txid,
         uint256S("0000000000000000000000000000000000000000000000000000000000000000"));
     BOOST_CHECK_EQUAL(consensus.drivechain_parent_state_ctip_vout, 4294967295U);
     BOOST_CHECK_EQUAL(consensus.drivechain_parent_state_ctip_value, 0);
-    BOOST_CHECK_EQUAL(consensus.drivechain_unused_slot_proposal_max_age, 36U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_unused_slot_activation_threshold, 30U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_used_slot_proposal_max_age, 144U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_used_slot_activation_threshold, 72U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_max_age, 144U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_inclusion_threshold, 72U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_parent_state_replay_version, 4U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_unused_slot_proposal_max_age, 2016U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_unused_slot_activation_threshold, 1008U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_used_slot_proposal_max_age, 26300U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_used_slot_activation_threshold, 13150U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_max_age, 26300U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_inclusion_threshold, 13150U);
+    BOOST_CHECK_EQUAL(consensus.drivechain_parent_state_replay_version, 5U);
     BOOST_CHECK_EQUAL(consensus.drivechain_annex_feature_version, 2U);
     BOOST_CHECK(consensus.drivechain_m6_withdrawal_validation);
 
@@ -1397,7 +1497,7 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "elements");
     BOOST_CHECK_EQUAL(params->Blech32HRP(), "elementsl");
     BOOST_CHECK_EQUAL(params->ParentBech32HRP(), "bc");
-    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "df91d03e");
+    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "60b4eff4");
     BOOST_CHECK_EQUAL(MAX_BLOCK_WEIGHT, 6'000'000U);
     BOOST_CHECK_EQUAL(MAX_BLOCK_SERIALIZED_SIZE, 6'000'000U);
     BOOST_CHECK_EQUAL(usdd::SP1_ANNEX_MAX_SIZE, 1'310'720U);
@@ -1419,13 +1519,37 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
         identity_error);
 }
 
-BOOST_AUTO_TEST_CASE(alpha_pegin_depth_upgrade_preserves_identity_and_is_height_scoped)
+// Reconstruct only the historical fields used by the Alpha depth predicate.
+// This is not a canonical current-network identity or a runnable Alpha chain.
+class HistoricalAlphaDepthParams final : public CChainParams {
+public:
+    HistoricalAlphaDepthParams() : CChainParams(*CreateChainParams(ArgsManager{}, CBaseChainParams::ELEMENTS))
+    {
+        consensus.drivechain_slot = 24;
+        consensus.hashGenesisBlock = uint256S("672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd");
+        consensus.drivechain_protocol_manifest_hash = uint256S("fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6");
+        consensus.pegin_min_depth = 100;
+    }
+};
+
+BOOST_AUTO_TEST_CASE(betanet_pegin_depth_excludes_historical_alpha_upgrade)
 {
     ArgsManager args;
-    // An ordinary configuration override cannot disable or move this upgrade.
+    // An ordinary configuration override cannot reduce the frozen depth.
     args.ForceSetArg("-peginconfirmationdepth", "0");
-    const auto alpha = CreateChainParams(args, CBaseChainParams::ELEMENTS);
-    const auto alpha_base = CreateBaseChainParams(CBaseChainParams::ELEMENTS);
+    const auto beta = CreateChainParams(args, CBaseChainParams::ELEMENTS);
+    BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(*beta));
+    for (const int height : {-1, 0, 63, 64, 65, std::numeric_limits<int>::max()}) {
+        const auto depth = GetDrivechainPeginConfirmationDepth(*beta, height);
+        BOOST_CHECK_EQUAL(depth, 100U);
+        BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 1098, depth));
+        BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1099, depth));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(alpha_pegin_depth_upgrade_is_identity_and_height_scoped)
+{
+    const auto alpha = std::make_unique<HistoricalAlphaDepthParams>();
     const auto& consensus = alpha->GetConsensus();
     BOOST_CHECK(HasAlphaPeginOneConfirmationUpgrade(*alpha));
     BOOST_CHECK_EQUAL(ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT, 64);
@@ -1438,14 +1562,7 @@ BOOST_AUTO_TEST_CASE(alpha_pegin_depth_upgrade_preserves_identity_and_is_height_
     BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(*alpha, std::numeric_limits<int>::max()), 1U);
     BOOST_CHECK_EQUAL(consensus.pegin_min_depth, 100U);
     BOOST_CHECK_EQUAL(consensus.hashGenesisBlock.GetHex(), "672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd");
-    BOOST_CHECK_EQUAL(consensus.pegged_asset.GetHex(), "62dce3bd80dc4b0503e7ccbb3fcfa4d7adfd64b4e0cc78fa5e1754b88f1d2da4");
     BOOST_CHECK_EQUAL(consensus.drivechain_protocol_manifest_hash.GetHex(), "fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6");
-    BOOST_REQUIRE(consensus.drivechain_proposal_hash.has_value());
-    BOOST_CHECK_EQUAL(consensus.drivechain_proposal_hash->GetHex(), "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400");
-    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_max_age, 144U);
-    BOOST_CHECK_EQUAL(consensus.drivechain_withdrawal_bundle_inclusion_threshold, 72U);
-    std::string error;
-    BOOST_CHECK_MESSAGE(IsCanonicalElementsProductionIdentity(*alpha, *alpha_base, &error), error);
 
     class MutatedIdentity final : public CChainParams {
     public:
@@ -1478,7 +1595,7 @@ BOOST_AUTO_TEST_CASE(alpha_pegin_depth_upgrade_preserves_identity_and_is_height_
 
 BOOST_AUTO_TEST_CASE(alpha_pegin_depth_counts_authenticated_parent_inclusion)
 {
-    const auto alpha = CreateChainParams(ArgsManager{}, CBaseChainParams::ELEMENTS);
+    const auto alpha = std::make_unique<HistoricalAlphaDepthParams>();
     const uint32_t before = GetDrivechainPeginConfirmationDepth(*alpha, 63);
     const uint32_t after = GetDrivechainPeginConfirmationDepth(*alpha, 64);
     BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 1000, before));
