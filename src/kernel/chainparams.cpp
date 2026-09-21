@@ -13,6 +13,7 @@
 #include <chainparamsbase.h>
 #include <consensus/consensus.h>
 #include <elements_drivechain_identity.h>
+#include <drivechain_parent_rules.h>
 #include <usdd_sp1_resources.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
@@ -1076,8 +1077,7 @@ public:
         consensus.drivechain_protocol_manifest_hash = manifest_writer.GetHash();
 
         const std::string proposal_title{"Elements"};
-        const std::string proposal_text{
-            "Elements Drivechain v11; parameterized controller profile; replay v4; annex v2; one M6 per parent block; withdrawal accumulator v1; BIP301 checkpoint v1; Simplicity active; slot 24"};
+        const std::string proposal_text{drivechain::FROZEN_PARENT_RULES.proposal_text};
         consensus.drivechain_proposal_description = {0, static_cast<uint8_t>(proposal_title.size())};
         consensus.drivechain_proposal_description.insert(
             consensus.drivechain_proposal_description.end(),
@@ -1098,6 +1098,16 @@ public:
         const uint160 source_id = Hash160(source_preimage);
         consensus.drivechain_proposal_description.insert(
             consensus.drivechain_proposal_description.end(), source_id.begin(), source_id.end());
+        if constexpr (ElementsDrivechainIdentity::BETANET_FREEBANK_TEST_PROFILE) {
+            // Preserve the existing parent title and proposal; the independently
+            // calculated child manifest is still bound into the child identity.
+            consensus.drivechain_proposal_description = ParseHex(
+                ElementsDrivechainIdentity::BETANET_FREEBANK_PROPOSAL_HEX);
+            if (Hash(consensus.drivechain_proposal_description) != uint256S(
+                    ElementsDrivechainIdentity::BETANET_FREEBANK_PROPOSAL_HASH)) {
+                throw std::runtime_error("FreeBank test proposal hash mismatch");
+            }
+        }
         consensus.drivechain_proposal_hash = Hash(consensus.drivechain_proposal_description);
         assert(consensus.drivechain_protocol_manifest_hash == uint256S(
             ElementsDrivechainIdentity::PROTOCOL_MANIFEST_HASH));
@@ -1372,7 +1382,7 @@ public:
 
         assert(consensus.hashGenesisBlock != parentGenesisBlockHash);
         assert(consensus.elements_mode);
-        assert(consensus.drivechain_slot == uint8_t{24});
+        assert(consensus.drivechain_slot == ElementsDrivechainIdentity::SIDECHAIN_SLOT);
     }
 };
 

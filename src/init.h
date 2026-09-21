@@ -84,6 +84,10 @@ bool ParseDrivechainBmmBid(const std::string& value,
                            CAmount& bid,
                            std::string* error = nullptr);
 
+/** Parse Core's replacement fee deficit; unknown errors never increase spending. */
+bool ComputeDrivechainBmmReplacementBid(const std::string& error, CAmount current,
+                                       CAmount maximum, CAmount& replacement);
+
 /**
  * Submit one already-validated blinded BIP300 M6 to the configured enforcer.
  *

@@ -263,6 +263,36 @@ bool ComputeDrivechainBmmBid(const CAmount configured_bid,
     return true;
 }
 
+bool ComputeDrivechainBmmReplacementBid(const std::string& error, const CAmount current,
+                                       const CAmount maximum, CAmount& replacement)
+{
+    if (current <= 0 || !MoneyRange(current) || !MoneyRange(maximum) || current >= maximum) return false;
+    if (error.find("insufficient fee, rejecting replacement ") == std::string::npos) return false;
+    std::string marker{"not enough additional fees to relay; "};
+    auto start = error.find(marker);
+    if (start == std::string::npos) {
+        marker = "less fees than conflicting txs; ";
+        start = error.find(marker);
+    }
+    if (start == std::string::npos) return false;
+    const auto value_start = start + marker.size();
+    const auto separator = error.find(" < ", value_start);
+    if (separator == std::string::npos) return false;
+    std::string paid = error.substr(value_start, separator - value_start);
+    const bool negative = !paid.empty() && paid.front() == '-';
+    if (negative) paid.erase(0, 1);
+    const auto paid_amount = ParseMoney(paid);
+    const auto needed_start = separator + 3;
+    const auto end = error.find_first_not_of("0123456789.", needed_start);
+    if (end == needed_start || (end != std::string::npos && error[end] != '"' && error[end] != '\n')) return false;
+    const auto needed = ParseMoney(error.substr(needed_start, end - needed_start));
+    if (!paid_amount || !needed) return false;
+    const CAmount delta = *needed - (negative ? -*paid_amount : *paid_amount);
+    if (delta <= 0 || delta > maximum - current) return false;
+    replacement = current + delta;
+    return true;
+}
+
 bool ParseDrivechainBmmBid(const std::string& value,
                            CAmount& bid,
                            std::string* error)
@@ -631,56 +661,74 @@ static void SubmitDrivechainBmmGrpcRequest(NodeContext& node, const int sidechai
         throw std::runtime_error(bid_error);
     }
 
-    const std::string request = strprintf(
-        "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
-        sidechain_slot,
-        selected_bid,
-        mainchain_tip_height,
-        critical_hash.GetHex(),
-        mainchain_tip_hash.GetHex());
-
-    static constexpr size_t MAX_GRPCURL_OUTPUT{64 * 1024};
-    static constexpr auto GRPCURL_TIMEOUT{std::chrono::seconds{10}};
-    const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
-        gArgs, "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction", request,
-        std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
-        MAX_GRPCURL_OUTPUT,
-        [&node] { return ShutdownRequested(node); });
-    if (!child.started) {
-        throw std::runtime_error(strprintf(
-            "failed to launch grpcurl: %s", child.error));
-    }
-    if (child.cancelled) {
-        throw std::runtime_error("grpcurl cancelled during shutdown");
-    }
-    if (child.timed_out) {
-        throw std::runtime_error("grpcurl exceeded its 10-second deadline");
-    }
-    if (child.output_truncated) {
-        throw std::runtime_error("grpcurl exceeded its 64 KiB output limit");
-    }
-    if (!child.error.empty()) {
-        throw std::runtime_error(strprintf(
-            "grpcurl process management failed: %s", child.error));
-    }
-    if (!child.exited) {
-        throw std::runtime_error("grpcurl was not reaped");
-    }
-    if (child.exit_code != 0) {
-        if (child.output.find("AlreadyExists") != std::string::npos ||
-            child.output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
-            LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
-                sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
-            return;
+    const CAmount extra = gArgs.GetIntArg("-drivechainbmmreplacementextra", 0);
+    if (!MoneyRange(extra)) throw std::runtime_error("Invalid BMM replacement allowance");
+    const CAmount maximum_bid = selected_bid + std::min(extra, MAX_MONEY - selected_bid);
+    // Core may report the conflicting absolute fee before its relay increment.
+    // Allow those two recovery steps for this exact candidate, within one cap.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (ShutdownRequested(node) || GetMainchainBlockHash(GetMainchainBlockHeight()) != mainchain_tip_hash) {
+            throw std::runtime_error("BMM parent changed before submission");
         }
-        throw std::runtime_error(strprintf(
-            "grpcurl exited with status %d: %s",
-            child.exit_code, child.output));
+        const std::string request = strprintf(
+            "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
+            sidechain_slot,
+            selected_bid,
+            mainchain_tip_height,
+            critical_hash.GetHex(),
+            mainchain_tip_hash.GetHex());
+
+        static constexpr size_t MAX_GRPCURL_OUTPUT{64 * 1024};
+        static constexpr auto GRPCURL_TIMEOUT{std::chrono::seconds{10}};
+        const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
+            gArgs, "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction", request,
+            std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
+            MAX_GRPCURL_OUTPUT,
+            [&node] { return ShutdownRequested(node); });
+        if (!child.started) {
+            throw std::runtime_error(strprintf(
+                "failed to launch grpcurl: %s", child.error));
+        }
+        if (child.cancelled) {
+            throw std::runtime_error("grpcurl cancelled during shutdown");
+        }
+        if (child.timed_out) {
+            throw std::runtime_error("grpcurl exceeded its 10-second deadline");
+        }
+        if (child.output_truncated) {
+            throw std::runtime_error("grpcurl exceeded its 64 KiB output limit");
+        }
+        if (!child.error.empty()) {
+            throw std::runtime_error(strprintf(
+                "grpcurl process management failed: %s", child.error));
+        }
+        if (!child.exited) {
+            throw std::runtime_error("grpcurl was not reaped");
+        }
+        if (child.exit_code != 0) {
+            CAmount replacement{0};
+            if (attempt < 2 && ComputeDrivechainBmmReplacementBid(child.output, selected_bid, maximum_bid, replacement)) {
+                LogPrintf("drivechain L1 block sync: replacing stale BMM input conflict, bid %d -> %d sats (cap %d)\n",
+                          selected_bid, replacement, maximum_bid);
+                selected_bid = replacement;
+                continue;
+            }
+            if (child.output.find("AlreadyExists") != std::string::npos ||
+                child.output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
+                LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
+                    sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
+                return;
+            }
+            throw std::runtime_error(strprintf(
+                "grpcurl exited with status %d: %s",
+                child.exit_code, child.output));
+        }
+        LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, critical hash %s, candidate fees %s, bid %s, response %s\n",
+            sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height,
+            critical_hash.GetHex(), FormatMoney(sidechain_fees),
+            FormatMoney(selected_bid), child.output);
+        return;
     }
-    LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, critical hash %s, candidate fees %s, bid %s, response %s\n",
-        sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height,
-        critical_hash.GetHex(), FormatMoney(sidechain_fees),
-        FormatMoney(selected_bid), child.output);
 #endif
 }
 
@@ -1886,6 +1934,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the funded local enforcer wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmreplacementextra=<sats>", "Maximum additional satoshis above the selected BMM bid for up to two replacement retries after Core fee-deficit rejections (default: 0, disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "Authenticated TLS enforcer endpoint for native BIP301 submission (default: 127.0.0.1:55051). Enforcer responses are not consensus evidence.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Deprecated compatibility assertion; if supplied, must exactly match -drivechainbmmgrpcaddr. Withdrawals and BMM bids use the same authenticated enforcer endpoint.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Required absolute path to an owner-only executable grpcurl for authenticated enforcer reads and submissions. No PATH search. Install in an owner-controlled directory.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -2225,6 +2274,11 @@ bool AppInitParameterInteraction(ArgsManager& args)
                 /*sidechain_fees=*/0, selected_bid, &bid_error)) {
             return InitError(Untranslated(strprintf(
                 "Invalid -drivechainbmmbid: %s", bid_error)));
+        }
+
+        int64_t replacement_extra{0};
+        if (!ParseInt64(args.GetArg("-drivechainbmmreplacementextra", "0"), &replacement_extra) || !MoneyRange(replacement_extra)) {
+            return InitError(Untranslated("Invalid -drivechainbmmreplacementextra: expected nonnegative satoshis within money range"));
         }
 
         // Parent-chain validity checks are synchronous and some callers hold

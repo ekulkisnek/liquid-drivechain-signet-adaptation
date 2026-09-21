@@ -5,6 +5,7 @@
 #include <chainparamsbase.h>
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
+#include <drivechain_treasury.h>
 #include <util/fs.h>
 #include <logging.h>
 #include <pegins.h>
@@ -346,17 +347,7 @@ bool VerifyDrivechainDeposit(
 
 static bool IsDrivechainCtipScript(const CScript& script, const int sidechain_slot)
 {
-    if (sidechain_slot < 0 || sidechain_slot > 255) return false;
-    CScript::const_iterator cursor = script.begin();
-    opcodetype opcode;
-    std::vector<unsigned char> data;
-    if (!script.GetOp(cursor, opcode, data) || opcode != OP_NOP5) return false;
-    if (!script.GetOp(cursor, opcode, data) || opcode > OP_PUSHDATA4 ||
-        data.size() != 1 || data[0] != static_cast<unsigned char>(sidechain_slot)) {
-        return false;
-    }
-    if (!script.GetOp(cursor, opcode, data) || opcode != OP_1) return false;
-    return cursor == script.end();
+    return drivechain::IsTreasuryScript(script, drivechain::FROZEN_PARENT_RULES.treasury_opcode, sidechain_slot);
 }
 
 bool BuildDrivechainDepositEvidence(

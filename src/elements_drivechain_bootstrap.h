@@ -1,12 +1,16 @@
-// Generated from the authenticated pruned Alphanet checkpoint.
+// Preserve the authenticated historical checkpoint separately from Betanet's
+// empty state immediately before parent activation.
 #ifndef BITCOIN_ELEMENTS_DRIVECHAIN_BOOTSTRAP_H
 #define BITCOIN_ELEMENTS_DRIVECHAIN_BOOTSTRAP_H
 #include <array>
 #include <cstdint>
+#include <optional>
+#include <span>
+#include <elements_drivechain_identity.h>
 namespace ElementsDrivechainBootstrap {
 inline constexpr bool ENABLED{true};
 struct Slot { uint8_t slot; const char* active; const char* ctip_txid; uint32_t ctip_vout; int64_t ctip_value; };
-inline constexpr std::array<Slot, 7> SLOTS{{
+inline constexpr std::array<Slot, 7> ALPHA_SLOTS{{
     Slot{2, "44923e8adf714f49838fa096a59d3913811b8af07cca03b82843b76fe9ca6cd9", "0000000000000000000000000000000000000000000000000000000000000000", 4294967295, 0},
     Slot{4, "e5cfe12a22ff7245baf797dc7e966033afeaddd7dfe5a8379e37a8751fa55a2a", "0000000000000000000000000000000000000000000000000000000000000000", 4294967295, 0},
     Slot{9, "61375db9dc0fe8c2b3aabdadcd7a5ea542ca9162cc8c89992bb3e6c5869ce039", "57dd0496215533d258e6c08119f3952ce12c3f804523e307d4de983eccc991a0", 0, 302000000},
@@ -15,5 +19,18 @@ inline constexpr std::array<Slot, 7> SLOTS{{
     Slot{99, "d9825e315ab563c70f38496d0867ecde37a9791b746d47fcec5290a8eda05597", "0000000000000000000000000000000000000000000000000000000000000000", 4294967295, 0},
     Slot{255, "3459ab323378afbc87c8719f5807448a79849c481c5a23930a9aa8c93ef5d144", "0000000000000000000000000000000000000000000000000000000000000000", 4294967295, 0},
 }};
+constexpr std::optional<std::span<const Slot>> SlotsForReplayVersion(uint32_t version)
+{
+    switch (version) {
+    case 4: return std::span<const Slot>{ALPHA_SLOTS};
+    case 5: return std::span<const Slot>{};
+    default: return std::nullopt;
+    }
+}
+static_assert(SlotsForReplayVersion(ElementsDrivechainIdentity::PARENT_REPLAY_VERSION).has_value());
+static_assert(ElementsDrivechainIdentity::PARENT_REPLAY_VERSION != 5 ||
+    ElementsDrivechainIdentity::PARENT_CHECKPOINT_HEIGHT == 967679,
+    "Empty Betanet bootstrap is valid only immediately before BIP300 activation");
+inline constexpr auto SLOTS = *SlotsForReplayVersion(ElementsDrivechainIdentity::PARENT_REPLAY_VERSION);
 }
 #endif

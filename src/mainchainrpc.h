@@ -6,6 +6,7 @@
 #ifndef BITCOIN_MAINCHAINRPC_H
 #define BITCOIN_MAINCHAINRPC_H
 
+#include <drivechain_parent_rules.h>
 #include <rpc/client.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
@@ -639,14 +640,17 @@ bool ApplyDrivechainParentBlockState(
     std::vector<DrivechainMintableDeposit>* deposits = nullptr,
     std::string* error = nullptr,
     std::vector<DrivechainSuccessfulWithdrawal>* successful_withdrawals = nullptr,
-    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals = nullptr);
+    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals = nullptr,
+    drivechain::TreasuryOpcode treasury_opcode = drivechain::TreasuryOpcode::NOP5,
+    DrivechainM6ReplayRule m6_rule = DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6);
 
 /** Derive the canonical blinded BIP300 M6 transaction id. */
 bool ComputeDrivechainM6Id(const Sidechain::Bitcoin::CTransaction& transaction,
                            CAmount previous_treasury_value,
                            uint256& m6id,
                            uint8_t* sidechain_slot = nullptr,
-                           std::string* error = nullptr);
+                           std::string* error = nullptr,
+                           drivechain::TreasuryOpcode treasury_opcode = drivechain::TreasuryOpcode::NOP5);
 
 /**
  * Authenticate the containing parent block and require one exact BIP300 M5

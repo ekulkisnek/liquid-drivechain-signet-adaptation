@@ -1,9 +1,29 @@
-# Elements Alpha node
+# Elements Drivechain node
 
-Elements sidechain for **eCash Alphanet, slot 24**. Use `-chain=elements`.
+Elements sidechain implementation targeting Betanet **slot 130** (historical Alpha slot 24). Use `-chain=elements`.
 This is not Liquid, Bitcoin mainnet, or the historical signet demo.
 Confidential transactions and explicit payments are supported. Rangeproof,
 surjection-proof and amount-conservation checks remain mandatory.
+
+## Betanet migration status
+
+This checkout freezes a new Betanet identity at parent checkpoint 967679. It is
+an **operator-authorized FreeBank slot-130 test profile**, not an Elements slot
+activation: the existing FreeBank proposal bytes, name and hash are unchanged.
+Parent replay must authenticate that exact proposal and activation. The child
+manifest, genesis and native asset are independently bound; the FreeBank parent
+proposal does not commit to the Elements implementation.
+
+The independent serializer reproduces the frozen identity, but native build,
+continuous pruned-parent operation and fresh node/indexer deployment still need
+qualification. This is **not yet a Betanet-ready sidechain release**. Never reuse
+Alpha chain, index or wallet databases as Betanet data. Retained Alpha domain
+separators and test vectors are historical protocol data, not current network
+selection. Never replace their strings without recomputing and validating the
+entire dependent identity.
+
+The configuration below targets the new identity. Keep automatic production and
+bidding disabled until deployment qualification is complete.
 
 Nodes built from the former explicit-only Alpha branch must upgrade before
 accepting confidential payments. This consensus change does not alter the
@@ -22,7 +42,7 @@ verifier archives. A source checkout alone does not supply those archives.
 
 ## 2. Configure
 
-You need a synced, compatible Alpha parent node and enforcer.
+You need a synced parent node and enforcer matching the frozen identity.
 Complete the [parent RPC and enforcer mTLS setup](doc/drivechain-rpc-security.md)
 first. Keep RPC private; do not expose either node's RPC port to the internet.
 
@@ -34,7 +54,7 @@ server=1
 rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
 mainchainrpchost=127.0.0.1
-mainchainrpcport=18302
+mainchainrpcport=28532
 mainchainrpccookiefile=/absolute/path/to/parent/.cookie
 
 # Start without automatic block production or bidding.
@@ -47,8 +67,8 @@ For a local credential bridge, use `mainchainrpccredentialfile` instead of
 TLS settings from that guide; this minimal excerpt does not replace them.
 
 The defaults are P2P **7066**, RPC **7065**, and chain subdirectory
-`elements-v11`. The [frozen network identity](src/elements_drivechain_identity.h)
-defines the required Alpha parent checkpoint. Do not reuse another chain's data.
+`elements-betanet-v1`. The [frozen network identity](src/elements_drivechain_identity.h)
+defines the required Betanet parent checkpoint. Do not reuse another chain's data.
 
 ## 3. Run
 
@@ -82,4 +102,4 @@ can reveal your IP to peers; use an isolated relay/VPN setup if privacy is neede
 - [Report a vulnerability](SECURITY.md)
 - [MIT license](COPYING)
 
-This is experimental Alphanet software, not a real-money production release.
+This is experimental software, not a real-money production release.
