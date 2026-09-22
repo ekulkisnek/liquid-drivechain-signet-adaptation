@@ -5,6 +5,7 @@
 #include <drivechain_peg.h>
 
 #include <arith_uint256.h>
+#include <bech32.h>
 #include <chainparams.h>
 #include <coins.h>
 #include <consensus/merkle.h>
@@ -215,9 +216,9 @@ std::vector<unsigned char> Serialize(const T& value)
         UCharCast(stream.data()) + stream.size()};
 }
 
-CScript CtipScript()
+CScript CtipScript(const opcodetype opcode = OP_NOP5)
 {
-    return CScript() << OP_NOP5 << std::vector<unsigned char>{24} << OP_1;
+    return CScript() << opcode << std::vector<unsigned char>{24} << OP_1;
 }
 
 class DrivechainPegTestingSetup : public BasicTestingSetup
@@ -257,7 +258,7 @@ struct DeterministicFixture
     CTransactionRef transaction;
     uint256 anchor;
 
-    DeterministicFixture()
+    explicit DeterministicFixture(const opcodetype opcode = OP_NOP5)
     {
         const std::vector<unsigned char> previous_raw = ParseHex(
             "02000000000102ba1b6b0b25cbed783a2bb5bcfcb18d54115388b1a53454417ea20ce06c2de8dd0100000000fdffffffabede444d25da6440680778541b4f5876388e10cd9da94f55a546eeab5700a010000000000ffffffff03d0c1db000000000004b401185100000000000000002d6a2b65727431713932363379396e7166326b776a6c3768726873676577656671373835397739337a356e3878388f1c00000000000016001420ee25f486b457599d671fec23be2a2ffbb8efc20247304402203cdbeac736b8c0b97fe7f9ad9b1d76fc7b60d2a7ef907942c52fd7481c509c5702201f27991af112244d8e159546587f0d2dd98f49e5a8eaed5919932a2d5f8f6dfa012103ddd93dd5a45116fb7febe151d9b4d9f7cdccc84ffb94dbe7d5665aa2bafed1dd00fe180000");
@@ -275,7 +276,7 @@ struct DeterministicFixture
         deposit_tx.version = 2;
         deposit_tx.vin.emplace_back(
             Sidechain::Bitcoin::COutPoint(previous_tx.GetHash(), 0));
-        deposit_tx.vout.emplace_back(14'404'000, CtipScript());
+        deposit_tx.vout.emplace_back(14'404'000, CtipScript(opcode));
         const std::string address = TestDepositAddress();
         deposit_tx.vout.emplace_back(
             0,
@@ -665,6 +666,64 @@ BOOST_AUTO_TEST_CASE(withdrawal_bundle_is_confirmation_bound)
     BOOST_CHECK(first.m6id == same.m6id);
     BOOST_CHECK(first.bytes != moved_height.bytes);
     BOOST_CHECK(first.m6id != moved_height.m6id);
+
+    // Independent fixed vector: preserves the original inputless codec and
+    // ECX tagged-hash bytes while reusing the upstream transaction serializer.
+    BOOST_CHECK_EQUAL(HexStr(first.no_witness_bytes),
+        "02000000000400000000000000000a6a0800000000000003e8"
+        "0000000000000000226a20b082a80c8313dddcada453a1b9c33576f4cfa590b5bcc7d22014dbff28c3b79f"
+        "b88201000000000001510000000000000000276a255058535401"
+        "7cf36ebee8f4244cef45c66f4adc027076916867e262c3c763a2e66a73df0ca800000000");
+    BOOST_CHECK_EQUAL(first.m6id.GetHex(), "84e3552a4944266891be14858c43ecc9790cd2b5745f1db3aa535e071362e625");
+    auto transported = first.no_witness_bytes;
+    transported.insert(transported.begin() + 4, {0, 1});
+    BOOST_CHECK(first.bytes == transported);
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_codec_uses_bitcoin_serialization)
+{
+    for (const size_t size : {1U, 252U, 253U, 254U, 10000U}) {
+        const std::vector<unsigned char> script_bytes(size, OP_TRUE);
+        const CScript script(script_bytes.begin(), script_bytes.end());
+        const auto bundle = wallet::BuildDrivechainWithdrawalBundle(
+            100'000, 1'000, script, COutPoint(Txid::FromUint256(uint256S("11")), 3), 50);
+        DataStream bytes{bundle.no_witness_bytes};
+        Sidechain::Bitcoin::CMutableTransaction tx;
+        bytes >> TX_NO_WITNESS(tx);
+        BOOST_CHECK(bytes.empty());
+        BOOST_CHECK(tx.vin.empty());
+        BOOST_REQUIRE_EQUAL(tx.vout.size(), 3U);
+        BOOST_CHECK_EQUAL(tx.version, 2U);
+        BOOST_CHECK_EQUAL(tx.nLockTime, 0U);
+        BOOST_CHECK_EQUAL(tx.vout[2].nValue, 99'000);
+        BOOST_CHECK(tx.vout[2].scriptPubKey == script);
+        BOOST_CHECK(tx.GetHash() == bundle.m6id);
+    }
+    BOOST_CHECK_THROW(wallet::BuildDrivechainWithdrawalBundle(
+        1000, 1000, CScript() << OP_TRUE,
+        COutPoint(Txid::FromUint256(uint256S("11")), 3), 50), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_destination_rejects_lossy_or_unspendable_input)
+{
+    const WitnessV0KeyHash key(uint160(ParseHex("00112233445566778899aabbccddeeff00112233")));
+    const auto script = GetScriptForDestination(key);
+    const auto address = EncodeParentDestination(key);
+    BOOST_CHECK(wallet::DecodeDrivechainWithdrawalDestination(address) == script);
+    BOOST_CHECK(wallet::DecodeDrivechainWithdrawalDestination("hex:" + HexStr(script)) == script);
+    const PKHash legacy(uint160(ParseHex("00112233445566778899aabbccddeeff00112233")));
+    BOOST_CHECK(wallet::DecodeDrivechainWithdrawalDestination(EncodeParentDestination(legacy)) ==
+                GetScriptForDestination(legacy));
+    const auto decoded = bech32::Decode(address);
+    BOOST_CHECK_THROW(wallet::DecodeDrivechainWithdrawalDestination(
+        bech32::Encode(decoded.encoding, "wrong", decoded.data)), UniValue);
+    for (const auto& invalid : {
+            std::string{}, std::string{"not-an-address"}, std::string{"hex:"},
+            std::string{"hex:6a"}, std::string{"hex:51"},
+            "hex:" + HexStr(script) + "zz", "hex:" + HexStr(script) + "0",
+            "hex:" + std::string(258, '0')}) {
+        BOOST_CHECK_THROW(wallet::DecodeDrivechainWithdrawalDestination(invalid), UniValue);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(withdrawal_journal_distinguishes_missing_and_corrupt)
@@ -1200,6 +1259,15 @@ BOOST_AUTO_TEST_CASE(validates_persisted_v2_evidence_without_external_services)
     BOOST_REQUIRE(drivechain::GetCtipState(rolled_back, restored, &error));
     BOOST_CHECK_EQUAL(restored.sequence_number, 8);
     BOOST_CHECK_EQUAL(restored.value, 14'402'000);
+}
+
+BOOST_AUTO_TEST_CASE(historical_deposit_evidence_rejects_betanet_treasury_opcode)
+{
+    DeterministicFixture wrong_opcode(OP_NOP8);
+    std::string error;
+    BOOST_CHECK(!drivechain::VerifyDepositEvidenceAnchor(
+        *wrong_opcode.transaction, 0, wrong_opcode.anchor, error));
+    BOOST_CHECK(error.find("slot-24 CTIP") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(rejects_corrupted_stale_and_noncanonical_v2_evidence)

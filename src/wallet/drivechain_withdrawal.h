@@ -11,6 +11,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace wallet {
@@ -26,15 +27,21 @@ inline constexpr const char* DRIVECHAIN_WITHDRAWAL_PAYOUT_SCRIPT_KEY{
 
 struct DrivechainWithdrawalBundle {
     std::vector<unsigned char> bytes;
+    std::vector<unsigned char> no_witness_bytes;
     uint256 m6id;
 };
 
-/** Pure native inputless M6 codec; does not authorize a burn or broadcast. */
+/** Decode a parent-network address or exact hex script and reject unspendable payouts. */
+CScript DecodeDrivechainWithdrawalDestination(const std::string& destination);
+
+/** Legacy inputless M6 codec; does not authorize a burn or broadcast.
+ * Native Betanet withdrawals use drivechain::BuildNativeWithdrawalM6 instead.
+ */
 DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
     CAmount amount, CAmount mainchain_fee, const CScript& payout_script,
     const COutPoint& withdrawal_outpoint, uint32_t sidechain_block_height);
 
-/** Build the exact ECX-bound BIP300 M6 bytes for a confirmed withdrawal. */
+/** Build the historical slot-24 ECX-bound BIP300 M6 bytes. */
 DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
     CAmount amount,
     CAmount mainchain_fee,
