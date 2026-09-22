@@ -4,10 +4,8 @@
 
 #include <assetsdir.h>
 #include <node/drivechain_withdrawal_bundle.h>
-#include <bech32.h>
 #include <block_proof.h>
 #include <core_io.h>
-#include <crypto/sha256.h>
 #include <deploymentstatus.h>
 #include <drivechain_peg.h>
 #include <drivechain_settings.h>
@@ -38,6 +36,7 @@
 #include <common/args.h>
 #include <util/fs_helpers.h>
 #include <wallet/coincontrol.h>
+#include <wallet/drivechain_withdrawal.h>
 #include <wallet/fees.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
@@ -81,179 +80,8 @@ static CAmount DrivechainWithdrawalFee(const CAmount amount)
     return fee;
 }
 
-static void PushLE32(std::vector<unsigned char>& bytes, uint32_t value)
-{
-    for (int i = 0; i < 4; ++i) {
-        bytes.push_back((value >> (8 * i)) & 0xff);
-    }
-}
 
-static void PushLE64(std::vector<unsigned char>& bytes, uint64_t value)
-{
-    for (int i = 0; i < 8; ++i) {
-        bytes.push_back((value >> (8 * i)) & 0xff);
-    }
-}
-
-static void PushCompactSize(std::vector<unsigned char>& bytes, uint64_t value)
-{
-    if (value < 253) {
-        bytes.push_back(value);
-    } else if (value <= std::numeric_limits<uint16_t>::max()) {
-        bytes.push_back(253);
-        bytes.push_back(value & 0xff);
-        bytes.push_back((value >> 8) & 0xff);
-    } else if (value <= std::numeric_limits<uint32_t>::max()) {
-        bytes.push_back(254);
-        PushLE32(bytes, value);
-    } else {
-        bytes.push_back(255);
-        PushLE64(bytes, value);
-    }
-}
-
-static void PushBitcoinTxOut(std::vector<unsigned char>& bytes, CAmount amount, const CScript& script_pubkey)
-{
-    if (amount < 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "BIP300 withdrawal output amount cannot be negative");
-    }
-    PushLE64(bytes, amount);
-    PushCompactSize(bytes, script_pubkey.size());
-    bytes.insert(bytes.end(), script_pubkey.begin(), script_pubkey.end());
-}
-
-static std::vector<unsigned char> ToByteVector(const uint256& value)
-{
-    return std::vector<unsigned char>(value.begin(), value.end());
-}
-
-static uint256 DrivechainInputsCommitment(
-    const COutPoint& withdrawal_outpoint,
-    uint32_t sidechain_block_height)
-{
-    std::vector<COutPoint> committed_inputs;
-    committed_inputs.push_back(withdrawal_outpoint);
-    committed_inputs.emplace_back(Txid{}, sidechain_block_height);
-    return (HashWriter{} << committed_inputs).GetHash();
-}
-
-static CScript BuildDrivechainInputsCommitmentScript(const uint256& commitment)
-{
-    return CScript() << OP_RETURN << ToByteVector(commitment);
-}
-
-static uint256 Sha256(const std::vector<unsigned char>& bytes)
-{
-    uint256 result;
-    CSHA256 hasher;
-    if (!bytes.empty()) hasher.Write(bytes.data(), bytes.size());
-    hasher.Finalize(result.begin());
-    return result;
-}
-
-static uint256 TaggedHash(
-    const std::string& tag,
-    const std::vector<unsigned char>& payload)
-{
-    const std::vector<unsigned char> tag_bytes(tag.begin(), tag.end());
-    const uint256 tag_hash = Sha256(tag_bytes);
-    uint256 result;
-    CSHA256 hasher;
-    hasher.Write(tag_hash.begin(), 32);
-    hasher.Write(tag_hash.begin(), 32);
-    if (!payload.empty()) hasher.Write(payload.data(), payload.size());
-    hasher.Finalize(result.begin());
-    return result;
-}
-
-static void PushBE32(std::vector<unsigned char>& bytes, uint32_t value)
-{
-    bytes.push_back((value >> 24) & 0xff);
-    bytes.push_back((value >> 16) & 0xff);
-    bytes.push_back((value >> 8) & 0xff);
-    bytes.push_back(value & 0xff);
-}
-
-static uint256 BuildWithdrawalStateAnchor(
-    const uint256& child_genesis,
-    uint32_t checkpoint_height,
-    const uint256& previous_child_hash,
-    const uint256& withdrawal_commitment,
-    const uint256& exchange_state_root)
-{
-    if (child_genesis.IsNull() || withdrawal_commitment.IsNull() ||
-        exchange_state_root.IsNull()) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "Cannot create PXST marker with a null consensus commitment");
-    }
-    std::vector<unsigned char> payload;
-    payload.reserve(134);
-    payload.push_back(1);  // PXST interface version
-    payload.push_back(24); // LayerTwoLabs BIP300 sidechain slot
-    payload.insert(payload.end(), child_genesis.begin(), child_genesis.end());
-    PushBE32(payload, checkpoint_height);
-    payload.insert(
-        payload.end(), previous_child_hash.begin(), previous_child_hash.end());
-    payload.insert(
-        payload.end(), withdrawal_commitment.begin(), withdrawal_commitment.end());
-    payload.insert(
-        payload.end(), exchange_state_root.begin(), exchange_state_root.end());
-    return TaggedHash("ECX/perps-m6-state/v1", payload);
-}
-
-static CScript BuildWithdrawalStateMarkerScript(const uint256& anchor)
-{
-    std::vector<unsigned char> marker{'P', 'X', 'S', 'T', 1};
-    marker.insert(marker.end(), anchor.begin(), anchor.end());
-    return CScript() << OP_RETURN << marker;
-}
-
-
-static CScript BuildDrivechainPayoutScript(const std::string& destination)
-{
-    if (destination.rfind("hex:", 0) == 0) {
-        const std::vector<unsigned char> script_bytes = ParseHex(destination.substr(4));
-        if (script_bytes.empty()) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "hex: destination script is empty or invalid");
-        }
-        return CScript(script_bytes.begin(), script_bytes.end());
-    }
-
-    const auto dec = bech32::Decode(destination);
-    if ((dec.hrp == "bc" || dec.hrp == "tb" || dec.hrp == "bcrt") && !dec.data.empty()) {
-        const int version = dec.data[0];
-        if (version < 0 || version > 16) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid witness version in Bitcoin address");
-        }
-        if (version == 0 && dec.encoding != bech32::Encoding::BECH32) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Version 0 witness address must use Bech32 checksum");
-        }
-        if (version != 0 && dec.encoding != bech32::Encoding::BECH32M) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Version 1+ witness address must use Bech32m checksum");
-        }
-
-        std::vector<unsigned char> witness_program;
-        if (!ConvertBits<5, 8, false>([&](unsigned char c) { witness_program.push_back(c); }, dec.data.begin() + 1, dec.data.end())) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bech32 witness program");
-        }
-        if (witness_program.size() < 2 || witness_program.size() > 40) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bech32 witness program size");
-        }
-        if (version == 0 && witness_program.size() != 20 && witness_program.size() != 32) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bech32 v0 witness program size");
-        }
-
-        CScript script;
-        script << CScript::EncodeOP_N(version) << witness_program;
-        return script;
-    }
-
-    const std::vector<unsigned char> destination_bytes(destination.begin(), destination.end());
-    return CScript() << OP_RETURN << destination_bytes;
-}
-
-struct DrivechainWithdrawalBundle
+struct CheckpointWithdrawalBundle
 {
     std::vector<unsigned char> bytes;
     std::vector<unsigned char> no_witness_bytes;
@@ -264,56 +92,10 @@ struct DrivechainWithdrawalBundle
     uint256 m6id;
 };
 
-static std::vector<unsigned char> BuildDrivechainWithdrawalBundleBytes(
+
+static CheckpointWithdrawalBundle BuildCheckpointWithdrawalBundle(
     CAmount amount,
-    const std::string& destination,
-    const COutPoint& withdrawal_outpoint,
-    uint32_t sidechain_block_height,
-    bool include_witness_marker,
-    const uint256& child_genesis,
-    const uint256& previous_child_hash,
-    const uint256& exchange_state_root)
-{
-    const CAmount mainchain_fee = DrivechainWithdrawalFee(amount);
-
-    const uint64_t fee_sats = static_cast<uint64_t>(mainchain_fee);
-    std::vector<unsigned char> fee_bytes;
-    for (int i = 7; i >= 0; --i) {
-        fee_bytes.push_back((fee_sats >> (8 * i)) & 0xff);
-    }
-    const CScript fee_script = CScript() << OP_RETURN << fee_bytes;
-    const uint256 withdrawal_commitment =
-        DrivechainInputsCommitment(withdrawal_outpoint, sidechain_block_height);
-    const CScript inputs_commitment_script =
-        BuildDrivechainInputsCommitmentScript(withdrawal_commitment);
-    const CScript payout_script = BuildDrivechainPayoutScript(destination);
-    const uint256 state_anchor = BuildWithdrawalStateAnchor(
-        child_genesis,
-        sidechain_block_height,
-        previous_child_hash,
-        withdrawal_commitment,
-        exchange_state_root);
-    const CScript state_marker_script = BuildWithdrawalStateMarkerScript(state_anchor);
-
-    std::vector<unsigned char> bytes;
-    PushLE32(bytes, 2); // nVersion
-    if (include_witness_marker) {
-        bytes.push_back(0); // segwit marker; disambiguates an inputless tx from a non-witness tx
-        bytes.push_back(1); // segwit flag
-    }
-    PushCompactSize(bytes, 0); // vin
-    PushCompactSize(bytes, 4); // vout; append only, output zero is unchanged
-    PushBitcoinTxOut(bytes, 0, fee_script);
-    PushBitcoinTxOut(bytes, 0, inputs_commitment_script);
-    PushBitcoinTxOut(bytes, amount - mainchain_fee, payout_script);
-    PushBitcoinTxOut(bytes, 0, state_marker_script);
-    PushLE32(bytes, 0); // nLockTime
-    return bytes;
-}
-
-static DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
-    CAmount amount,
-    const std::string& destination,
+    const CScript& payout_script,
     const COutPoint& withdrawal_outpoint,
     uint32_t sidechain_block_height,
     const uint256& checkpoint_block_hash,
@@ -321,30 +103,17 @@ static DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
     const uint256& previous_child_hash,
     const uint256& exchange_state_root)
 {
-    DrivechainWithdrawalBundle bundle;
-    bundle.bytes = BuildDrivechainWithdrawalBundleBytes(
-        amount,
-        destination,
-        withdrawal_outpoint,
-        sidechain_block_height,
-        true,
-        child_genesis,
-        previous_child_hash,
-        exchange_state_root);
-    bundle.no_witness_bytes = BuildDrivechainWithdrawalBundleBytes(
-        amount,
-        destination,
-        withdrawal_outpoint,
-        sidechain_block_height,
-        false,
-        child_genesis,
-        previous_child_hash,
-        exchange_state_root);
+    CheckpointWithdrawalBundle bundle;
+    auto encoded = wallet::BuildDrivechainWithdrawalBundle(
+        amount, DrivechainWithdrawalFee(amount), payout_script, withdrawal_outpoint,
+        sidechain_block_height, child_genesis, previous_child_hash, exchange_state_root);
+    bundle.bytes = std::move(encoded.bytes);
+    bundle.no_witness_bytes = std::move(encoded.no_witness_bytes);
     bundle.checkpoint_height = sidechain_block_height;
     bundle.checkpoint_block_hash = checkpoint_block_hash;
     bundle.previous_child_hash = previous_child_hash;
     bundle.exchange_state_root = exchange_state_root;
-    bundle.m6id = Hash(bundle.no_witness_bytes);
+    bundle.m6id = encoded.m6id;
     return bundle;
 }
 
@@ -501,7 +270,7 @@ public:
         }
     }
 
-    void Complete(const DrivechainWithdrawalBundle& bundle)
+    void Complete(const CheckpointWithdrawalBundle& bundle)
     {
         node::CompleteDrivechainWithdrawalBundleCreation(
             bundle.m6id,
@@ -513,7 +282,7 @@ public:
     }
 };
 
-static UniValue BroadcastDrivechainWithdrawalBundle(const DrivechainWithdrawalBundle& bundle)
+static UniValue BroadcastDrivechainWithdrawalBundle(const CheckpointWithdrawalBundle& bundle)
 {
     const int sidechain_id = DEFAULT_DRIVECHAIN_SIDECHAIN_SLOT;
 
@@ -1021,52 +790,7 @@ RPCHelpMan sendtomainchain_drivechain()
     EnsureWalletIsUnlocked(*pwallet);
 
     const std::string destination_arg = request.params[0].get_str();
-    CScript destination_script;
-    if (destination_arg.rfind("hex:", 0) == 0) {
-        const std::string script_hex = destination_arg.substr(4);
-        if (!IsHex(script_hex) || script_hex.empty() || script_hex.size() % 2 != 0) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                               "hex: destination must contain a nonempty, even-length hexadecimal scriptPubKey");
-        }
-        const std::vector<unsigned char> bytes = ParseHex(script_hex);
-        destination_script = CScript(bytes.begin(), bytes.end());
-    } else {
-        std::string address_error;
-        const CTxDestination parent_address =
-            DecodeParentDestination(destination_arg, address_error);
-        if (!IsValidDestination(parent_address)) {
-            throw JSONRPCError(
-                RPC_INVALID_ADDRESS_OR_KEY,
-                strprintf("Invalid Bitcoin address: %s", address_error));
-        }
-        destination_script = GetScriptForDestination(parent_address);
-    }
-    if (destination_script.empty() ||
-        destination_script.size() >
-            drivechain::NATIVE_WITHDRAWAL_MAX_DESTINATION_SIZE) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                           "Bitcoin destination script must be between 1 and 128 bytes");
-    }
-    TxoutType destination_type;
-    if (!IsStandard(destination_script, std::nullopt, destination_type)) {
-        throw JSONRPCError(
-            RPC_INVALID_ADDRESS_OR_KEY,
-            "Bitcoin destination must be a currently standard script");
-    }
-    switch (destination_type) {
-    case TxoutType::PUBKEY:
-    case TxoutType::PUBKEYHASH:
-    case TxoutType::SCRIPTHASH:
-    case TxoutType::MULTISIG:
-    case TxoutType::WITNESS_V0_SCRIPTHASH:
-    case TxoutType::WITNESS_V0_KEYHASH:
-    case TxoutType::WITNESS_V1_TAPROOT:
-        break;
-    default:
-        throw JSONRPCError(
-            RPC_INVALID_ADDRESS_OR_KEY,
-            "Bitcoin destination must be a recognized, currently spendable standard script; data outputs, treasury scripts, unknown witness versions, and nonstandard scripts are forbidden");
-    }
+    const CScript destination_script = wallet::DecodeDrivechainWithdrawalDestination(destination_arg);
 
     const CAmount payout_amount = AmountFromValue(request.params[1], true);
     if (payout_amount <= 0 || !MoneyRange(payout_amount)) {
@@ -1251,6 +975,9 @@ RPCHelpMan sendtomainchain_legacy()
 
     const std::string mainchain_destination = request.params[0].get_str();
 
+    // Validate before SendMoney can commit or broadcast an irreversible burn.
+    const CScript payout_script = wallet::DecodeDrivechainWithdrawalDestination(mainchain_destination);
+
     CAmount nAmount = AmountFromValue(request.params[1]);
     if (nAmount <= 0)
         throw JSONRPCError(RPC_TYPE_ERROR, "Invalid amount for send");
@@ -1336,9 +1063,9 @@ RPCHelpMan sendtomainchain_legacy()
 
     const std::string tx_hex = EncodeHexTx(*wtx->tx);
     const COutPoint withdrawal_outpoint(Txid::FromUint256(txid), *withdrawal_vout);
-    const DrivechainWithdrawalBundle withdrawal_bundle = BuildDrivechainWithdrawalBundle(
+    const CheckpointWithdrawalBundle withdrawal_bundle = BuildCheckpointWithdrawalBundle(
         nAmount,
-        mainchain_destination,
+        payout_script,
         withdrawal_outpoint,
         checkpoint_height,
         checkpoint_block_hash,
@@ -2046,11 +1773,8 @@ static RPCHelpMan importdrivechaindeposit_native()
     } else {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be an integer number of satoshis");
     }
-    if (value_sats <= 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be greater than zero");
-    }
-    if (value_sats > std::numeric_limits<CAmount>::max()) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats is too large");
+    if (value_sats <= 0 || !MoneyRange(value_sats)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_sats must be positive and within the money range");
     }
     int64_t max_fee_sats{0};
     if (request.params.size() > 5 && !request.params[5].isNull()) {

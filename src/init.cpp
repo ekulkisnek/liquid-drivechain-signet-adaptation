@@ -363,6 +363,10 @@ BoundedCommandResult RunBoundedCommand(
         result.error = "bounded command requires positive timeout and output limit";
         return result;
     }
+    if (should_cancel && should_cancel()) {
+        result.cancelled = true;
+        return result;
+    }
 
 #ifdef WIN32
     result.error = "direct bounded child processes are not supported on Windows";
@@ -605,12 +609,12 @@ bool SubmitDrivechainWithdrawalBundle(
         std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
         MAX_GRPCURL_OUTPUT,
         [&node] { return ShutdownRequested(node); });
-    if (!child.started) {
-        if (error) *error = strprintf("failed to launch grpcurl: %s", child.error);
-        return false;
-    }
     if (child.cancelled) {
         if (error) *error = "grpcurl cancelled during shutdown";
+        return false;
+    }
+    if (!child.started) {
+        if (error) *error = strprintf("failed to launch grpcurl: %s", child.error);
         return false;
     }
     if (child.timed_out) {
@@ -685,12 +689,12 @@ static void SubmitDrivechainBmmGrpcRequest(NodeContext& node, const int sidechai
             std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
             MAX_GRPCURL_OUTPUT,
             [&node] { return ShutdownRequested(node); });
+        if (child.cancelled) {
+            throw std::runtime_error("grpcurl cancelled during shutdown");
+        }
         if (!child.started) {
             throw std::runtime_error(strprintf(
                 "failed to launch grpcurl: %s", child.error));
-        }
-        if (child.cancelled) {
-            throw std::runtime_error("grpcurl cancelled during shutdown");
         }
         if (child.timed_out) {
             throw std::runtime_error("grpcurl exceeded its 10-second deadline");

@@ -347,7 +347,8 @@ bool VerifyDrivechainDeposit(
 
 static bool IsDrivechainCtipScript(const CScript& script, const int sidechain_slot)
 {
-    return drivechain::IsTreasuryScript(script, drivechain::FROZEN_PARENT_RULES.treasury_opcode, sidechain_slot);
+    // This constructs historical ECX v2 evidence, not native Betanet replay.
+    return drivechain::IsTreasuryScript(script, drivechain::TreasuryOpcode::NOP5, sidechain_slot);
 }
 
 bool BuildDrivechainDepositEvidence(

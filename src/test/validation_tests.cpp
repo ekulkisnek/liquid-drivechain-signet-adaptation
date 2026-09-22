@@ -1219,9 +1219,17 @@ BOOST_AUTO_TEST_CASE(bounded_direct_child_process)
     const BoundedCommandResult cancelled = RunBoundedCommand(
         {"/bin/sleep", "5"}, std::chrono::milliseconds{1000}, 1024,
         [] { return true; });
-    BOOST_REQUIRE(cancelled.started);
-    BOOST_CHECK(cancelled.exited);
+    BOOST_CHECK(!cancelled.started);
+    BOOST_CHECK(!cancelled.exited);
     BOOST_CHECK(cancelled.cancelled);
+
+    int cancellation_checks{0};
+    const BoundedCommandResult cancelled_after_start = RunBoundedCommand(
+        {"/bin/sleep", "5"}, std::chrono::milliseconds{1000}, 1024,
+        [&] { return ++cancellation_checks > 1; });
+    BOOST_REQUIRE(cancelled_after_start.started);
+    BOOST_CHECK(cancelled_after_start.exited);
+    BOOST_CHECK(cancelled_after_start.cancelled);
 }
 #endif
 

@@ -3,7 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <drivechain_peg.h>
-#include <drivechain_parent_rules.h>
+#include <drivechain_treasury.h>
 
 #include <chainparams.h>
 #include <coins.h>
@@ -51,7 +51,9 @@ bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
 
 bool IsSlot24CtipScript(const CScript& script)
 {
-    return IsTreasuryScript(script, FROZEN_PARENT_RULES.treasury_opcode, DRIVECHAIN_SIDECHAIN_SLOT);
+    // Historical v2 evidence predates Betanet. Its authenticated transactions
+    // must retain their original opcode even in a Betanet-capable binary.
+    return IsTreasuryScript(script, TreasuryOpcode::NOP5, DRIVECHAIN_SIDECHAIN_SLOT);
 }
 
 bool ExtractDepositDestination(
