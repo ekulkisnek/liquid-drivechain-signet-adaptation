@@ -868,7 +868,7 @@ def calculate_alphanet_v11(header: Header, bootstrap: Header | None = None) -> I
 
 BETANET_FORK_HEIGHT = 967680
 BETANET_BOOTSTRAP_DOMAIN = "ELEMENTS_BETANET_PARENT_REPLAY_BOOTSTRAP_V1"
-BETANET_LOCAL_RULE_DOMAIN = "ELEMENTS_SLOT130_SEQUENTIAL_M6_REPROPOSAL_V1"
+BETANET_LOCAL_RULE_DOMAIN = "ELEMENTS_SLOT24_SEQUENTIAL_M6_REPROPOSAL_V1"
 
 
 def betanet_bootstrap_commitment(header: Header) -> str:
@@ -884,7 +884,7 @@ def betanet_bootstrap_commitment(header: Header) -> str:
 def calculate_betanet_v11(header: Header) -> IdentityResult:
     """Candidate only: the checkpoint must separately pass authenticated replay."""
     expected = {
-        "SIDECHAIN_SLOT": 130,
+        "SIDECHAIN_SLOT": 24,
         "PARENT_CHECKPOINT_HEIGHT": BETANET_FORK_HEIGHT - 1,
         "PARENT_REPLAY_VERSION": 5,
         "UNUSED_PROPOSAL_MAX_AGE": 2016,
@@ -915,17 +915,17 @@ def calculate_betanet_v11(header: Header) -> IdentityResult:
 def _calculate_v11(header: Header, *, alphanet: bool, betanet: bool = False) -> IdentityResult:
     if alphanet and betanet:
         raise ValueError("network identity modes are mutually exclusive")
-    freebank_test = ("BETANET_FREEBANK_TEST_PROFILE" in header.text
-                     and header.boolean("BETANET_FREEBANK_TEST_PROFILE"))
-    if freebank_test and not betanet:
-        raise ValueError("FreeBank test profile requires Betanet")
+    existing_elements_test = ("BETANET_EXISTING_ELEMENTS_TEST_PROFILE" in header.text
+                     and header.boolean("BETANET_EXISTING_ELEMENTS_TEST_PROFILE"))
+    if existing_elements_test and not betanet:
+        raise ValueError("Elements test profile requires Betanet")
     profile_id = header.array("PARAMETERIZED_CONTROLLER_PROFILE_ID")
     if profile_id.hex() != "6fd5a5e55769320cc1c6a497644d0bc7a642eed8442ab1703af304cfac253d25":
         raise ValueError("refusing V11: corrected parameterized profile is absent")
     if profile_id == bytes(32):
         raise ValueError("refusing V11: zero parameterized profile")
-    p2p_domain = "ecash-elements-drivechain-betanet-p2p-v1" if betanet else "ecash-elements-drivechain-p2p-v11"
-    data_dir = "elements-betanet-v1" if betanet else "elements-v11"
+    p2p_domain = "ecash-elements-drivechain-betanet-slot24-p2p-v1" if betanet else "ecash-elements-drivechain-p2p-v11"
+    data_dir = "elements-betanet-slot24-v1" if betanet else "elements-v11"
     if header.string("P2P_MAGIC_DOMAIN") != p2p_domain:
         raise ValueError("refusing V11: incompatible P2P namespace is absent")
     if header.string("DATA_DIR") != data_dir:
@@ -967,25 +967,25 @@ def _calculate_v11(header: Header, *, alphanet: bool, betanet: bool = False) -> 
         source_domain="ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V11",
         text=("Elements Drivechain Betanet v1; parameterized controller profile; replay v5; "
               "annex v2; sequential M6; withdrawal accumulator v1; "
-              "BIP301 checkpoint v1; Simplicity active; slot 130") if betanet else
+              "BIP301 checkpoint v1; Simplicity active; slot 24") if betanet else
              ("Elements Drivechain v11; parameterized controller profile; replay v4; "
               "annex v2; one M6 per parent block; withdrawal accumulator v1; "
               "BIP301 checkpoint v1; Simplicity active; slot 24"),
     )
-    if freebank_test:
-        description = bytes.fromhex(header.string("BETANET_FREEBANK_PROPOSAL_HEX"))
+    if existing_elements_test:
+        description = bytes.fromhex(header.string("BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX"))
         proposal_digest = hash256(description)
-        expected = "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd"
+        expected = "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"
         if (display_hash(proposal_digest) != expected
-                or header.string("BETANET_FREEBANK_PROPOSAL_HASH") != expected):
-            raise ValueError("FreeBank test proposal hash mismatch")
+                or header.string("BETANET_EXISTING_ELEMENTS_PROPOSAL_HASH") != expected):
+            raise ValueError("Elements test proposal hash mismatch")
     identity_digest = identity_commitment_v11(
         header, manifest_digest, description, proposal_digest, include_bootstrap=alphanet or betanet
     )
     pegged = derive_pegged_asset(identity_digest, header.string("PARENT_GENESIS"))
     merkle, genesis_digest = genesis(identity_digest, header)
     return IdentityResult(
-        mode="candidate-v11-betanet-freebank-authorized-test" if freebank_test else
+        mode="candidate-v11-betanet-existing_elements-authorized-test" if existing_elements_test else
              "candidate-v11-betanet-preactivation-parent" if betanet else
              "candidate-v11-alphanet-preactivation-parent" if alphanet else "candidate-v11-parameterized-controller",
         protocol_manifest_hash=display_hash(manifest_digest),
