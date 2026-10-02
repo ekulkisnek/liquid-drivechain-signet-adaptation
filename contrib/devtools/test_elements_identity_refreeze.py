@@ -33,11 +33,11 @@ class BetanetIdentityCandidateTests(unittest.TestCase):
         # Synthetic boundary values, never a deployable parent checkpoint.
         self.header = Header(IDENTITY_HEADER)
         self.header.text = self.header.text.replace(
-            "BETANET_FREEBANK_TEST_PROFILE{true}", "BETANET_FREEBANK_TEST_PROFILE{false}")
+            "BETANET_EXISTING_ELEMENTS_TEST_PROFILE{true}", "BETANET_EXISTING_ELEMENTS_TEST_PROFILE{false}")
         for name, value in {
-            "SIDECHAIN_SLOT": 130,
-            "P2P_MAGIC_DOMAIN": "ecash-elements-drivechain-betanet-p2p-v1",
-            "DATA_DIR": "elements-betanet-v1",
+            "SIDECHAIN_SLOT": 24,
+            "P2P_MAGIC_DOMAIN": "ecash-elements-drivechain-betanet-slot24-p2p-v1",
+            "DATA_DIR": "elements-betanet-slot24-v1",
             "PARENT_CHECKPOINT_HEIGHT": 967679,
             "PARENT_CHECKPOINT_HASH": "11" * 32,
             "PARENT_CHECKPOINT_CHAINWORK": "22" * 32,
@@ -71,7 +71,7 @@ class BetanetIdentityCandidateTests(unittest.TestCase):
         self.assertTrue(result.parent_activation_required)
         self.assertFalse(result.future_parent_milestones_committed)
         self.assertIn(b"sequential M6", bytes.fromhex(result.proposal_description_hex))
-        self.assertIn(b"slot 130", bytes.fromhex(result.proposal_description_hex))
+        self.assertIn(b"slot 24", bytes.fromhex(result.proposal_description_hex))
         self.assertEqual(result.p2p_message_start,
                          hash256(result.p2p_magic_domain.encode())[:4].hex())
 
@@ -81,18 +81,18 @@ class BetanetIdentityCandidateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             calculate_alphanet_v11(self.header)
 
-    def enable_freebank_test(self):
+    def enable_existing_elements_test(self):
         self.header.text = self.header.text.replace(
-            "BETANET_FREEBANK_TEST_PROFILE{false}", "BETANET_FREEBANK_TEST_PROFILE{true}")
+            "BETANET_EXISTING_ELEMENTS_TEST_PROFILE{false}", "BETANET_EXISTING_ELEMENTS_TEST_PROFILE{true}")
 
-    def test_freebank_profile_preserves_parent_but_changes_child_identity(self):
+    def test_existing_elements_profile_preserves_parent_but_changes_child_identity(self):
         original = calculate_betanet_v11(self.header)
-        self.enable_freebank_test()
+        self.enable_existing_elements_test()
         result = calculate_betanet_v11(self.header)
         self.assertEqual(result.proposal_hash,
-                         "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd")
-        self.assertEqual(result.mode, "candidate-v11-betanet-freebank-authorized-test")
-        self.assertEqual(bytes.fromhex(result.proposal_description_hex)[2:10], b"FreeBank")
+                         "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400")
+        self.assertEqual(result.mode, "candidate-v11-betanet-existing_elements-authorized-test")
+        self.assertEqual(bytes.fromhex(result.proposal_description_hex)[2:10], b"Elements")
         self.assertEqual(result.protocol_manifest_hash, original.protocol_manifest_hash)
         for field in ("identity_commitment", "genesis_hash", "pegged_asset"):
             self.assertNotEqual(getattr(result, field), getattr(original, field))
@@ -105,26 +105,26 @@ class BetanetIdentityCandidateTests(unittest.TestCase):
         self.assertNotEqual(changed.identity_commitment, result.identity_commitment)
         self.assertNotEqual(changed.genesis_hash, result.genesis_hash)
 
-    def test_freebank_profile_rejects_changed_parent_proposal(self):
-        self.enable_freebank_test()
+    def test_existing_elements_profile_rejects_changed_parent_proposal(self):
+        self.enable_existing_elements_test()
         original = self.header.text
-        for name, value in (("BETANET_FREEBANK_PROPOSAL_HEX", "00"),
-                            ("BETANET_FREEBANK_PROPOSAL_HASH", "11" * 32)):
+        for name, value in (("BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX", "00"),
+                            ("BETANET_EXISTING_ELEMENTS_PROPOSAL_HASH", "11" * 32)):
             self.header.text = original
             replace_field(self.header, name, value)
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "proposal hash mismatch"):
                 calculate_betanet_v11(self.header)
 
-    def test_freebank_profile_rejects_historical_network(self):
+    def test_existing_elements_profile_rejects_historical_network(self):
         self.header = Header(ALPHA_IDENTITY_HEADER)
-        self.header.text += "\ninline constexpr bool BETANET_FREEBANK_TEST_PROFILE{true};\n"
+        self.header.text += "\ninline constexpr bool BETANET_EXISTING_ELEMENTS_TEST_PROFILE{true};\n"
         with self.assertRaisesRegex(ValueError, "requires Betanet"):
             calculate_alphanet_v11(self.header)
 
     def test_mixed_parameters_fail_closed(self):
         original = self.header.text
         for name, value in {
-            "SIDECHAIN_SLOT": 24, "PARENT_REPLAY_VERSION": 4,
+            "SIDECHAIN_SLOT": 130, "PARENT_REPLAY_VERSION": 4,
             "BIP300301_LOCAL_RULE_DOMAIN": "ELEMENTS_SLOT24_SINGLE_M6_PER_PARENT_BLOCK_V1",
             "BIP300301_LOCAL_RULE_ID": "00" * 32,
             "PARENT_CHECKPOINT_HEIGHT": 967680,
@@ -181,7 +181,7 @@ class BetanetIdentityCandidateTests(unittest.TestCase):
         self.assertEqual(bindings["network"], "betanet")
         self.assertEqual(bindings["genesis_hash"], result.genesis_hash)
         self.assertEqual(bindings["native_asset"], result.pegged_asset)
-        self.assertEqual(bindings["data_dir"], "elements-betanet-v1")
+        self.assertEqual(bindings["data_dir"], "elements-betanet-slot24-v1")
         self.assertEqual(bindings["p2p_magic_u32_le"].to_bytes(4, "little").hex(),
                          result.p2p_message_start)
         self.assertEqual(bindings["bech32_hrp"], self.header.string("BECH32_HRP"))
@@ -213,18 +213,18 @@ class FrozenBetanetIdentityTests(unittest.TestCase):
         header = Header(IDENTITY_HEADER)
         result = calculate_betanet_v11(header)
         assert_current_v7(header, result)
-        self.assertTrue(header.boolean("BETANET_FREEBANK_TEST_PROFILE"))
-        self.assertEqual(result.mode, "candidate-v11-betanet-freebank-authorized-test")
+        self.assertTrue(header.boolean("BETANET_EXISTING_ELEMENTS_TEST_PROFILE"))
+        self.assertEqual(result.mode, "candidate-v11-betanet-existing_elements-authorized-test")
         self.assertEqual(result.genesis_hash,
-                         "91e50b1b7e2ddc1b9fc49d9067c8b309ac83045685673bb43f1bad6fac6f6011")
+                         "a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f")
         self.assertEqual(result.proposal_hash,
-                         "80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd")
+                         "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400")
         self.assertEqual(header.string("PARENT_CHECKPOINT_HASH"),
                          "00000000000000000001b58cb69869f6067f0ecb3f2fe0f2263e62ba1ccb0c41")
         self.assertEqual(header.string("PARENT_CHECKPOINT_CHAINWORK"),
                          "000000000000000000000000000000000000000148a384d49682843d3c74a5a0")
         bindings = indexer_bindings(header)
-        self.assertEqual(bindings["sidechain_slot"], 130)
+        self.assertEqual(bindings["sidechain_slot"], 24)
         self.assertEqual(bindings["genesis_hash"], result.genesis_hash)
         self.assertEqual(bindings["native_asset"], result.pegged_asset)
 

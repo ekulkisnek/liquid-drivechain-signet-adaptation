@@ -24,10 +24,10 @@ enum class DrivechainWithdrawalHistoryRule {
 
 namespace drivechain {
 
-static_assert(!ElementsDrivechainIdentity::BETANET_FREEBANK_TEST_PROFILE ||
+static_assert(!ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE ||
     (ElementsDrivechainIdentity::PARENT_REPLAY_VERSION == 5 &&
-     ElementsDrivechainIdentity::SIDECHAIN_SLOT == 130),
-    "FreeBank test profile requires Betanet replay and slot 130");
+     ElementsDrivechainIdentity::SIDECHAIN_SLOT == 24),
+    "Elements test profile requires Betanet replay and slot 24");
 
 struct ParentRules {
     TreasuryOpcode treasury_opcode;
@@ -55,8 +55,8 @@ constexpr std::optional<ParentRules> ParentRulesForVersion(uint32_t version)
             DrivechainM6ReplayRule::SEQUENTIAL_M6,
             DrivechainWithdrawalHistoryRule::ALLOW_REPROPOSAL,
             "ELEMENTS_BETANET_PARENT_REPLAY_BOOTSTRAP_V1",
-            "ELEMENTS_SLOT130_SEQUENTIAL_M6_REPROPOSAL_V1",
-            "Elements Drivechain Betanet v1; parameterized controller profile; replay v5; annex v2; sequential M6; withdrawal accumulator v1; BIP301 checkpoint v1; Simplicity active; slot 130"};
+            "ELEMENTS_SLOT24_SEQUENTIAL_M6_REPROPOSAL_V1",
+            "Elements Drivechain Betanet v1; parameterized controller profile; replay v5; annex v2; sequential M6; withdrawal accumulator v1; BIP301 checkpoint v1; Simplicity active; slot 24"};
     default:
         return std::nullopt;
     }
@@ -69,8 +69,8 @@ inline constexpr ParentRules FROZEN_PARENT_RULES =
 static_assert(FROZEN_PARENT_RULES.local_rule_domain == ElementsDrivechainIdentity::BIP300301_LOCAL_RULE_DOMAIN,
     "Frozen identity local rule domain disagrees with replay version");
 static_assert(ElementsDrivechainIdentity::PARENT_REPLAY_VERSION != 5 ||
-    ElementsDrivechainIdentity::SIDECHAIN_SLOT == 130,
-    "Betanet frozen identity must select sidechain slot 130");
+    ElementsDrivechainIdentity::SIDECHAIN_SLOT == 24,
+    "Betanet frozen identity must select sidechain slot 24");
 
 } // namespace drivechain
 

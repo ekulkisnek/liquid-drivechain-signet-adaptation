@@ -1420,7 +1420,7 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     const auto base_params = CreateBaseChainParams(CBaseChainParams::ELEMENTS);
 
     BOOST_CHECK_EQUAL(params->NetworkIDString(), "elements");
-    BOOST_CHECK_EQUAL(base_params->DataDir(), "elements-betanet-v1");
+    BOOST_CHECK_EQUAL(base_params->DataDir(), "elements-betanet-slot24-v1");
     BOOST_CHECK_EQUAL(base_params->RPCPort(), 7065);
     BOOST_CHECK_EQUAL(base_params->MainchainRPCPort(), 28532);
     BOOST_CHECK_EQUAL(base_params->OnionServiceTargetPort(), 37066);
@@ -1429,7 +1429,7 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK(consensus.elements_mode);
     BOOST_CHECK(consensus.has_parent_chain);
     BOOST_REQUIRE(consensus.drivechain_slot.has_value());
-    BOOST_CHECK_EQUAL(*consensus.drivechain_slot, 130);
+    BOOST_CHECK_EQUAL(*consensus.drivechain_slot, 24);
     BOOST_CHECK(consensus.enable_usdd_sp1_annex);
     BOOST_CHECK_EQUAL(
         params->ParentGenesisBlockHash(),
@@ -1444,27 +1444,27 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK(consensus.signblockscript == CScript() << OP_TRUE);
     BOOST_CHECK_EQUAL(
         params->HashGenesisBlock(),
-        uint256S("91e50b1b7e2ddc1b9fc49d9067c8b309ac83045685673bb43f1bad6fac6f6011"));
+        uint256S("a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f"));
     BOOST_CHECK_EQUAL(
         params->GenesisBlock().hashMerkleRoot,
-        uint256S("6c41bf9e406b8ba231977e7bf94eb835dfeae534868f6ed1554c7a107986149c"));
+        uint256S("4dfba0f3ac9d10a3dd44eb16f2925693b47787c4060bdf5b5bab2dd97f99505f"));
     BOOST_CHECK_EQUAL(
         consensus.pegged_asset.GetHex(),
-        "21bee57a5dc06b81587c05fe472f59fb3717c485965dfe8a9cd4a760873b2b64");
+        "5836dcc06130dcf6a65b6ac493813fd65559955283e44cc3f07966294eccb2c8");
     BOOST_CHECK_EQUAL(params->GenesisBlock().nTime, 1784334600U);
     BOOST_CHECK(params->HashGenesisBlock() != params->ParentGenesisBlockHash());
     BOOST_CHECK(consensus.subsidy_asset == consensus.pegged_asset);
 
     BOOST_CHECK_EQUAL(
         consensus.drivechain_protocol_manifest_hash,
-        uint256S("665fcf89067c9804a91ec8c71fb1e4769fdb9013c94c279c487d13f16842ccee"));
+        uint256S("5c3d0dab899b95e05a47691bed1a0bdca87938faca69ab04985a4c43a970a673"));
     BOOST_CHECK_EQUAL(
         HexStr(consensus.drivechain_proposal_description),
-        ElementsDrivechainIdentity::BETANET_FREEBANK_PROPOSAL_HEX);
+        ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX);
     BOOST_REQUIRE(consensus.drivechain_proposal_hash.has_value());
     BOOST_CHECK_EQUAL(
         *consensus.drivechain_proposal_hash,
-        uint256S("80856492ea5bcd0dc04f5e58bf2f116b12e015780998500128c861fa0d67f4fd"));
+        uint256S("866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"));
     BOOST_REQUIRE(consensus.drivechain_parent_state_active_proposal_hash.has_value());
     BOOST_CHECK_EQUAL(
         *consensus.drivechain_parent_state_active_proposal_hash,
@@ -1505,7 +1505,7 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "elements");
     BOOST_CHECK_EQUAL(params->Blech32HRP(), "elementsl");
     BOOST_CHECK_EQUAL(params->ParentBech32HRP(), "bc");
-    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "60b4eff4");
+    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "3b5ff18b");
     BOOST_CHECK_EQUAL(MAX_BLOCK_WEIGHT, 6'000'000U);
     BOOST_CHECK_EQUAL(MAX_BLOCK_SERIALIZED_SIZE, 6'000'000U);
     BOOST_CHECK_EQUAL(usdd::SP1_ANNEX_MAX_SIZE, 1'310'720U);

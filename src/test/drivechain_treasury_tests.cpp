@@ -39,10 +39,10 @@ BOOST_AUTO_TEST_CASE(parent_rules_are_versioned_and_fail_closed)
     BOOST_CHECK(legacy->bootstrap_domain == "ELEMENTS_ALPHANET_PARENT_REPLAY_BOOTSTRAP_V1");
     BOOST_CHECK(beta->bootstrap_domain == "ELEMENTS_BETANET_PARENT_REPLAY_BOOTSTRAP_V1");
     BOOST_CHECK(legacy->local_rule_domain == "ELEMENTS_SLOT24_SINGLE_M6_PER_PARENT_BLOCK_V1");
-    BOOST_CHECK(beta->local_rule_domain == "ELEMENTS_SLOT130_SEQUENTIAL_M6_REPROPOSAL_V1");
+    BOOST_CHECK(beta->local_rule_domain == "ELEMENTS_SLOT24_SEQUENTIAL_M6_REPROPOSAL_V1");
     BOOST_CHECK(legacy->proposal_text.find("replay v4;") != std::string_view::npos);
     BOOST_CHECK(beta->proposal_text.find("replay v5;") != std::string_view::npos);
-    BOOST_CHECK(beta->proposal_text.find("slot 130") != std::string_view::npos);
+    BOOST_CHECK(beta->proposal_text.find("slot 24") != std::string_view::npos);
     BOOST_CHECK(beta->proposal_text.find("one M6") == std::string_view::npos);
     for (const uint32_t version : {0U, 1U, 2U, 3U, 6U, 255U, 0xffffffffU}) {
         BOOST_CHECK(!drivechain::ParentRulesForVersion(version));

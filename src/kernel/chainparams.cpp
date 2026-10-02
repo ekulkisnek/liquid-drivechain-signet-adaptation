@@ -1098,14 +1098,14 @@ public:
         const uint160 source_id = Hash160(source_preimage);
         consensus.drivechain_proposal_description.insert(
             consensus.drivechain_proposal_description.end(), source_id.begin(), source_id.end());
-        if constexpr (ElementsDrivechainIdentity::BETANET_FREEBANK_TEST_PROFILE) {
+        if constexpr (ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE) {
             // Preserve the existing parent title and proposal; the independently
             // calculated child manifest is still bound into the child identity.
             consensus.drivechain_proposal_description = ParseHex(
-                ElementsDrivechainIdentity::BETANET_FREEBANK_PROPOSAL_HEX);
+                ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX);
             if (Hash(consensus.drivechain_proposal_description) != uint256S(
-                    ElementsDrivechainIdentity::BETANET_FREEBANK_PROPOSAL_HASH)) {
-                throw std::runtime_error("FreeBank test proposal hash mismatch");
+                    ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_PROPOSAL_HASH)) {
+                throw std::runtime_error("Elements test proposal hash mismatch");
             }
         }
         consensus.drivechain_proposal_hash = Hash(consensus.drivechain_proposal_description);
